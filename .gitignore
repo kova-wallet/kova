@@ -1,0 +1,12 @@
+node_modules/
+dist/
+coverage/
+*.log
+.env
+.env.*
+.DS_Store
+
+# Local dev (scripts/local-dev.sh)
+.local-keypair.json
+.validator.pid
+test-ledger/

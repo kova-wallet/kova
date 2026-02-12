@@ -1,0 +1,98 @@
+{
+  "name": "kova",
+  "version": "0.1.0",
+  "description": "A policy-constrained crypto wallet SDK for autonomous AI agents",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./signers": {
+      "import": "./dist/signers/index.js",
+      "types": "./dist/signers/index.d.ts"
+    },
+    "./stores": {
+      "import": "./dist/stores/index.js",
+      "types": "./dist/stores/index.d.ts"
+    },
+    "./chains/solana": {
+      "import": "./dist/chains/solana/index.js",
+      "types": "./dist/chains/solana/index.d.ts"
+    },
+    "./approval": {
+      "import": "./dist/approval/index.js",
+      "types": "./dist/approval/index.d.ts"
+    },
+    "./adapters": {
+      "import": "./dist/adapters/index.js",
+      "types": "./dist/adapters/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "lint": "eslint src/ tests/",
+    "lint:fix": "eslint src/ tests/ --fix",
+    "format": "prettier --write \"src/**/*.ts\" \"tests/**/*.ts\"",
+    "format:check": "prettier --check \"src/**/*.ts\" \"tests/**/*.ts\"",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist",
+    "prepublishOnly": "npm run clean && npm run build",
+    "local:dev": "bash scripts/local-dev.sh",
+    "local:stop": "bash scripts/local-dev.sh --stop",
+    "local:status": "bash scripts/local-dev.sh --status",
+    "docs:dev": "vitepress dev docs-site",
+    "docs:build": "vitepress build docs-site",
+    "docs:preview": "vitepress preview docs-site"
+  },
+  "keywords": [
+    "wallet",
+    "ai-agents",
+    "solana",
+    "crypto",
+    "policy",
+    "llm",
+    "tool-use",
+    "autonomous-agents"
+  ],
+  "author": "kova contributors",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kova-wallet/kova.git"
+  },
+  "homepage": "https://github.com/kova-wallet/kova#readme",
+  "bugs": {
+    "url": "https://github.com/kova-wallet/kova/issues"
+  },
+  "sideEffects": false,
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@typescript-eslint/eslint-plugin": "^8.55.0",
+    "@typescript-eslint/parser": "^8.55.0",
+    "@vitest/coverage-v8": "^4.0.18",
+    "eslint": "^9.39.2",
+    "prettier": "^3.8.1",
+    "typescript": "^5.9.3",
+    "vitepress": "^1.6.4",
+    "vitest": "^4.0.18"
+  },
+  "dependencies": {
+    "@solana/spl-token": "^0.4.14",
+    "@solana/web3.js": "^1.98.4",
+    "better-sqlite3": "^12.6.2"
+  }
+}
