@@ -284,6 +284,18 @@ else
   info "Location: $LOCAL_KEYPAIR"
 fi
 
+# Generate a recipient keypair for test transfers
+LOCAL_RECIPIENT="$PROJECT_ROOT/.local-recipient.json"
+if [[ -f "$LOCAL_RECIPIENT" ]]; then
+  RECIPIENT_ADDRESS=$(solana-keygen pubkey "$LOCAL_RECIPIENT" 2>/dev/null)
+  success "Reusing existing recipient: $RECIPIENT_ADDRESS"
+else
+  info "Generating recipient keypair for test transfers..."
+  solana-keygen new --outfile "$LOCAL_RECIPIENT" --no-bip39-passphrase --force --silent 2>/dev/null
+  RECIPIENT_ADDRESS=$(solana-keygen pubkey "$LOCAL_RECIPIENT")
+  success "Recipient keypair generated: $RECIPIENT_ADDRESS"
+fi
+
 # ── Step 5: Start Validator ─────────────────────────────────────────────────
 
 step "Step 5/8: Starting solana-test-validator"
@@ -442,8 +454,8 @@ SOLANA_RPC_URL=$RPC_URL
 LOCAL_KEYPAIR_PATH=$LOCAL_KEYPAIR
 WALLET_ADDRESS=$WALLET_ADDRESS
 
-# Recipient for test transfers (System Program address — safe to send to)
-RECIPIENT_ADDRESS=11111111111111111111111111111111
+# Recipient for test transfers (a second local keypair)
+RECIPIENT_ADDRESS=$(solana-keygen pubkey "$PROJECT_ROOT/.local-recipient.json" 2>/dev/null || echo "")
 
 # ── Optional: Claude Agent Example ───────────────────────────────────────────
 # Get a key at https://console.anthropic.com/

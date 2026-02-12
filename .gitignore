@@ -8,10 +8,10 @@ coverage/
 
 # Local dev (scripts/local-dev.sh)
 .local-keypair.json
+.local-recipient.json
 .validator.pid
 test-ledger/
 
 # Documentation & internal
-docs-site/
 docs/
 implementation/
