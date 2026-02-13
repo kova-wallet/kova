@@ -9,12 +9,12 @@ Signers are responsible for holding private keys and signing transactions. The `
 | Scenario | Recommended Signer | Why |
 |---|---|---|
 | **Local development / testing** | `LocalSigner` | Simple setup, key lives in memory. No external dependencies. |
-| **Production (small scale)** | Custom signer (e.g., AWS KMS, Fireblocks) | Private key never leaves a secure environment. See the custom signer example below. |
-| **Production (institutional)** | Custom signer (e.g., Fireblocks, Fordefi) | Hardware-backed signing with audit trails, multi-party approvals, and compliance features. |
-| **Future: distributed key management** | `MPCSigner` (Phase 2) | Key is split across multiple parties so no single party can sign alone. Not yet implemented. |
+| **Production with MPC** | `MpcSigner` + your provider | Key is split across multiple parties via MPC. Wire any backend (Turnkey, Lit Protocol, Fireblocks). |
+| **Production with KMS** | Custom signer (e.g., AWS KMS) | Private key managed by a cloud key management service. See the custom signer example below. |
+| **Production (institutional)** | `MpcSigner` or custom signer | Hardware-backed signing with audit trails, multi-party approvals, and compliance features. |
 
 ::: tip QUICK RULE OF THUMB
-Use `LocalSigner` for development and testing. For production, implement a custom signer that delegates to a secure key management service (KMS) so that the private key never exists in your application's memory.
+Use `LocalSigner` for development and testing. For production, use `MpcSigner` with a provider adapter for your MPC backend, or implement a custom `Signer` for KMS/HSM services. The private key should never exist in your application's memory.
 :::
 
 ## How Signing Works (Plain English)
@@ -216,7 +216,7 @@ console.log(JSON.stringify(signer));
 ```
 
 ::: danger SECURITY WARNING
-`LocalSigner` stores the private key in process memory as a plain `Keypair`. The key can be extracted via heap dumps, core dumps, or memory inspection tools. **Do not use `LocalSigner` in production with real funds.** Use `MPCSigner` or a custom hardware-backed signer for production deployments.
+`LocalSigner` stores the private key in process memory as a plain `Keypair`. The key can be extracted via heap dumps, core dumps, or memory inspection tools. **Do not use `LocalSigner` in production with real funds.** Use `MpcSigner` with a secure provider or a custom hardware-backed signer for production deployments.
 :::
 
 ### Supported Transaction Formats
@@ -232,63 +232,181 @@ The detection is transparent -- you do not need to specify the format.
 Solana has two transaction formats. **Legacy transactions** are the original format, used for simple operations like transferring SOL. **Versioned transactions** (v0) are a newer format that supports "address lookup tables," allowing more complex operations (like multi-hop token swaps) to fit within Solana's transaction size limits. `LocalSigner` handles both automatically -- you do not need to worry about which format is being used.
 :::
 
-## MPCSigner
+## MpcSigner
 
-Multi-Party Computation signer. Currently a stub -- all methods throw an error. Full implementation is planned for Phase 2.
+Provider-agnostic MPC signer for production use. You implement the `MpcSigningProvider` interface for your MPC backend (Turnkey, Lit Protocol, Fireblocks, etc.), and `MpcSigner` handles the rest -- chain validation, address caching, retries, and timeouts.
 
 ```typescript
-// Import MPCSigner -- the placeholder for multi-party computation signing.
-// MPC signers distribute the private key across multiple parties so that
-// no single party ever holds the full key, greatly improving security.
-import { MPCSigner } from "kova";
+// Import MpcSigner and the provider interface from kova.
+import { MpcSigner } from "kova";
+import type { MpcSigningProvider } from "kova";
 ```
 
 ::: tip WHAT IS MPC (MULTI-PARTY COMPUTATION)?
 MPC is a cryptographic technique where a private key is split into multiple "shares" distributed across different servers or parties. To sign a transaction, a threshold number of shares must cooperate (e.g., 2 out of 3). No single party ever has the full key, which means a breach of any single server cannot compromise the wallet. This is similar in concept to requiring multiple signatures on a corporate bank account.
 :::
 
-### MPCSignerConfig
+### MpcSigningProvider Interface
+
+This is what you implement for your specific MPC backend:
 
 ```typescript
-// Configuration for initializing an MPC signer.
-// This interface defines the parameters needed to connect to an MPC provider.
-interface MPCSignerConfig {
-  /** MPC provider (e.g., "lit-protocol", "fireblocks") */
-  // Identifies which MPC service to use. Different providers have different
-  // key management protocols and SDK integrations.
-  provider: string;
-  /** Key identifier within the MPC provider */
-  // The unique ID of the key shard/share set within the MPC provider's system.
-  // This tells the provider which distributed key to use for signing.
-  keyId: string;
-  /** Number of shares required to sign */
-  // The threshold (t) in a t-of-n MPC scheme. For example, threshold: 2 means
-  // at least 2 out of n key share holders must participate to produce a signature.
-  threshold: number;
+// The MpcSigningProvider interface defines the 3 methods your backend adapter
+// must implement. MpcSigner delegates all cryptographic operations to your provider.
+interface MpcSigningProvider {
+  /** Human-readable provider name (for logging/errors) */
+  // Used in error messages and logs to identify which backend failed.
+  // Example values: "turnkey", "lit-protocol", "fireblocks"
+  readonly name: string;
+
+  /** Return the public address for the configured signing key */
+  // Called once on first use, then cached by MpcSigner.
+  getAddress(): Promise<string>;
+
+  /** Sign raw transaction bytes using MPC */
+  // Receives the unsigned transaction bytes and must return:
+  //   - signedData: the fully assembled signed transaction (ready to broadcast)
+  //   - signature: the raw signature bytes (64 bytes for Ed25519 on Solana)
+  signTransaction(transactionData: Uint8Array): Promise<MpcSignResult>;
+
+  /** Check if the provider is reachable and the signing key is available */
+  // A health probe. Return true if your MPC backend is operational.
+  healthCheck(): Promise<boolean>;
 }
 ```
 
-### Current Status
+### MpcSignerConfig
 
 ```typescript
-// Create an MPCSigner instance with Lit Protocol as the MPC provider.
-// Note: This is currently a stub -- the actual MPC integration is not yet implemented.
-const signer = new MPCSigner({
-  provider: "lit-protocol",  // The MPC provider to use
-  keyId: "key-001",          // The key identifier in Lit Protocol's key management
-  threshold: 2,              // Require 2 shares to produce a valid signature
-});
-
-// All methods throw "not yet implemented" in the current release.
-// These calls are shown to illustrate the expected API surface for Phase 2.
-await signer.getAddress();    // throws Error
-await signer.sign(tx);        // throws Error
-await signer.healthCheck();   // returns false
+// Configuration for initializing an MPC signer.
+interface MpcSignerConfig {
+  /** The MPC signing provider implementation */
+  // Your adapter class that implements MpcSigningProvider.
+  provider: MpcSigningProvider;
+  /** Chain this signer operates on (e.g., "solana") */
+  // Validated against incoming transactions -- rejects mismatched chains.
+  chain: string;
+  /** Max retries for transient provider failures (default: 2) */
+  // If the provider throws a transient error (network blip, temporary 503),
+  // MpcSigner will retry up to this many additional times before failing.
+  maxRetries?: number;
+  /** Timeout in ms for individual provider calls (default: 30000) */
+  // If a provider call takes longer than this, it throws a TIMEOUT error.
+  timeoutMs?: number;
+}
 ```
 
-::: warning
-`MPCSigner` is not functional in the current release. It exists to define the configuration interface and reserve the API surface for Phase 2. Use `LocalSigner` for development and implement a custom `Signer` for production needs.
-:::
+### Example: Implementing a Provider
+
+```typescript
+// Example: A Turnkey MPC provider adapter.
+// Turnkey provides MPC-based key management with an API for remote signing.
+import { MpcSigningProvider, MpcSignResult } from "kova";
+
+class TurnkeyProvider implements MpcSigningProvider {
+  readonly name = "turnkey";
+  private readonly organizationId: string;
+  private readonly privateKeyId: string;
+
+  constructor(config: { organizationId: string; privateKeyId: string }) {
+    this.organizationId = config.organizationId;
+    this.privateKeyId = config.privateKeyId;
+  }
+
+  async getAddress(): Promise<string> {
+    // Call Turnkey API to get the public address for this private key
+    const response = await turnkeyClient.getPrivateKey({
+      organizationId: this.organizationId,
+      privateKeyId: this.privateKeyId,
+    });
+    return response.addresses[0].address;
+  }
+
+  async signTransaction(transactionData: Uint8Array): Promise<MpcSignResult> {
+    // Submit the unsigned transaction bytes to Turnkey for MPC signing
+    const result = await turnkeyClient.signRawPayload({
+      organizationId: this.organizationId,
+      privateKeyId: this.privateKeyId,
+      payload: Buffer.from(transactionData).toString("hex"),
+      encoding: "hex",
+    });
+
+    return {
+      signedData: Buffer.from(result.signedPayload, "hex"),
+      signature: Buffer.from(result.signature, "hex"),
+    };
+  }
+
+  async healthCheck(): Promise<boolean> {
+    try {
+      await turnkeyClient.getWhoami({ organizationId: this.organizationId });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+```
+
+### Using MpcSigner
+
+```typescript
+// Create the provider (your backend adapter)
+const provider = new TurnkeyProvider({
+  organizationId: process.env.TURNKEY_ORG_ID!,
+  privateKeyId: process.env.TURNKEY_KEY_ID!,
+});
+
+// Wrap it in MpcSigner with chain validation and retry configuration
+const signer = new MpcSigner({
+  provider,
+  chain: "solana",        // Only signs Solana transactions
+  maxRetries: 3,          // Retry transient failures up to 3 times
+  timeoutMs: 15_000,      // Fail if a provider call takes > 15 seconds
+});
+
+// Use it exactly like LocalSigner -- the wallet doesn't care
+const wallet = new AgentWallet({
+  signer,
+  chain: new SolanaAdapter({ rpcUrl: "https://api.mainnet-beta.solana.com" }),
+  policy: engine,
+  store: new SqliteStore({ path: "./wallet.db" }),
+});
+```
+
+### Built-in Features
+
+| Feature | Behavior |
+|---------|----------|
+| **Address caching** | `getAddress()` calls the provider once, then returns the cached result |
+| **Chain validation** | Rejects transactions with a chain that doesn't match the configured `chain` |
+| **Retry** | Retries transient provider errors up to `maxRetries` times. Non-transient errors (chain mismatch) are never retried |
+| **Timeout** | Each provider call is wrapped in a timeout. Slow providers throw `TIMEOUT` |
+| **Health check** | Delegates to provider with timeout. Returns `false` on any error (no retry) |
+
+### Error Handling
+
+`MpcSigner` throws `MpcSignerError` with typed error codes:
+
+```typescript
+import { MpcSignerError } from "kova";
+
+try {
+  await wallet.execute(intent);
+} catch (err) {
+  if (err instanceof MpcSignerError) {
+    console.log(err.code);     // "PROVIDER_ERROR" | "TIMEOUT" | "CHAIN_MISMATCH"
+    console.log(err.provider); // "turnkey"
+    console.log(err.message);  // Human-readable description
+  }
+}
+```
+
+| Error Code | When | Retried? |
+|---|---|---|
+| `CHAIN_MISMATCH` | Transaction chain doesn't match signer's configured chain | No |
+| `TIMEOUT` | Provider call exceeded `timeoutMs` | Yes (counts as an attempt) |
+| `PROVIDER_ERROR` | Provider threw an error after all retries exhausted | N/A (final) |
 
 ## Implementing a Custom Signer
 
