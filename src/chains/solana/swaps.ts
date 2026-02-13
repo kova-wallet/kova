@@ -17,9 +17,20 @@ import {
 
 const DEFAULT_JUPITER_API = "https://quote-api.jup.ag/v6";
 const DEFAULT_JUPITER_PRICE_API = "https://price.jup.ag/v2";
+const DEFAULT_FETCH_TIMEOUT_MS = 15_000;
 
 /** Wrapped SOL mint address used by Jupiter */
 const SOL_MINT = "So11111111111111111111111111111111111111112";
+
+async function fetchWithTimeout(url: string, init?: RequestInit, timeoutMs: number = DEFAULT_FETCH_TIMEOUT_MS): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 
 interface JupiterQuote {
   inputMint: string;
@@ -80,7 +91,7 @@ export async function buildJupiterSwap(
   quoteUrl.searchParams.set("amount", amountIn.toString());
   quoteUrl.searchParams.set("slippageBps", String(slippageBps));
 
-  const quoteResponse = await fetch(quoteUrl.toString());
+  const quoteResponse = await fetchWithTimeout(quoteUrl.toString());
   if (!quoteResponse.ok) {
     const body = (await quoteResponse.text()).slice(0, 200);
     throw new SolanaAdapterError(
@@ -91,7 +102,7 @@ export async function buildJupiterSwap(
   const quote: JupiterQuote = (await quoteResponse.json()) as JupiterQuote;
 
   // Step 2: Get swap transaction from Jupiter
-  const swapResponse = await fetch(`${jupiterApiUrl}/swap`, {
+  const swapResponse = await fetchWithTimeout(`${jupiterApiUrl}/swap`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -153,7 +164,7 @@ export async function getTokenPriceUSD(
   url.searchParams.set("ids", mint);
 
   try {
-    const response = await fetch(url.toString());
+    const response = await fetchWithTimeout(url.toString());
     if (!response.ok) return null;
 
     const data = (await response.json()) as {

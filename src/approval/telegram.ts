@@ -23,6 +23,8 @@ export interface TelegramApprovalBotConfig {
   allowedUserIds?: number[];
   /** Polling interval in ms between getUpdates calls (defaults to 2000) */
   pollInterval?: number;
+  /** HTTP timeout for Telegram API requests (defaults to 15_000 = 15s) */
+  requestTimeoutMs?: number;
 }
 
 /** Telegram API response wrapper */
@@ -52,6 +54,7 @@ interface TelegramUpdate {
 const DEFAULT_TIMEOUT_MS = 300_000; // 5 minutes
 const DEFAULT_POLL_INTERVAL_MS = 2000;
 const TELEGRAM_LONG_POLL_TIMEOUT = 2; // seconds for getUpdates long poll
+const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 
 export class TelegramApprovalBot implements ApprovalChannel {
   readonly name = "telegram";
@@ -61,14 +64,38 @@ export class TelegramApprovalBot implements ApprovalChannel {
   private readonly allowedUserIds?: number[];
   private readonly pollInterval: number;
   private readonly apiBase: string;
+  private readonly requestTimeoutMs: number;
 
   constructor(config: TelegramApprovalBotConfig) {
+    if (!config.token || typeof config.token !== "string" || config.token.trim() === "") {
+      throw new Error("TelegramApprovalBot requires a non-empty bot token");
+    }
+    if (!config.chatId || typeof config.chatId !== "string" || config.chatId.trim() === "") {
+      throw new Error("TelegramApprovalBot requires a non-empty chatId");
+    }
+
     this.token = config.token;
     this.chatId = config.chatId;
     this.defaultTimeout = config.defaultTimeout ?? DEFAULT_TIMEOUT_MS;
     this.allowedUserIds = config.allowedUserIds;
     this.pollInterval = config.pollInterval ?? DEFAULT_POLL_INTERVAL_MS;
     this.apiBase = `https://api.telegram.org/bot${config.token}`;
+    this.requestTimeoutMs =
+      typeof config.requestTimeoutMs === "number" && Number.isFinite(config.requestTimeoutMs) && config.requestTimeoutMs > 0
+        ? config.requestTimeoutMs
+        : DEFAULT_REQUEST_TIMEOUT_MS;
+
+    // SEC: Warn when allowedUserIds is not configured — any chat member can approve/reject
+    if (!config.allowedUserIds || config.allowedUserIds.length === 0) {
+      try {
+        process.emitWarning(
+          "[kova:TelegramApprovalBot] allowedUserIds is not configured. Any user in this chat can approve or reject transaction requests. Set allowedUserIds to restrict approval to specific Telegram users.",
+          { code: "KOVA_TELEGRAM_ALLOWED_USER_IDS_MISSING" },
+        );
+      } catch {
+        // Non-fatal
+      }
+    }
   }
 
   /**
@@ -133,21 +160,28 @@ export class TelegramApprovalBot implements ApprovalChannel {
       if (remainingMs <= 0) break;
 
       let updates: TelegramUpdate[];
-      try {
-        const params = new URLSearchParams({
-          offset: String(lastUpdateOffset),
-          timeout: String(TELEGRAM_LONG_POLL_TIMEOUT),
-          allowed_updates: JSON.stringify(["callback_query"]),
-        });
+	      try {
+	        const params = new URLSearchParams({
+	          offset: String(lastUpdateOffset),
+	          timeout: String(TELEGRAM_LONG_POLL_TIMEOUT),
+	          allowed_updates: JSON.stringify(["callback_query"]),
+	        });
 
-        const response = await fetch(
-          `${this.apiBase}/getUpdates?${params.toString()}`,
-        );
-        if (!response.ok) {
-          // Transient API failure — wait and retry
-          await this.sleep(this.pollInterval);
-          continue;
-        }
+	        const controller = new AbortController();
+	        const timeout = setTimeout(
+	          () => controller.abort(),
+	          Math.max(this.requestTimeoutMs, (TELEGRAM_LONG_POLL_TIMEOUT + 1) * 1000),
+	        );
+
+	        const response = await fetch(
+	          `${this.apiBase}/getUpdates?${params.toString()}`,
+	          { signal: controller.signal },
+	        ).finally(() => clearTimeout(timeout));
+	        if (!response.ok) {
+	          // Transient API failure — wait and retry
+	          await this.sleep(this.pollInterval);
+	          continue;
+	        }
         const json = (await response.json()) as TelegramResponse<
           TelegramUpdate[]
         >;
@@ -295,11 +329,25 @@ export class TelegramApprovalBot implements ApprovalChannel {
     method: string,
     body: Record<string, unknown>,
   ): Promise<T> {
-    const response = await fetch(`${this.apiBase}/${method}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.requestTimeoutMs);
+
+    let response: Response;
+    try {
+      response = await fetch(`${this.apiBase}/${method}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `Telegram API ${method} request failed: ${message}`.replaceAll(this.token, "[REDACTED]"),
+      );
+    } finally {
+      clearTimeout(timeout);
+    }
 
     if (!response.ok) {
       const text = (await response.text()).slice(0, 200).replaceAll(this.token, "[REDACTED]");

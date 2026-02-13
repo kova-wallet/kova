@@ -17,6 +17,10 @@ export interface AllowlistConfig {
   denyAddresses?: string[];
   allowPrograms?: string[];
   denyPrograms?: string[];
+  /** Allowed token symbols/mints for swap intents. If set, swaps to unlisted tokens are denied. */
+  allowTokens?: string[];
+  /** Denied token symbols/mints for swap intents. Swaps involving these tokens are denied. */
+  denyTokens?: string[];
 }
 
 /**
@@ -31,14 +35,29 @@ function normalizeAddress(address: string): string {
   return address;
 }
 
+/**
+ * SEC: Normalize token identifiers for comparison.
+ * - Token symbols are case-insensitive ("usdc" == "USDC")
+ * - Address-like identifiers (e.g. Solana base58 mints) remain case-sensitive
+ * - EVM addresses are normalized to lowercase
+ */
+function normalizeTokenId(token: string): string {
+  if (token.startsWith("0x") && token.length === 42) return token.toLowerCase();
+  if (/^[A-Za-z0-9_]{2,16}$/.test(token)) return token.toUpperCase();
+  return token;
+}
+
 export class AllowlistRule implements PolicyRule {
   readonly name = "allowlist";
   private readonly allowAddresses: Set<string>;
   private readonly denyAddresses: Set<string>;
   private readonly allowPrograms: Set<string>;
   private readonly denyPrograms: Set<string>;
+  private readonly allowTokens: Set<string>;
+  private readonly denyTokens: Set<string>;
   private readonly hasAllowAddresses: boolean;
   private readonly hasAllowPrograms: boolean;
+  private readonly hasAllowTokens: boolean;
 
   constructor(config: AllowlistConfig) {
     // HIGH-03 fix: Normalize addresses for case-insensitive matching on EVM chains
@@ -46,8 +65,12 @@ export class AllowlistRule implements PolicyRule {
     this.denyAddresses = new Set((config.denyAddresses ?? []).map(normalizeAddress));
     this.allowPrograms = new Set(config.allowPrograms ?? []);
     this.denyPrograms = new Set(config.denyPrograms ?? []);
+    // SEC: Token allowlist/denylist for swap intents (case-insensitive matching)
+    this.allowTokens = new Set((config.allowTokens ?? []).map(normalizeTokenId));
+    this.denyTokens = new Set((config.denyTokens ?? []).map(normalizeTokenId));
     this.hasAllowAddresses = this.allowAddresses.size > 0;
     this.hasAllowPrograms = this.allowPrograms.size > 0;
+    this.hasAllowTokens = this.allowTokens.size > 0;
   }
 
   /** Get the allowlist configuration (for policy introspection) */
@@ -57,6 +80,8 @@ export class AllowlistRule implements PolicyRule {
       denyAddresses: this.denyAddresses.size > 0 ? [...this.denyAddresses] : undefined,
       allowPrograms: this.hasAllowPrograms ? [...this.allowPrograms] : undefined,
       denyPrograms: this.denyPrograms.size > 0 ? [...this.denyPrograms] : undefined,
+      allowTokens: this.hasAllowTokens ? [...this.allowTokens] : undefined,
+      denyTokens: this.denyTokens.size > 0 ? [...this.denyTokens] : undefined,
     };
   }
 
@@ -103,6 +128,28 @@ export class AllowlistRule implements PolicyRule {
       };
     }
 
+    // 5. SEC: Check swap token allowlist/denylist
+    const swapTokens = this.extractSwapTokens(intent);
+    if (swapTokens) {
+      for (const token of swapTokens) {
+        const normalized = normalizeTokenId(token);
+        if (this.denyTokens.has(normalized)) {
+          return {
+            decision: "DENY",
+            rule: this.name,
+            reason: `Token is denylisted for swaps: ${token}`,
+          };
+        }
+        if (this.hasAllowTokens && !this.allowTokens.has(normalized)) {
+          return {
+            decision: "DENY",
+            rule: this.name,
+            reason: `Token is not in the swap allowlist: ${token}`,
+          };
+        }
+      }
+    }
+
     return { decision: "ALLOW" };
   }
 
@@ -138,6 +185,19 @@ export class AllowlistRule implements PolicyRule {
     const params = intent.params as unknown as Record<string, unknown>;
     if (intent.type === "custom" && "programId" in params && typeof params.programId === "string") {
       return params.programId;
+    }
+    return null;
+  }
+
+  /** SEC: Extract fromToken and toToken from swap intents for token allowlist checks */
+  private extractSwapTokens(intent: TransactionIntent): [string, string] | null {
+    if (intent.type !== "swap") return null;
+    const params = intent.params as unknown as Record<string, unknown>;
+    if (
+      "fromToken" in params && typeof params.fromToken === "string" &&
+      "toToken" in params && typeof params.toToken === "string"
+    ) {
+      return [params.fromToken, params.toToken];
     }
     return null;
   }

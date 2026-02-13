@@ -407,8 +407,13 @@ TELEGRAM_CHAT_ID=""
 # Load existing .env.local if it exists
 if [[ -f "$ENV_FILE" ]]; then
   info "Found existing $ENV_FILE — loading values as defaults."
-  # shellcheck disable=SC1090
-  source "$ENV_FILE" 2>/dev/null || true
+  while IFS= read -r line; do
+    case "$line" in
+      ANTHROPIC_API_KEY=*) ANTHROPIC_API_KEY="${line#ANTHROPIC_API_KEY=}" ;;
+      TELEGRAM_BOT_TOKEN=*) TELEGRAM_BOT_TOKEN="${line#TELEGRAM_BOT_TOKEN=}" ;;
+      TELEGRAM_CHAT_ID=*) TELEGRAM_CHAT_ID="${line#TELEGRAM_CHAT_ID=}" ;;
+    esac
+  done < <(grep -E '^(ANTHROPIC_API_KEY|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID)=' "$ENV_FILE" 2>/dev/null || true)
 fi
 
 if ! $QUICK_MODE; then

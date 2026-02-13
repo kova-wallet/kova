@@ -17,6 +17,12 @@ import type { ApprovalRequest } from "../../approval/interface.js";
 
 const DEFAULT_TIMEOUT_MS = 300_000; // 5 minutes
 
+function normalizeTokenId(token: string): string {
+  if (token.startsWith("0x") && token.length === 42) return token.toLowerCase();
+  if (/^[A-Za-z0-9_]{2,16}$/.test(token)) return token.toUpperCase();
+  return token;
+}
+
 export class ApprovalGateRule implements PolicyRule {
   readonly name = "approval-gate";
   private readonly config: ApprovalGateConfig;
@@ -41,7 +47,7 @@ export class ApprovalGateRule implements PolicyRule {
     const token = this.extractToken(intent);
 
     // Check if amount is above the threshold (token-aware)
-    if (token.toUpperCase() !== this.config.above.token.toUpperCase()) {
+    if (normalizeTokenId(token) !== normalizeTokenId(this.config.above.token)) {
       // Different token — this rule doesn't apply
       return { decision: "ALLOW" };
     }
@@ -95,20 +101,20 @@ export class ApprovalGateRule implements PolicyRule {
   }
 
   /** Build an ApprovalRequest from the intent */
-  private buildApprovalRequest(
-    intent: TransactionIntent,
-    amount: number,
-    token: string,
-  ): ApprovalRequest {
-    const timeoutMs = this.config.timeout ?? DEFAULT_TIMEOUT_MS;
-    const params = intent.params as unknown as Record<string, unknown>;
+	  private buildApprovalRequest(
+	    intent: TransactionIntent,
+	    amount: number,
+	    token: string,
+	  ): ApprovalRequest {
+	    const timeoutMs = this.config.timeout ?? DEFAULT_TIMEOUT_MS;
+	    const params = intent.params as unknown as Record<string, unknown>;
 
-    return {
-      id: intent.id ?? crypto.randomUUID(),
-      summary: `${intent.type} ${amount} ${token}`,
-      amount: String(amount),
-      token,
-      target: this.extractTarget(intent),
+	    return {
+	      id: crypto.randomUUID(),
+	      summary: `${intent.type} ${amount} ${token}`,
+	      amount: String(amount),
+	      token,
+	      target: this.extractTarget(intent),
       reason: typeof params.reason === "string" ? params.reason : intent.metadata?.reason as string | undefined,
       agentId: intent.metadata?.agentId as string | undefined,
       expiresAt: Date.now() + timeoutMs,

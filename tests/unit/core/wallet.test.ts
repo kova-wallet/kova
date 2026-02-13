@@ -27,6 +27,9 @@ const denyRule: PolicyRule = {
   }),
 };
 
+const VALID_SOL_ADDRESS = "GsbwXfJraMomNxBcjYLcG3mxkBUiyWXAB32fGbSQQRre";
+const VALID_SOL_ADDRESS_2 = "7v91N7iZ9mNicL8WfG6cgSCKyRXydQjLh6UYBWwm6y1Q";
+
 function createMockSigner(address = "MockAddress1234567890abcdef12345678"): Signer {
   return {
     getAddress: async () => address,
@@ -67,7 +70,7 @@ function createTransferIntent(overrides?: Partial<TransactionIntent>): Transacti
   return {
     type: "transfer",
     chain: "solana",
-    params: { to: "RecipientAddr1234567890abcdef1234", amount: "1.0", token: "SOL" },
+    params: { to: VALID_SOL_ADDRESS, amount: "1.0", token: "SOL" },
     ...overrides,
   };
 }
@@ -405,11 +408,11 @@ describe("AgentWallet", () => {
       const wallet = createWallet();
       const result = await wallet.execute(
         createTransferIntent({
-          params: { to: "RecipientAddr1234567890abcdef1234", amount: "2.5", token: "USDC" },
+          params: { to: VALID_SOL_ADDRESS, amount: "2.5", token: "USDC" },
         }),
       );
 
-      expect(result.summary).toBe("Sent 2.5 USDC to Reci...1234");
+      expect(result.summary).toBe("Sent 2.5 USDC to Gsbw...QRre");
     });
 
     it("should generate swap summary", async () => {
@@ -429,12 +432,12 @@ describe("AgentWallet", () => {
         type: "mint",
         chain: "solana",
         params: {
-          collection: "DeGods1234567890abcdef1234567890",
+          collection: VALID_SOL_ADDRESS_2,
           metadataUri: "https://example.com/meta.json",
         },
       });
 
-      expect(result.summary).toBe("Minted NFT from collection DeGods12...");
+      expect(result.summary).toBe("Minted NFT from collection 7v91N7iZ...");
     });
 
     it("should generate stake summary", async () => {
@@ -454,7 +457,7 @@ describe("AgentWallet", () => {
         type: "custom",
         chain: "solana",
         params: {
-          programId: "Program123",
+          programId: VALID_SOL_ADDRESS,
           data: "base64data",
           accounts: [],
         },
@@ -464,7 +467,8 @@ describe("AgentWallet", () => {
     });
 
     it("should handle short recipient addresses without truncation", async () => {
-      const wallet = createWallet();
+      const chain = { ...createMockChain(), isValidAddress: () => true };
+      const wallet = createWallet({ chain });
       const result = await wallet.execute(
         createTransferIntent({
           params: { to: "ShortAdr", amount: "1.0", token: "SOL" },
@@ -651,7 +655,7 @@ describe("AgentWallet", () => {
       const originalIntent: TransactionIntent = {
         type: "transfer",
         chain: "solana",
-        params: { to: "RecipientAddr1234567890abcdef1234", amount: "5.5", token: "USDC" },
+        params: { to: VALID_SOL_ADDRESS, amount: "5.5", token: "USDC" },
         metadata: { agentId: "agent-1", reason: "test payment", urgency: "high" },
       };
 
@@ -968,7 +972,7 @@ describe("AgentWallet", () => {
       const intent: TransactionIntent = {
         type: "transfer",
         chain: "solana",
-        params: { to: "RecipientAddr1234567890abcdef1234", amount: "1.0", token: "SOL" },
+        params: { to: VALID_SOL_ADDRESS, amount: "1.0", token: "SOL" },
         // metadata is intentionally absent
       };
 
@@ -1017,9 +1021,9 @@ describe("AgentWallet", () => {
         type: "mint",
         chain: "solana",
         params: {
-          collection: "Collection1234567890abcdef12345678",
+          collection: VALID_SOL_ADDRESS_2,
           metadataUri: "https://example.com/meta.json",
-          to: "RecipientAddr1234567890abcdef1234",
+          to: VALID_SOL_ADDRESS,
         },
       });
 
@@ -1031,22 +1035,24 @@ describe("AgentWallet", () => {
       const result = await wallet.execute({
         type: "stake",
         chain: "solana",
-        params: { amount: "10", token: "SOL", validator: "Validator1234567890abcdef1234" },
+        params: { amount: "10", token: "SOL", validator: VALID_SOL_ADDRESS_2 },
       });
 
       expect(result.status).toBe("confirmed");
       expect(result.summary).toBe("Staked 10 SOL");
     });
 
-    it("should handle intent on different chains", async () => {
+    it("should reject intent when chain does not match configured adapter", async () => {
       const wallet = createWallet();
       const result = await wallet.execute({
         type: "transfer",
         chain: "ethereum",
-        params: { to: "RecipientAddr1234567890abcdef1234", amount: "0.5", token: "ETH" },
+        params: { to: VALID_SOL_ADDRESS, amount: "0.5", token: "ETH" },
       });
 
-      expect(result.status).toBe("confirmed");
+      expect(result.status).toBe("failed");
+      expect(result.error?.code).toBe("VALIDATION_FAILED");
+      expect(result.error?.message).toContain("Chain mismatch");
     });
   });
 
@@ -1414,7 +1420,7 @@ describe("AgentWallet", () => {
       const result = await wallet.execute({
         type: "transfer",
         chain: "solana",
-        params: { to: "RecipientAddr", amount: "", token: "SOL" },
+        params: { to: VALID_SOL_ADDRESS, amount: "", token: "SOL" },
       });
 
       expect(result.status).toBe("failed");
@@ -1427,7 +1433,7 @@ describe("AgentWallet", () => {
       const result = await wallet.execute({
         type: "transfer",
         chain: "solana",
-        params: { to: "RecipientAddr", amount: "1.0", token: "" },
+        params: { to: VALID_SOL_ADDRESS, amount: "1.0", token: "" },
       });
 
       expect(result.status).toBe("failed");
@@ -1440,7 +1446,7 @@ describe("AgentWallet", () => {
       const result = await wallet.execute({
         type: "transfer",
         chain: "solana",
-        params: { to: "RecipientAddr", amount: "not-a-number", token: "SOL" },
+        params: { to: VALID_SOL_ADDRESS, amount: "not-a-number", token: "SOL" },
       });
 
       expect(result.status).toBe("failed");
@@ -1453,7 +1459,7 @@ describe("AgentWallet", () => {
       const result = await wallet.execute({
         type: "transfer",
         chain: "solana",
-        params: { to: "RecipientAddr", amount: "0", token: "SOL" },
+        params: { to: VALID_SOL_ADDRESS, amount: "0", token: "SOL" },
       });
 
       expect(result.status).toBe("failed");
@@ -1466,7 +1472,7 @@ describe("AgentWallet", () => {
       const result = await wallet.execute({
         type: "transfer",
         chain: "solana",
-        params: { to: "RecipientAddr", amount: "-5", token: "SOL" },
+        params: { to: VALID_SOL_ADDRESS, amount: "-5", token: "SOL" },
       });
 
       expect(result.status).toBe("failed");
@@ -1544,26 +1550,26 @@ describe("AgentWallet", () => {
       expect(result.error!.message).toContain("'collection' must be a non-empty string");
     });
 
-    it("should reject mint with empty metadataUri", async () => {
-      const wallet = createWallet();
-      const result = await wallet.execute({
-        type: "mint",
-        chain: "solana",
-        params: { collection: "Collection123", metadataUri: "" },
-      });
+	    it("should reject mint with empty metadataUri", async () => {
+	      const wallet = createWallet();
+	      const result = await wallet.execute({
+	        type: "mint",
+	        chain: "solana",
+	        params: { collection: VALID_SOL_ADDRESS_2, metadataUri: "" },
+	      });
 
       expect(result.status).toBe("failed");
       expect(result.error!.code).toBe("VALIDATION_FAILED");
       expect(result.error!.message).toContain("'metadataUri' must be a non-empty string");
     });
 
-    it("should accept valid mint intent", async () => {
-      const wallet = createWallet();
-      const result = await wallet.execute({
-        type: "mint",
-        chain: "solana",
-        params: { collection: "Collection123", metadataUri: "https://example.com/meta.json" },
-      });
+	    it("should accept valid mint intent", async () => {
+	      const wallet = createWallet();
+	      const result = await wallet.execute({
+	        type: "mint",
+	        chain: "solana",
+	        params: { collection: VALID_SOL_ADDRESS_2, metadataUri: "https://example.com/meta.json" },
+	      });
 
       expect(result.status).toBe("confirmed");
     });
@@ -1623,7 +1629,7 @@ describe("AgentWallet", () => {
       const result = await wallet.execute({
         type: "custom",
         chain: "solana",
-        params: { programId: "Prog123", data: 12345 as any, accounts: [] },
+        params: { programId: VALID_SOL_ADDRESS_2, data: 12345 as any, accounts: [] },
       });
 
       expect(result.status).toBe("failed");
@@ -1636,7 +1642,7 @@ describe("AgentWallet", () => {
       const result = await wallet.execute({
         type: "custom",
         chain: "solana",
-        params: { programId: "Prog123", data: "abc", accounts: "not-an-array" as any },
+        params: { programId: VALID_SOL_ADDRESS_2, data: "abc", accounts: "not-an-array" as any },
       });
 
       expect(result.status).toBe("failed");
@@ -1649,21 +1655,31 @@ describe("AgentWallet", () => {
       const result = await wallet.execute({
         type: "custom",
         chain: "solana",
-        params: { programId: "Prog123", data: "abc", accounts: [] },
+        params: { programId: VALID_SOL_ADDRESS_2, data: "abc", accounts: [] },
       });
 
       expect(result.status).toBe("confirmed");
     });
 
-    it("should accept all valid chains (solana, ethereum, base)", async () => {
-      for (const chain of ["solana", "ethereum", "base"] as const) {
-        const wallet = createWallet();
+    it("should accept matching chain and reject mismatched chains", async () => {
+      // Solana matches the mock adapter — should succeed
+      const wallet = createWallet();
+      const solanaResult = await wallet.execute({
+        type: "transfer",
+        chain: "solana",
+        params: { to: VALID_SOL_ADDRESS, amount: "1.0", token: "SOL" },
+      });
+      expect(solanaResult.status).toBe("confirmed");
+
+      // Ethereum and Base don't match the solana adapter — should fail with chain mismatch
+      for (const chain of ["ethereum", "base"] as const) {
         const result = await wallet.execute({
           type: "transfer",
           chain,
-          params: { to: "RecipientAddr1234567890abcdef1234", amount: "1.0", token: "SOL" },
+          params: { to: VALID_SOL_ADDRESS, amount: "1.0", token: "SOL" },
         });
-        expect(result.status).toBe("confirmed");
+        expect(result.status).toBe("failed");
+        expect(result.error?.message).toContain("Chain mismatch");
       }
     });
 
@@ -1683,7 +1699,7 @@ describe("AgentWallet", () => {
       const mintResult = await wallet.execute({
         type: "mint",
         chain: "solana",
-        params: { collection: "Col123", metadataUri: "https://example.com/meta.json" },
+        params: { collection: VALID_SOL_ADDRESS_2, metadataUri: "https://example.com/meta.json" },
       });
       expect(mintResult.status).toBe("confirmed");
 
@@ -1694,11 +1710,11 @@ describe("AgentWallet", () => {
       });
       expect(stakeResult.status).toBe("confirmed");
 
-      const customResult = await wallet.execute({
-        type: "custom",
-        chain: "solana",
-        params: { programId: "Prog123", data: "abc", accounts: [] },
-      });
+	      const customResult = await wallet.execute({
+	        type: "custom",
+	        chain: "solana",
+	        params: { programId: VALID_SOL_ADDRESS_2, data: "abc", accounts: [] },
+	      });
       expect(customResult.status).toBe("confirmed");
     });
 
@@ -1744,7 +1760,7 @@ describe("AgentWallet", () => {
       const result = await wallet.execute({
         type: "transfer",
         chain: "solana",
-        params: { to: "RecipientAddr", amount: "  ", token: "SOL" },
+        params: { to: VALID_SOL_ADDRESS, amount: "  ", token: "SOL" },
       });
 
       expect(result.status).toBe("failed");
@@ -1798,7 +1814,7 @@ describe("AgentWallet", () => {
       const wallet = createApprovalWallet(approval);
 
       const result = await wallet.execute(
-        createTransferIntent({ params: { to: "RecipientAddr1234567890abcdef1234", amount: "2.0", token: "SOL" } }),
+        createTransferIntent({ params: { to: VALID_SOL_ADDRESS, amount: "2.0", token: "SOL" } }),
       );
 
       expect(result.status).toBe("confirmed");
@@ -1815,7 +1831,7 @@ describe("AgentWallet", () => {
       const wallet = createApprovalWallet(approval);
 
       const result = await wallet.execute(
-        createTransferIntent({ params: { to: "RecipientAddr1234567890abcdef1234", amount: "10.0", token: "SOL" } }),
+        createTransferIntent({ params: { to: VALID_SOL_ADDRESS, amount: "10.0", token: "SOL" } }),
       );
 
       expect(result.status).toBe("confirmed");
@@ -1833,7 +1849,7 @@ describe("AgentWallet", () => {
       const wallet = createApprovalWallet(approval);
 
       const result = await wallet.execute(
-        createTransferIntent({ params: { to: "RecipientAddr1234567890abcdef1234", amount: "10.0", token: "SOL" } }),
+        createTransferIntent({ params: { to: VALID_SOL_ADDRESS, amount: "10.0", token: "SOL" } }),
       );
 
       expect(result.status).toBe("denied");
@@ -1853,7 +1869,7 @@ describe("AgentWallet", () => {
       const wallet = createApprovalWallet(approval);
 
       const result = await wallet.execute(
-        createTransferIntent({ params: { to: "RecipientAddr1234567890abcdef1234", amount: "10.0", token: "SOL" } }),
+        createTransferIntent({ params: { to: VALID_SOL_ADDRESS, amount: "10.0", token: "SOL" } }),
       );
 
       expect(result.status).toBe("denied");
@@ -1869,7 +1885,7 @@ describe("AgentWallet", () => {
       const wallet = createWallet({ policy, store });
 
       const result = await wallet.execute(
-        createTransferIntent({ params: { to: "RecipientAddr1234567890abcdef1234", amount: "10.0", token: "SOL" } }),
+        createTransferIntent({ params: { to: VALID_SOL_ADDRESS, amount: "10.0", token: "SOL" } }),
       );
 
       expect(result.status).toBe("denied");
@@ -1887,7 +1903,7 @@ describe("AgentWallet", () => {
       const wallet = createApprovalWallet(approval);
 
       const result = await wallet.execute(
-        createTransferIntent({ params: { to: "RecipientAddr1234567890abcdef1234", amount: "10.0", token: "SOL" } }),
+        createTransferIntent({ params: { to: VALID_SOL_ADDRESS, amount: "10.0", token: "SOL" } }),
       );
 
       expect(result.status).toBe("denied");
@@ -1906,7 +1922,7 @@ describe("AgentWallet", () => {
 
       await wallet.execute(
         createTransferIntent({
-          params: { to: "RecipientAddr1234567890abcdef1234", amount: "10.0", token: "SOL" },
+          params: { to: VALID_SOL_ADDRESS, amount: "10.0", token: "SOL" },
           metadata: { agentId: "agent-99", reason: "quarterly payout" },
         }),
       );
@@ -1915,7 +1931,7 @@ describe("AgentWallet", () => {
       const request: ApprovalRequest = requestSpy.mock.calls[0]![0];
       expect(request.amount).toBe("10");
       expect(request.token).toBe("SOL");
-      expect(request.target).toBe("RecipientAddr1234567890abcdef1234");
+      expect(request.target).toBe(VALID_SOL_ADDRESS);
       expect(request.agentId).toBe("agent-99");
       expect(request.expiresAt).toBeGreaterThan(Date.now());
     });
@@ -1933,7 +1949,7 @@ describe("AgentWallet", () => {
       const wallet = createWallet({ policy, store, approval });
 
       await wallet.execute(
-        createTransferIntent({ params: { to: "RecipientAddr1234567890abcdef1234", amount: "10.0", token: "SOL" } }),
+        createTransferIntent({ params: { to: VALID_SOL_ADDRESS, amount: "10.0", token: "SOL" } }),
       );
 
       const logs = await store.getRecent("audit:log", 10);
@@ -1956,7 +1972,7 @@ describe("AgentWallet", () => {
 
       // Exactly 5.0 SOL with threshold of 5 — should be allowed without approval (<=)
       const result = await wallet.execute(
-        createTransferIntent({ params: { to: "RecipientAddr1234567890abcdef1234", amount: "5.0", token: "SOL" } }),
+        createTransferIntent({ params: { to: VALID_SOL_ADDRESS, amount: "5.0", token: "SOL" } }),
       );
 
       expect(result.status).toBe("confirmed");
@@ -1972,7 +1988,7 @@ describe("AgentWallet", () => {
       const wallet = createApprovalWallet(approval, { amount: "5", token: "SOL" });
 
       const result = await wallet.execute(
-        createTransferIntent({ params: { to: "RecipientAddr1234567890abcdef1234", amount: "5.01", token: "SOL" } }),
+        createTransferIntent({ params: { to: VALID_SOL_ADDRESS, amount: "5.01", token: "SOL" } }),
       );
 
       expect(result.status).toBe("confirmed");
@@ -1990,7 +2006,7 @@ describe("AgentWallet", () => {
 
       // Transfer 1000 USDC — threshold is for SOL, so this should pass without approval
       const result = await wallet.execute(
-        createTransferIntent({ params: { to: "RecipientAddr1234567890abcdef1234", amount: "1000", token: "USDC" } }),
+        createTransferIntent({ params: { to: VALID_SOL_ADDRESS, amount: "1000", token: "USDC" } }),
       );
 
       expect(result.status).toBe("confirmed");
