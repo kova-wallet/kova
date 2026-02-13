@@ -1,4 +1,4 @@
 export type { Signer, UnsignedTransaction, SignedTransaction } from "./interface.js";
 export { LocalSigner } from "./local.js";
-export { MPCSigner } from "./mpc.js";
-export type { MPCSignerConfig } from "./mpc.js";
+export { MpcSigner, MpcSignerError } from "./mpc.js";
+export type { MpcSigningProvider, MpcSignerConfig, MpcSignResult, MpcSignerErrorCode } from "./mpc.js";

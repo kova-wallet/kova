@@ -64,7 +64,8 @@ export { ApprovalGateRule } from "./policy/rules/approval-gate.js";
 // Signers
 export type { Signer, UnsignedTransaction, SignedTransaction } from "./signers/interface.js";
 export { LocalSigner } from "./signers/local.js";
-export { MPCSigner } from "./signers/mpc.js";
+export { MpcSigner, MpcSignerError } from "./signers/mpc.js";
+export type { MpcSigningProvider, MpcSignerConfig, MpcSignResult, MpcSignerErrorCode } from "./signers/mpc.js";
 
 // Stores
 export type { Store } from "./stores/interface.js";

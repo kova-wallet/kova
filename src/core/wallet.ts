@@ -54,9 +54,35 @@ const VALID_TYPES = new Set(["transfer", "swap", "mint", "stake", "custom"]);
 /** HIGH-10 fix: Maximum length limits for string inputs to prevent memory exhaustion */
 const MAX_ADDRESS_LENGTH = 128;
 const MAX_TOKEN_LENGTH = 64;
-const MAX_DATA_LENGTH = 1_048_576; // 1MB
+const MAX_DATA_LENGTH = 65_536; // SEC: 64KB (reduced from 1MB to limit audit log entry size)
 const MAX_URI_LENGTH = 2048;
 const MAX_REASON_LENGTH = 1024;
+const MAX_AMOUNT_LENGTH = 64;
+const MAX_AMOUNT_DECIMALS = 18; // SEC: supports EVM-style 18 decimals, safe for Solana (<= 9)
+const MAX_METADATA_ID_LENGTH = 128;
+/** SEC: Maximum accounts per custom intent to prevent oversized audit entries */
+const MAX_ACCOUNTS = 64;
+/** SEC: Prevent JSON.parse memory DoS on tool-provided accounts blobs */
+const MAX_ACCOUNTS_JSON_LENGTH = 65_536; // 64KB
+
+const DECIMAL_AMOUNT_REGEX = /^\d+(\.\d+)?$/;
+
+function validateDecimalAmount(value: string): string | null {
+  if (value.length > MAX_AMOUNT_LENGTH) return `'amount' exceeds max length of ${MAX_AMOUNT_LENGTH}`;
+  if (value.trim() !== value) return "'amount' must not include leading or trailing whitespace";
+  if (!DECIMAL_AMOUNT_REGEX.test(value)) {
+    return `invalid amount '${value}'. Must be a positive decimal string`;
+  }
+  const fractional = value.split(".")[1];
+  if (fractional && fractional.length > MAX_AMOUNT_DECIMALS) {
+    return `'amount' has more than ${MAX_AMOUNT_DECIMALS} decimal places`;
+  }
+  const parsed = parseFloat(value);
+  if (isNaN(parsed) || !Number.isFinite(parsed) || parsed <= 0) {
+    return `invalid amount '${value}'. Must be a finite positive number`;
+  }
+  return null;
+}
 
 export interface AgentWalletConfig {
   /** The signer responsible for signing transactions */
@@ -444,74 +470,184 @@ export class AgentWallet {
       return `Invalid chain: ${String(intent.chain)}. Must be one of: solana, ethereum, base`;
     }
 
+    // SEC: Verify intent chain matches the configured adapter to prevent
+    // cross-chain confusion (e.g., intent labeled "ethereum" executed by SolanaAdapter)
+    if (intent.chain !== this.chain.chain) {
+      return `Chain mismatch: intent targets "${intent.chain}" but wallet is configured for "${this.chain.chain}"`;
+    }
+
     if (!intent.params || typeof intent.params !== "object") {
       return "Intent params must be a non-null object";
     }
 
-    // S2-15 fix: Validate intent ID format if provided
-    if (intent.id !== undefined) {
-      if (typeof intent.id !== "string" || intent.id.length === 0 || intent.id.length > 128) {
-        return "Intent ID must be a string between 1 and 128 characters";
-      }
-    }
+	    // S2-15 fix: Validate intent ID format if provided
+	    if (intent.id !== undefined) {
+	      if (typeof intent.id !== "string" || intent.id.length === 0 || intent.id.length > 128) {
+	        return "Intent ID must be a string between 1 and 128 characters";
+	      }
+	    }
 
-    // HIGH-10 fix: Validate metadata reason length
-    if (intent.metadata && typeof intent.metadata === "object") {
-      if (intent.metadata.reason !== undefined && typeof intent.metadata.reason === "string") {
-        if (intent.metadata.reason.length > MAX_REASON_LENGTH) {
-          return `Metadata reason exceeds maximum length of ${MAX_REASON_LENGTH} characters`;
-        }
-      }
-    }
+	    if (intent.createdAt !== undefined) {
+	      if (typeof intent.createdAt !== "number" || !Number.isFinite(intent.createdAt) || intent.createdAt < 0) {
+	        return "Intent createdAt must be a finite non-negative number (milliseconds since epoch)";
+	      }
+	    }
 
-    // Type-specific validation with HIGH-10 max length checks
-    if (isTransferIntent(intent)) {
-      const { to, amount, token } = intent.params;
-      if (typeof to !== "string" || to.trim() === "") return "Transfer: 'to' must be a non-empty string";
-      if (to.length > MAX_ADDRESS_LENGTH) return `Transfer: 'to' exceeds max length of ${MAX_ADDRESS_LENGTH}`;
-      if (typeof amount !== "string" || amount.trim() === "") return "Transfer: 'amount' must be a non-empty string";
-      const parsed = parseFloat(amount);
-      if (isNaN(parsed) || !Number.isFinite(parsed) || parsed <= 0) return `Transfer: invalid amount '${amount}'. Must be a finite positive number`;
-      if (typeof token !== "string" || token.trim() === "") return "Transfer: 'token' must be a non-empty string";
-      if (token.length > MAX_TOKEN_LENGTH) return `Transfer: 'token' exceeds max length of ${MAX_TOKEN_LENGTH}`;
-    }
+	    if (intent.metadata !== undefined) {
+	      if (!intent.metadata || typeof intent.metadata !== "object" || Array.isArray(intent.metadata)) {
+	        return "Intent metadata must be an object";
+	      }
 
-    if (isSwapIntent(intent)) {
-      const { fromToken, toToken, amount } = intent.params;
-      if (typeof fromToken !== "string" || fromToken.trim() === "") return "Swap: 'fromToken' must be a non-empty string";
-      if (fromToken.length > MAX_TOKEN_LENGTH) return `Swap: 'fromToken' exceeds max length of ${MAX_TOKEN_LENGTH}`;
-      if (typeof toToken !== "string" || toToken.trim() === "") return "Swap: 'toToken' must be a non-empty string";
-      if (toToken.length > MAX_TOKEN_LENGTH) return `Swap: 'toToken' exceeds max length of ${MAX_TOKEN_LENGTH}`;
-      if (typeof amount !== "string" || amount.trim() === "") return "Swap: 'amount' must be a non-empty string";
-      const parsed = parseFloat(amount);
-      if (isNaN(parsed) || !Number.isFinite(parsed) || parsed <= 0) return `Swap: invalid amount '${amount}'. Must be a finite positive number`;
-    }
+	      const metadata = intent.metadata as Record<string, unknown>;
+	      if (metadata.reason !== undefined) {
+	        if (typeof metadata.reason !== "string") return "Metadata 'reason' must be a string";
+	        if (metadata.reason.length > MAX_REASON_LENGTH) {
+	          return `Metadata reason exceeds maximum length of ${MAX_REASON_LENGTH} characters`;
+	        }
+	      }
+	      if (metadata.agentId !== undefined) {
+	        if (typeof metadata.agentId !== "string" || metadata.agentId.trim() === "") {
+	          return "Metadata 'agentId' must be a non-empty string";
+	        }
+	        if (metadata.agentId.length > MAX_METADATA_ID_LENGTH) {
+	          return `Metadata 'agentId' exceeds max length of ${MAX_METADATA_ID_LENGTH}`;
+	        }
+	      }
+	      if (metadata.taskId !== undefined) {
+	        if (typeof metadata.taskId !== "string" || metadata.taskId.trim() === "") {
+	          return "Metadata 'taskId' must be a non-empty string";
+	        }
+	        if (metadata.taskId.length > MAX_METADATA_ID_LENGTH) {
+	          return `Metadata 'taskId' exceeds max length of ${MAX_METADATA_ID_LENGTH}`;
+	        }
+	      }
+	      if (metadata.urgency !== undefined) {
+	        if (metadata.urgency !== "low" && metadata.urgency !== "normal" && metadata.urgency !== "high") {
+	          return "Metadata 'urgency' must be one of: low, normal, high";
+	        }
+	      }
+	    }
 
-    if (isMintIntent(intent)) {
-      const { collection, metadataUri } = intent.params;
-      if (typeof collection !== "string" || collection.trim() === "") return "Mint: 'collection' must be a non-empty string";
-      if (collection.length > MAX_ADDRESS_LENGTH) return `Mint: 'collection' exceeds max length of ${MAX_ADDRESS_LENGTH}`;
-      if (typeof metadataUri !== "string" || metadataUri.trim() === "") return "Mint: 'metadataUri' must be a non-empty string";
-      if (metadataUri.length > MAX_URI_LENGTH) return `Mint: 'metadataUri' exceeds max length of ${MAX_URI_LENGTH}`;
-    }
+	    // Type-specific validation with HIGH-10 max length checks
+	    if (isTransferIntent(intent)) {
+	      const { to, amount, token } = intent.params;
+	      if (typeof to !== "string" || to.trim() === "") return "Transfer: 'to' must be a non-empty string";
+	      if (to.length > MAX_ADDRESS_LENGTH) return `Transfer: 'to' exceeds max length of ${MAX_ADDRESS_LENGTH}`;
+	      if (to.trim() !== to) return "Transfer: 'to' must not include leading or trailing whitespace";
+	      try {
+	        if (!this.chain.isValidAddress(to)) return `Transfer: 'to' is not a valid ${this.chain.chain} address`;
+	      } catch {
+	        return `Transfer: failed to validate recipient address for chain "${this.chain.chain}"`;
+	      }
 
-    if (isStakeIntent(intent)) {
-      const { amount, token } = intent.params;
-      if (typeof amount !== "string" || amount.trim() === "") return "Stake: 'amount' must be a non-empty string";
-      const parsed = parseFloat(amount);
-      if (isNaN(parsed) || !Number.isFinite(parsed) || parsed <= 0) return `Stake: invalid amount '${amount}'. Must be a finite positive number`;
-      if (typeof token !== "string" || token.trim() === "") return "Stake: 'token' must be a non-empty string";
-      if (token.length > MAX_TOKEN_LENGTH) return `Stake: 'token' exceeds max length of ${MAX_TOKEN_LENGTH}`;
-    }
+	      if (typeof amount !== "string" || amount.trim() === "") return "Transfer: 'amount' must be a non-empty string";
+	      const amountErr = validateDecimalAmount(amount);
+	      if (amountErr) return `Transfer: ${amountErr}`;
 
-    if (isCustomIntent(intent)) {
-      const { programId, data, accounts } = intent.params;
-      if (typeof programId !== "string" || programId.trim() === "") return "Custom: 'programId' must be a non-empty string";
-      if (programId.length > MAX_ADDRESS_LENGTH) return `Custom: 'programId' exceeds max length of ${MAX_ADDRESS_LENGTH}`;
-      if (typeof data !== "string") return "Custom: 'data' must be a string";
-      if (data.length > MAX_DATA_LENGTH) return `Custom: 'data' exceeds max length of ${MAX_DATA_LENGTH}`;
-      if (!Array.isArray(accounts)) return "Custom: 'accounts' must be an array";
-    }
+	      if (typeof token !== "string" || token.trim() === "") return "Transfer: 'token' must be a non-empty string";
+	      if (token.trim() !== token) return "Transfer: 'token' must not include leading or trailing whitespace";
+	      if (token.length > MAX_TOKEN_LENGTH) return `Transfer: 'token' exceeds max length of ${MAX_TOKEN_LENGTH}`;
+	    }
+
+	    if (isSwapIntent(intent)) {
+	      const { fromToken, toToken, amount, maxSlippage } = intent.params;
+	      if (typeof fromToken !== "string" || fromToken.trim() === "") return "Swap: 'fromToken' must be a non-empty string";
+	      if (fromToken.trim() !== fromToken) return "Swap: 'fromToken' must not include leading or trailing whitespace";
+	      if (fromToken.length > MAX_TOKEN_LENGTH) return `Swap: 'fromToken' exceeds max length of ${MAX_TOKEN_LENGTH}`;
+	      if (typeof toToken !== "string" || toToken.trim() === "") return "Swap: 'toToken' must be a non-empty string";
+	      if (toToken.trim() !== toToken) return "Swap: 'toToken' must not include leading or trailing whitespace";
+	      if (toToken.length > MAX_TOKEN_LENGTH) return `Swap: 'toToken' exceeds max length of ${MAX_TOKEN_LENGTH}`;
+	      if (typeof amount !== "string" || amount.trim() === "") return "Swap: 'amount' must be a non-empty string";
+	      const amountErr = validateDecimalAmount(amount);
+	      if (amountErr) return `Swap: ${amountErr}`;
+	      if (maxSlippage !== undefined) {
+	        if (typeof maxSlippage !== "number" || !Number.isFinite(maxSlippage) || maxSlippage < 0 || maxSlippage > 1) {
+	          return "Swap: 'maxSlippage' must be a finite number between 0 and 1";
+	        }
+	      }
+	    }
+
+	    if (isMintIntent(intent)) {
+	      const { collection, metadataUri, to } = intent.params;
+	      if (typeof collection !== "string" || collection.trim() === "") return "Mint: 'collection' must be a non-empty string";
+	      if (collection.length > MAX_ADDRESS_LENGTH) return `Mint: 'collection' exceeds max length of ${MAX_ADDRESS_LENGTH}`;
+	      if (collection.trim() !== collection) return "Mint: 'collection' must not include leading or trailing whitespace";
+	      try {
+	        if (!this.chain.isValidAddress(collection)) return `Mint: 'collection' is not a valid ${this.chain.chain} address`;
+	      } catch {
+	        return `Mint: failed to validate collection address for chain "${this.chain.chain}"`;
+	      }
+	      if (typeof metadataUri !== "string" || metadataUri.trim() === "") return "Mint: 'metadataUri' must be a non-empty string";
+	      if (metadataUri.trim() !== metadataUri) return "Mint: 'metadataUri' must not include leading or trailing whitespace";
+	      if (metadataUri.length > MAX_URI_LENGTH) return `Mint: 'metadataUri' exceeds max length of ${MAX_URI_LENGTH}`;
+	      if (to !== undefined) {
+	        if (typeof to !== "string" || to.trim() === "") return "Mint: 'to' must be a non-empty string";
+	        if (to.length > MAX_ADDRESS_LENGTH) return `Mint: 'to' exceeds max length of ${MAX_ADDRESS_LENGTH}`;
+	        if (to.trim() !== to) return "Mint: 'to' must not include leading or trailing whitespace";
+	        try {
+	          if (!this.chain.isValidAddress(to)) return `Mint: 'to' is not a valid ${this.chain.chain} address`;
+	        } catch {
+	          return `Mint: failed to validate recipient address for chain "${this.chain.chain}"`;
+	        }
+	      }
+	    }
+
+	    if (isStakeIntent(intent)) {
+	      const { amount, token, validator } = intent.params;
+	      if (typeof amount !== "string" || amount.trim() === "") return "Stake: 'amount' must be a non-empty string";
+	      const amountErr = validateDecimalAmount(amount);
+	      if (amountErr) return `Stake: ${amountErr}`;
+	      if (typeof token !== "string" || token.trim() === "") return "Stake: 'token' must be a non-empty string";
+	      if (token.trim() !== token) return "Stake: 'token' must not include leading or trailing whitespace";
+	      if (token.length > MAX_TOKEN_LENGTH) return `Stake: 'token' exceeds max length of ${MAX_TOKEN_LENGTH}`;
+	      if (validator !== undefined) {
+	        if (typeof validator !== "string" || validator.trim() === "") return "Stake: 'validator' must be a non-empty string";
+	        if (validator.length > MAX_ADDRESS_LENGTH) return `Stake: 'validator' exceeds max length of ${MAX_ADDRESS_LENGTH}`;
+	        if (validator.trim() !== validator) return "Stake: 'validator' must not include leading or trailing whitespace";
+	        try {
+	          if (!this.chain.isValidAddress(validator)) return `Stake: 'validator' is not a valid ${this.chain.chain} address`;
+	        } catch {
+	          return `Stake: failed to validate validator address for chain "${this.chain.chain}"`;
+	        }
+	      }
+	    }
+
+	    if (isCustomIntent(intent)) {
+	      const { programId, data, accounts } = intent.params;
+	      if (typeof programId !== "string" || programId.trim() === "") return "Custom: 'programId' must be a non-empty string";
+	      if (programId.length > MAX_ADDRESS_LENGTH) return `Custom: 'programId' exceeds max length of ${MAX_ADDRESS_LENGTH}`;
+	      if (programId.trim() !== programId) return "Custom: 'programId' must not include leading or trailing whitespace";
+	      try {
+	        if (!this.chain.isValidAddress(programId)) return `Custom: 'programId' is not a valid ${this.chain.chain} address`;
+	      } catch {
+	        return `Custom: failed to validate programId for chain "${this.chain.chain}"`;
+	      }
+	      if (typeof data !== "string") return "Custom: 'data' must be a string";
+	      if (data.trim() !== data) return "Custom: 'data' must not include leading or trailing whitespace";
+	      if (data.length > MAX_DATA_LENGTH) return `Custom: 'data' exceeds max length of ${MAX_DATA_LENGTH}`;
+	      if (!Array.isArray(accounts)) return "Custom: 'accounts' must be an array";
+	      if (accounts.length > MAX_ACCOUNTS) return `Custom: 'accounts' exceeds max count of ${MAX_ACCOUNTS}`;
+	      for (const account of accounts) {
+	        if (
+	          !account ||
+	          typeof account !== "object" ||
+	          typeof (account as { address?: unknown }).address !== "string" ||
+	          typeof (account as { isSigner?: unknown }).isSigner !== "boolean" ||
+	          typeof (account as { isWritable?: unknown }).isWritable !== "boolean"
+	        ) {
+	          return "Custom: each account must have { address: string, isSigner: boolean, isWritable: boolean }";
+	        }
+	        const address = (account as { address: string }).address;
+	        if (address.trim() === "") return "Custom: account 'address' must be a non-empty string";
+	        if (address.length > MAX_ADDRESS_LENGTH) return `Custom: account 'address' exceeds max length of ${MAX_ADDRESS_LENGTH}`;
+	        if (address.trim() !== address) return "Custom: account 'address' must not include leading or trailing whitespace";
+	        try {
+	          if (!this.chain.isValidAddress(address)) return `Custom: account 'address' is not a valid ${this.chain.chain} address`;
+	        } catch {
+	          return `Custom: failed to validate account address for chain "${this.chain.chain}"`;
+	        }
+	      }
+	    }
 
     return null;
   }
@@ -563,46 +699,151 @@ export class AgentWallet {
    * Map audit entry state to TransactionStatus.
    * S1-14 fix: explicit handling for each known state.
    */
-  private mapAuditStatus(entry: AuditEntry): TransactionResult["status"] {
-    if (entry.transactionResult?.status === "confirmed") return "confirmed";
-    if (entry.transactionResult?.status === "failed") return "failed";
-    if (entry.finalDecision.decision === "DENY") return "denied";
-    if (entry.finalDecision.decision === "PENDING") return "pending";
-    // ALLOW with no transaction result means execution threw
-    return "failed";
-  }
+	  private mapAuditStatus(entry: AuditEntry): TransactionResult["status"] {
+	    if (entry.transactionResult?.status === "confirmed") return "confirmed";
+	    if (entry.transactionResult?.status === "failed") return "failed";
+	    if (entry.finalDecision.decision === "DENY") return "denied";
+	    if (entry.finalDecision.decision === "PENDING") return "pending";
+	    // ALLOW with no transaction result means execution threw
+	    return "failed";
+	  }
 
-  /**
-   * Log an audit entry for a transaction attempt.
-   * S1-05 fix: deep-clones the intent to prevent shared references.
-   * S6: logger.log() now returns boolean; catch AuditCircuitOpenError.
+	  private sanitizeMetadataForAudit(metadata: unknown): TransactionIntent["metadata"] | undefined {
+	    if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return undefined;
+	    const raw = metadata as Record<string, unknown>;
+	    const sanitized: Record<string, unknown> = {};
+
+	    if (typeof raw.reason === "string") sanitized.reason = raw.reason.slice(0, MAX_REASON_LENGTH);
+	    if (typeof raw.agentId === "string") sanitized.agentId = raw.agentId.slice(0, MAX_METADATA_ID_LENGTH);
+	    if (typeof raw.taskId === "string") sanitized.taskId = raw.taskId.slice(0, MAX_METADATA_ID_LENGTH);
+	    if (raw.urgency === "low" || raw.urgency === "normal" || raw.urgency === "high") sanitized.urgency = raw.urgency;
+
+	    return Object.keys(sanitized).length > 0 ? (sanitized as TransactionIntent["metadata"]) : undefined;
+	  }
+
+	  private sanitizeIntentForAudit(intent: TransactionIntent): TransactionIntent {
+	    const id = typeof intent.id === "string" ? intent.id.slice(0, 128) : undefined;
+	    const createdAt =
+	      typeof intent.createdAt === "number" && Number.isFinite(intent.createdAt) && intent.createdAt >= 0
+	        ? intent.createdAt
+	        : undefined;
+	    const metadata = this.sanitizeMetadataForAudit(intent.metadata);
+
+	    const common = {
+	      ...(id ? { id } : {}),
+	      type: intent.type,
+	      chain: intent.chain,
+	      ...(createdAt !== undefined ? { createdAt } : {}),
+	      ...(metadata ? { metadata } : {}),
+	    } as const;
+
+	    if (isTransferIntent(intent)) {
+	      const { to, amount, token } = intent.params;
+	      return {
+	        ...common,
+	        params: {
+	          to: to.slice(0, MAX_ADDRESS_LENGTH),
+	          amount: amount.slice(0, MAX_AMOUNT_LENGTH),
+	          token: token.slice(0, MAX_TOKEN_LENGTH),
+	        },
+	      };
+	    }
+
+	    if (isSwapIntent(intent)) {
+	      const { fromToken, toToken, amount, maxSlippage } = intent.params;
+	      return {
+	        ...common,
+	        params: {
+	          fromToken: fromToken.slice(0, MAX_TOKEN_LENGTH),
+	          toToken: toToken.slice(0, MAX_TOKEN_LENGTH),
+	          amount: amount.slice(0, MAX_AMOUNT_LENGTH),
+	          ...(typeof maxSlippage === "number" && Number.isFinite(maxSlippage) ? { maxSlippage } : {}),
+	        },
+	      };
+	    }
+
+	    if (isMintIntent(intent)) {
+	      const { collection, metadataUri, to } = intent.params;
+	      return {
+	        ...common,
+	        params: {
+	          collection: collection.slice(0, MAX_ADDRESS_LENGTH),
+	          metadataUri: metadataUri.slice(0, MAX_URI_LENGTH),
+	          ...(typeof to === "string" ? { to: to.slice(0, MAX_ADDRESS_LENGTH) } : {}),
+	        },
+	      };
+	    }
+
+	    if (isStakeIntent(intent)) {
+	      const { amount, token, validator } = intent.params;
+	      return {
+	        ...common,
+	        params: {
+	          amount: amount.slice(0, MAX_AMOUNT_LENGTH),
+	          token: token.slice(0, MAX_TOKEN_LENGTH),
+	          ...(typeof validator === "string" ? { validator: validator.slice(0, MAX_ADDRESS_LENGTH) } : {}),
+	        },
+	      };
+	    }
+
+	    if (isCustomIntent(intent)) {
+	      const { programId, data, accounts } = intent.params;
+	      return {
+	        ...common,
+	        params: {
+	          programId: programId.slice(0, MAX_ADDRESS_LENGTH),
+	          data: data.slice(0, MAX_DATA_LENGTH),
+	          accounts: Array.isArray(accounts)
+	            ? accounts.slice(0, MAX_ACCOUNTS).map((a) => ({
+	              address: a.address.slice(0, MAX_ADDRESS_LENGTH),
+	              isSigner: Boolean(a.isSigner),
+	              isWritable: Boolean(a.isWritable),
+	            }))
+	            : [],
+	        },
+	      };
+	    }
+
+	    return {
+	      ...common,
+	      params: intent.params,
+	    } as TransactionIntent;
+	  }
+
+	  /**
+	   * Log an audit entry for a transaction attempt.
+	   * S1-05 fix: deep-clones the intent to prevent shared references.
+	   * S6: logger.log() now returns boolean; catch AuditCircuitOpenError.
    */
-  private async logAudit(
-    intent: TransactionIntent,
-    ruleAudits: PolicyRuleAudit[],
-    finalDecision: AuditEntry["finalDecision"],
-    txResult?: { txId: string; status: "confirmed" | "failed" },
-  ): Promise<void> {
-    const entry: AuditEntry = {
-      timestamp: Date.now(),
-      intentId: intent.id!,
-      agentId: intent.metadata?.agentId,
-      intent: structuredClone(intent),
-      policyDecisions: structuredClone(ruleAudits),
-      finalDecision: structuredClone(finalDecision),
-      transactionResult: txResult ? structuredClone(txResult) : undefined,
-    };
+	  private async logAudit(
+	    intent: TransactionIntent,
+	    ruleAudits: PolicyRuleAudit[],
+	    finalDecision: AuditEntry["finalDecision"],
+	    txResult?: { txId: string; status: "confirmed" | "failed" },
+	  ): Promise<void> {
+	    try {
+	      const safeIntent = this.sanitizeIntentForAudit(intent);
+	      const intentId = typeof intent.id === "string" ? intent.id : safeIntent.id ?? "unknown";
 
-    try {
-      await this.logger.log(entry);
-    } catch (err) {
-      if (err instanceof AuditCircuitOpenError) {
-        // Audit is now broken — future transactions will be blocked
-        // But don't break the current transaction flow
-      }
-      // Other logging failures are swallowed (backward compatible)
-    }
-  }
+	      const entry: AuditEntry = {
+	        timestamp: Date.now(),
+	        intentId,
+	        agentId: safeIntent.metadata?.agentId,
+	        intent: safeIntent,
+	        policyDecisions: ruleAudits.map((a) => ({ ...a })),
+	        finalDecision: structuredClone(finalDecision),
+	        transactionResult: txResult ? { ...txResult } : undefined,
+	      };
+
+	      await this.logger.log(entry);
+	    } catch (err) {
+	      if (err instanceof AuditCircuitOpenError) {
+	        // Audit is now broken — future transactions will be blocked
+	        // But don't break the current transaction flow
+	      }
+	      // Other logging failures are swallowed (backward compatible)
+	    }
+	  }
 
   // ── Tool call handlers ──────────────────────────────────────────────
 
@@ -684,16 +925,23 @@ export class AgentWallet {
     if (typeof input.data !== "string") return { success: false, error: "Missing or invalid 'data' parameter" };
     const reason = typeof input.reason === "string" ? input.reason : undefined;
 
-    let accounts: Array<{
-      address: string;
-      isSigner: boolean;
-      isWritable: boolean;
-    }>;
-    try {
-      const raw =
-        typeof input.accounts === "string"
-          ? JSON.parse(input.accounts)
-          : input.accounts;
+	    let accounts: Array<{
+	      address: string;
+	      isSigner: boolean;
+	      isWritable: boolean;
+	    }>;
+	    try {
+	      if (typeof input.accounts === "string" && input.accounts.length > MAX_ACCOUNTS_JSON_LENGTH) {
+	        return {
+	          success: false,
+	          error: `Invalid 'accounts' parameter: exceeds max length of ${MAX_ACCOUNTS_JSON_LENGTH} characters`,
+	        };
+	      }
+
+	      const raw =
+	        typeof input.accounts === "string"
+	          ? JSON.parse(input.accounts)
+	          : input.accounts;
 
       // S5-02 fix: validate parsed JSON structure — reject non-arrays and invalid elements
       if (!Array.isArray(raw)) {
@@ -703,24 +951,40 @@ export class AgentWallet {
             "Invalid 'accounts' parameter: must be a valid JSON array of { address, isSigner, isWritable }",
         };
       }
-      for (const item of raw) {
-        if (
-          !item ||
-          typeof item !== "object" ||
-          typeof item.address !== "string" ||
-          typeof item.isSigner !== "boolean" ||
-          typeof item.isWritable !== "boolean"
-        ) {
-          return {
-            success: false,
-            error:
-              "Invalid account entry: each account must have { address: string, isSigner: boolean, isWritable: boolean }",
-          };
-        }
-      }
-      accounts = raw;
-    } catch {
-      return {
+	      for (const item of raw) {
+	        if (
+	          !item ||
+	          typeof item !== "object" ||
+	          typeof item.address !== "string" ||
+	          typeof item.isSigner !== "boolean" ||
+	          typeof item.isWritable !== "boolean"
+	        ) {
+	          return {
+	            success: false,
+	            error:
+	              "Invalid account entry: each account must have { address: string, isSigner: boolean, isWritable: boolean }",
+	          };
+	        }
+	        if (item.address.trim() === "") {
+	          return { success: false, error: "Invalid account entry: 'address' must be a non-empty string" };
+	        }
+	        if (item.address.length > MAX_ADDRESS_LENGTH) {
+	          return { success: false, error: `Invalid account entry: 'address' exceeds max length of ${MAX_ADDRESS_LENGTH}` };
+	        }
+	        if (item.address.trim() !== item.address) {
+	          return { success: false, error: "Invalid account entry: 'address' must not include leading or trailing whitespace" };
+	        }
+	        try {
+	          if (!this.chain.isValidAddress(item.address)) {
+	            return { success: false, error: `Invalid account entry: 'address' is not a valid ${this.chain.chain} address` };
+	          }
+	        } catch {
+	          return { success: false, error: `Invalid account entry: failed to validate address for chain "${this.chain.chain}"` };
+	        }
+	      }
+	      accounts = raw;
+	    } catch {
+	      return {
         success: false,
         error:
           "Invalid 'accounts' parameter: must be a valid JSON array of { address, isSigner, isWritable }",

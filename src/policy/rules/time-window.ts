@@ -9,16 +9,6 @@ import type { PolicyRule, PolicyDecision, PolicyContext, ActiveHoursConfig } fro
 import type { TransactionIntent } from "../../core/intent.js";
 
 /** Map day-of-week number (0=Sun) to config day string */
-const DAY_MAP: Record<number, string> = {
-  0: "sun",
-  1: "mon",
-  2: "tue",
-  3: "wed",
-  4: "thu",
-  5: "fri",
-  6: "sat",
-};
-
 export class TimeWindowRule implements PolicyRule {
   readonly name = "time-window";
   private readonly config: ActiveHoursConfig;

@@ -61,6 +61,8 @@ function canonicalJson(obj: unknown): string {
 /** Recursively sort object keys at all levels */
 function sortKeysDeep(value: unknown): unknown {
   if (value === null || value === undefined) return value;
+  if (typeof value === "bigint") return value.toString();
+  if (value instanceof Uint8Array) return Buffer.from(value).toString("base64");
   if (Array.isArray(value)) return value.map(sortKeysDeep);
   if (typeof value === "object" && value !== null) {
     const sorted: Record<string, unknown> = {};
@@ -272,6 +274,7 @@ export class AuditLogger {
       // Verify the hash itself: recompute from entry content
       // Strip hash and previousHash fields, then recompute using canonical JSON
       const { hash: _storedHash, previousHash: prevHash, ...entryContent } = entry;
+      void _storedHash;
       const entryJson = canonicalJson(entryContent);
       // MED-04 fix: Use domain separator in hash recomputation (must match log())
       const expectedHash = createHash("sha256")

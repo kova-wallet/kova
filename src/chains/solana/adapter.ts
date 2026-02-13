@@ -49,7 +49,16 @@ function validateRpcUrl(url: string, label: string): void {
   }
 
   const hostname = parsed.hostname.toLowerCase();
-  const isLocalhost = hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
+
+  const ipv4Parts = hostname.split(".");
+  const ipv4Octets =
+    ipv4Parts.length === 4 && ipv4Parts.every((p) => /^\d{1,3}$/.test(p))
+      ? ipv4Parts.map(Number)
+      : null;
+  const isValidIpv4 = ipv4Octets ? ipv4Octets.every((o) => o >= 0 && o <= 255) : false;
+  const isLoopbackIpv4 = isValidIpv4 ? ipv4Octets![0] === 127 : false;
+
+  const isLocalhost = hostname === "localhost" || hostname === "::1" || isLoopbackIpv4;
 
   // Enforce HTTPS for non-localhost URLs
   if (parsed.protocol !== "https:" && !isLocalhost) {
@@ -59,21 +68,40 @@ function validateRpcUrl(url: string, label: string): void {
     );
   }
 
-  // Reject RFC 1918 private addresses, link-local, and metadata endpoints
+  // Reject private/internal network addresses (IPv4 + IPv6)
   if (!isLocalhost) {
-    const parts = hostname.split(".");
-    if (parts.length === 4 && parts.every(p => /^\d{1,3}$/.test(p))) {
-      const octets = parts.map(Number);
+    // Check IPv4 private ranges (RFC 1918, link-local, loopback)
+    if (isValidIpv4) {
+      const [o0, o1] = ipv4Octets!;
       const isPrivate =
-        octets[0] === 10 ||
-        (octets[0] === 172 && octets[1]! >= 16 && octets[1]! <= 31) ||
-        (octets[0] === 192 && octets[1] === 168) ||
-        (octets[0] === 169 && octets[1] === 254) ||
-        octets[0] === 0;
+        o0 === 10 ||
+        (o0 === 172 && o1! >= 16 && o1! <= 31) ||
+        (o0 === 192 && o1 === 168) ||
+        (o0 === 169 && o1 === 254) ||
+        (o0 === 100 && o1! >= 64 && o1! <= 127) || // CGNAT (100.64.0.0/10)
+        o0 === 0;
       if (isPrivate) {
         throw new SolanaAdapterError(
           "SSRF_BLOCKED",
           `${label} cannot target private/internal network addresses: ${hostname}`,
+        );
+      }
+    }
+
+    // SEC: Check IPv6 private ranges (ULA fc00::/7, link-local fe80::/10, loopback ::1,
+    // IPv4-mapped ::ffff:x.x.x.x, and other non-global addresses)
+    if (hostname.includes(":")) {
+      const lower = hostname.toLowerCase();
+      const isPrivateIPv6 =
+        lower.startsWith("fc") || lower.startsWith("fd") || // ULA (fc00::/7)
+        lower.startsWith("fe80") ||                          // Link-local (fe80::/10)
+        lower.startsWith("::ffff:") ||                       // IPv4-mapped IPv6
+        lower.startsWith("100:") ||                          // Discard prefix (100::/64)
+        lower === "::";                                      // Unspecified address
+      if (isPrivateIPv6) {
+        throw new SolanaAdapterError(
+          "SSRF_BLOCKED",
+          `${label} cannot target private/internal IPv6 addresses: ${hostname}`,
         );
       }
     }

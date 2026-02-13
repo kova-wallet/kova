@@ -2,7 +2,7 @@
  * SpendingLimitRule — Enforces per-transaction, daily, weekly, and monthly spending caps.
  *
  * Uses store counters with TTL-based expiration for time-window tracking.
- * All amounts are compared as floating-point strings in the configured token denomination.
+ * SEC: All comparisons use precision-safe integer math to avoid IEEE 754 drift.
  */
 
 import type { PolicyRule, PolicyDecision, PolicyContext, SpendingLimitConfig } from "../types.js";
@@ -17,6 +17,36 @@ const TTL = {
   weekly: 604_800,     // 7 days
   monthly: 2_592_000,  // 30 days
 } as const;
+
+/**
+ * SEC: Normalize token identifiers for comparison / keying.
+ * - Token symbols are case-insensitive ("usdc" == "USDC")
+ * - Address-like identifiers (e.g. Solana base58 mints) remain case-sensitive
+ * - EVM addresses are normalized to lowercase
+ */
+function normalizeTokenId(token: string): string {
+  if (token.startsWith("0x") && token.length === 42) return token.toLowerCase();
+  if (/^[A-Za-z0-9_]{2,16}$/.test(token)) return token.toUpperCase();
+  return token;
+}
+
+/**
+ * SEC: Precision-safe decimal math to avoid IEEE 754 floating-point drift.
+ * Amounts are scaled to integers (9 decimal places) before comparison,
+ * preventing issues like 0.1 + 0.2 !== 0.3.
+ */
+const PRECISION_DECIMALS = 9;
+const PRECISION_FACTOR = 10 ** PRECISION_DECIMALS;
+
+/** Scale a number to a precision-safe integer for comparison */
+function toSafeInt(value: number): number {
+  return Math.round(value * PRECISION_FACTOR);
+}
+
+/** Precision-safe greater-than comparison */
+function safeGt(a: number, b: number): boolean {
+  return toSafeInt(a) > toSafeInt(b);
+}
 
 export class SpendingLimitRule implements PolicyRule {
   readonly name = "spending-limit";
@@ -42,9 +72,9 @@ export class SpendingLimitRule implements PolicyRule {
 
     // 1. Per-transaction limit (stateless — no TOCTOU concern)
     if (this.config.perTransaction) {
-      if (token.toUpperCase() === this.config.perTransaction.token.toUpperCase()) {
+      if (normalizeTokenId(token) === normalizeTokenId(this.config.perTransaction.token)) {
         const limit = parseFloat(this.config.perTransaction.amount);
-        if (amount > limit) {
+        if (safeGt(amount, limit)) {
           return {
             decision: "DENY",
             rule: this.name,
@@ -115,12 +145,14 @@ export class SpendingLimitRule implements PolicyRule {
     ttl: number,
     incrementedKeys: Array<{ key: string; amount: number; ttl: number }>,
   ): Promise<PolicyDecision | null> {
-    if (token.toUpperCase() !== limitConfig.token.toUpperCase()) {
+    const normalizedIntentToken = normalizeTokenId(token);
+    const normalizedLimitToken = normalizeTokenId(limitConfig.token);
+    if (normalizedIntentToken !== normalizedLimitToken) {
       return null; // Different token, skip this limit
     }
 
     const limit = parseFloat(limitConfig.amount);
-    const key = `${KEY_PREFIX}${window}:${limitConfig.token.toUpperCase()}`;
+    const key = `${KEY_PREFIX}${window}:${normalizedLimitToken}`;
 
     // HIGH-05 fix: Always set TTL when initializing, using atomic init-if-absent
     await this.ensureKeyWithTTL(context, key, ttl);
@@ -129,7 +161,8 @@ export class SpendingLimitRule implements PolicyRule {
     const newTotal = await context.store.increment(key, amount);
     incrementedKeys.push({ key, amount, ttl });
 
-    if (newTotal > limit) {
+    // SEC: Use precision-safe comparison to avoid float drift in accumulated totals
+    if (safeGt(newTotal, limit)) {
       return {
         decision: "DENY",
         rule: this.name,
@@ -155,14 +188,6 @@ export class SpendingLimitRule implements PolicyRule {
         // Best-effort rollback — failure here means a slight under-count (safe direction)
       }
     }
-  }
-
-  /** Get the current spent amount from the store, returning 0 if not set */
-  private async getCurrentSpent(context: PolicyContext, key: string): Promise<number> {
-    const value = await context.store.get(key);
-    if (value === null) return 0;
-    const parsed = parseFloat(value);
-    return isNaN(parsed) ? 0 : parsed;
   }
 
   /**
