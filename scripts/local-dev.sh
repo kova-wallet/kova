@@ -205,7 +205,44 @@ else
 
   if $INSTALL_SOLANA; then
     info "Installing Solana CLI (this may take a minute)..."
-    sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)" 2>&1 | tail -3
+    # MED-38 fix: Download installer to temp file and verify before executing.
+    # The curl|sh pattern is vulnerable to partial downloads and MITM attacks.
+    #
+    # SUPPLY-009 SECURITY WARNING: This installer is fetched from a remote URL
+    # (https://release.anza.xyz/stable/install) without cryptographic checksum
+    # verification. Anza does not currently publish checksums for this script.
+    # Risks include: MITM attacks, CDN compromise, or partial/corrupt downloads.
+    # Mitigations applied:
+    #   - curl -f flag ensures HTTP errors are caught (no silent failures)
+    #   - Downloaded to a temp file and checked for non-empty before execution
+    #   - HTTPS enforced (TLS protects against passive eavesdropping)
+    # For production/CI environments, prefer installing Solana CLI from the
+    # official GitHub release binaries with GPG signature verification:
+    #   https://github.com/anza-xyz/agave/releases
+    SOLANA_INSTALLER=$(mktemp)
+    trap 'rm -f "$SOLANA_INSTALLER"' EXIT
+    # HIGH-T5-06: SECURITY NOTE — This download does not verify a checksum or GPG
+    # signature of the installer script. An attacker who compromises the CDN or
+    # performs a MITM attack could serve a malicious installer. For production
+    # environments, download the installer from the official GitHub releases page
+    # and verify the GPG signature before executing:
+    #   https://github.com/anza-xyz/agave/releases
+    # TODO: Pin to a specific version and verify SHA256 checksum after download.
+    curl -sSfL https://release.anza.xyz/stable/install -o "$SOLANA_INSTALLER"
+    if [[ ! -s "$SOLANA_INSTALLER" ]]; then
+      error "Failed to download Solana installer (empty file)."
+      echo "  Install manually: https://docs.solanalabs.com/cli/install"
+      exit 1
+    fi
+    # Verify the downloaded script looks like a valid shell installer
+    if ! head -1 "$SOLANA_INSTALLER" | grep -qE '^#!.*(bash|sh)'; then
+      error "Downloaded installer does not appear to be a valid shell script."
+      echo "  This could indicate a compromised download. Install manually:"
+      echo "  https://docs.solanalabs.com/cli/install"
+      rm -f "$SOLANA_INSTALLER"
+      exit 1
+    fi
+    sh "$SOLANA_INSTALLER" 2>&1 | tail -3
 
     # Add to PATH for this session
     export PATH="$HOME/.local/share/solana/install/active_release/bin:$PATH"
@@ -279,6 +316,8 @@ if [[ -f "$LOCAL_KEYPAIR" ]]; then
 else
   info "Generating new keypair..."
   solana-keygen new --outfile "$LOCAL_KEYPAIR" --no-bip39-passphrase --force --silent 2>/dev/null
+  # LOW-T5-08 fix: Restrict keypair file permissions to owner-only (contains private key)
+  chmod 0600 "$LOCAL_KEYPAIR"
   WALLET_ADDRESS=$(solana-keygen pubkey "$LOCAL_KEYPAIR")
   success "Keypair generated: $WALLET_ADDRESS"
   info "Location: $LOCAL_KEYPAIR"
@@ -292,6 +331,8 @@ if [[ -f "$LOCAL_RECIPIENT" ]]; then
 else
   info "Generating recipient keypair for test transfers..."
   solana-keygen new --outfile "$LOCAL_RECIPIENT" --no-bip39-passphrase --force --silent 2>/dev/null
+  # LOW-T5-08 fix: Restrict keypair file permissions to owner-only (contains private key)
+  chmod 0600 "$LOCAL_RECIPIENT"
   RECIPIENT_ADDRESS=$(solana-keygen pubkey "$LOCAL_RECIPIENT")
   success "Recipient keypair generated: $RECIPIENT_ADDRESS"
 fi
@@ -456,7 +497,8 @@ cat > "$ENV_FILE" << EOF
 SOLANA_RPC_URL=$RPC_URL
 
 # Wallet keypair (auto-generated, funded with SOL)
-LOCAL_KEYPAIR_PATH=$LOCAL_KEYPAIR
+# LOW-03 fix: Use relative path to avoid leaking filesystem structure in env files
+LOCAL_KEYPAIR_PATH=.local-keypair.json
 WALLET_ADDRESS=$WALLET_ADDRESS
 
 # Recipient for test transfers (a second local keypair)
@@ -475,6 +517,8 @@ TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
 TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
 EOF
 
+# LOW-T5-07 fix: Restrict .env.local permissions to owner-only (contains secrets)
+chmod 0600 "$ENV_FILE"
 success "Config written to $ENV_FILE"
 
 # ── Step 8: Smoke Test ──────────────────────────────────────────────────────

@@ -3,7 +3,10 @@ import { Policy } from "../../../src/policy/builder.js";
 
 describe("Policy Builder", () => {
   it("should create a basic policy with a name", () => {
-    const policy = Policy.create("test-policy").build();
+    // POLICY-012: Policy now requires at least one rule
+    const policy = Policy.create("test-policy")
+      .rateLimit({ maxTransactionsPerMinute: 10 })
+      .build();
     expect(policy.getName()).toBe("test-policy");
   });
 
@@ -119,7 +122,7 @@ describe("Policy Builder", () => {
       Policy.create("test")
         .requireApproval({ above: { amount: "1.0", token: "SOL" }, timeout: -1 })
         .build(),
-    ).toThrow("Approval gate timeout must be positive");
+    ).toThrow("Approval gate timeout must be a positive finite number");
   });
 
   it("should serialize to JSON and back", () => {
@@ -382,7 +385,7 @@ describe("Policy Builder", () => {
         Policy.create("test")
           .requireApproval({ above: { amount: "1", token: "SOL" }, timeout: 0 })
           .build(),
-      ).toThrow("Approval gate timeout must be positive");
+      ).toThrow("Approval gate timeout must be a positive finite number");
     });
 
     it("should accept approval gate without timeout (uses default)", () => {
@@ -416,15 +419,19 @@ describe("Policy Builder", () => {
     });
 
     it("should handle empty allowlist", () => {
+      // POLICY-012: Policy now requires at least one rule
       const policy = Policy.create("test")
         .allowAddresses([])
+        .rateLimit({ maxTransactionsPerMinute: 10 })
         .build();
       expect(policy.getConfig().allowAddresses).toEqual([]);
     });
 
     it("should handle empty denylist", () => {
+      // POLICY-012: Policy now requires at least one rule
       const policy = Policy.create("test")
         .denyAddresses([])
+        .rateLimit({ maxTransactionsPerMinute: 10 })
         .build();
       expect(policy.getConfig().denyAddresses).toEqual([]);
     });
@@ -526,7 +533,8 @@ describe("Policy Builder", () => {
     });
 
     it("should handle fromJSON with minimal config", () => {
-      const policy = Policy.fromJSON({ name: "minimal" });
+      // POLICY-012: Policy now requires at least one rule
+      const policy = Policy.fromJSON({ name: "minimal", rateLimit: { maxTransactionsPerMinute: 10 } });
       expect(policy.getName()).toBe("minimal");
       expect(policy.getConfig().spendingLimit).toBeUndefined();
     });
@@ -534,18 +542,27 @@ describe("Policy Builder", () => {
 
   describe("policy name edge cases", () => {
     it("should accept names with special characters", () => {
-      const policy = Policy.create("test-policy_v2.1").build();
+      // POLICY-012: Policy now requires at least one rule
+      const policy = Policy.create("test-policy_v2.1")
+        .rateLimit({ maxTransactionsPerMinute: 10 })
+        .build();
       expect(policy.getName()).toBe("test-policy_v2.1");
     });
 
     it("should accept very long policy names", () => {
       const longName = "a".repeat(200);
-      const policy = Policy.create(longName).build();
+      // POLICY-012: Policy now requires at least one rule
+      const policy = Policy.create(longName)
+        .rateLimit({ maxTransactionsPerMinute: 10 })
+        .build();
       expect(policy.getName()).toBe(longName);
     });
 
     it("should accept names with unicode characters", () => {
-      const policy = Policy.create("policy-alpha-beta").build();
+      // POLICY-012: Policy now requires at least one rule
+      const policy = Policy.create("policy-alpha-beta")
+        .rateLimit({ maxTransactionsPerMinute: 10 })
+        .build();
       expect(policy.getName()).toBe("policy-alpha-beta");
     });
   });

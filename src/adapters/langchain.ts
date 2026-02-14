@@ -4,11 +4,18 @@
  * IMPORTANT: Does NOT import or depend on LangChain or Zod.
  * Produces plain objects with the right shape that can be used with LangChain's
  * DynamicStructuredTool or passed to custom tool construction.
+ *
+ * HIGH-16: Before dispatching tool calls, callers should use validateToolInput()
+ * from "./tools.js" to validate and sanitize inputs. This ensures required fields
+ * are present, types are correct, and unknown properties are stripped.
  */
 
-import { WALLET_TOOLS } from "./tools.js";
+import { WALLET_TOOLS, safeHandleToolCall, sanitizeToolResponse } from "./tools.js";
 import type { ToolDefinition } from "./types.js";
 import type { AgentWallet } from "../core/wallet.js";
+
+/** MED-28: Timeout for tool call execution in milliseconds (120 seconds). */
+const TOOL_CALL_TIMEOUT_MS = 120_000;
 
 /** Shape compatible with LangChain's tool interface */
 export interface LangChainToolDefinition {
@@ -46,19 +53,39 @@ export function createLangChainTools(
     description: tool.description,
     schema: {
       type: tool.parameters.type,
-      properties: { ...tool.parameters.properties },
+      // MED-29: Use structuredClone for deep copy to prevent prototype pollution
+      // and mutations from leaking back into the canonical tool definitions.
+      properties: structuredClone(tool.parameters.properties),
       required: [...tool.parameters.required],
     },
     call: async (input: Record<string, unknown>): Promise<string> => {
       // S5-10 fix: defensive try/catch to prevent unhandled errors (e.g. BigInt serialization)
       try {
-        const result = await wallet.handleToolCall(tool.name, input);
-        return JSON.stringify(result);
-      } catch {
-        return JSON.stringify({
-          success: false,
-          error: "An internal error occurred while processing the tool call.",
-        });
+        // MED-28: Wrap handleToolCall in a timeout to prevent indefinite hangs.
+        // If the call does not resolve within TOOL_CALL_TIMEOUT_MS, reject with a timeout error.
+        // API-015: Ensure the timeout timer is cleaned up to prevent resource leaks
+        // and unresolvable Promise references when the tool call resolves before the timeout.
+        let timeoutId: ReturnType<typeof setTimeout>;
+        const result = await Promise.race([
+          safeHandleToolCall(wallet, tool.name, input),
+          new Promise<never>((_, reject) => {
+            timeoutId = setTimeout(
+              () => reject(new Error(`Tool call "${tool.name}" timed out after ${TOOL_CALL_TIMEOUT_MS}ms`)),
+              TOOL_CALL_TIMEOUT_MS,
+            );
+          }),
+        ]).finally(() => clearTimeout(timeoutId));
+        // CRIT-T3-01 fix: Sanitize tool response to mitigate indirect prompt injection.
+        // Wraps data in structured delimiters, truncates long strings, and strips
+        // characters commonly used in injection attacks from on-chain data.
+        return sanitizeToolResponse(tool.name, result);
+      } catch (err) {
+        const message = "An internal error occurred while processing the tool call.";
+        if (err instanceof Error && process.env.NODE_ENV === "test") {
+          // Only expose details in test environment for debugging
+          console.error(`[kova] Tool ${tool.name} error:`, err.message);
+        }
+        return sanitizeToolResponse(tool.name, { success: false, error: message });
       }
     },
   }));

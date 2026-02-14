@@ -5,7 +5,22 @@
  * - Per-minute counter expires after 60 seconds
  * - Per-hour counter expires after 3600 seconds
  *
- * Counters are incremented on ALLOW, so denied transactions don't count.
+ * MED-29 note: Counters are incremented on ALLOW; denied transactions are rolled back.
+ * This means denied attempts don't consume rate limit capacity, allowing an attacker
+ * to probe the rate limit boundary infinitely. This is an intentional trade-off:
+ * counting all attempts would cause legitimate transactions to be denied after
+ * a burst of invalid ones (DoS via bad requests). The wallet's execute mutex
+ * serializes all calls, limiting the probe rate to one at a time.
+ *
+ * HIGH-17 fix: Counter rollback guarantees under mutex serialization:
+ * AgentWallet.execute() serializes calls via a mutex, so only one policy
+ * evaluation runs at a time. This means the atomic increment-then-check
+ * pattern here is safe from TOCTOU races. On denial, counters are rolled
+ * back (decremented). Rollback failures result in slight under-counting
+ * which is the safe direction (allows fewer transactions, not more).
+ * If the store itself fails, the error propagates up and the transaction
+ * is rejected (fail-closed). Store implementations (MemoryStore, SqliteStore)
+ * provide atomic increment operations, so partial increments cannot occur.
  */
 
 import type { PolicyRule, PolicyDecision, PolicyContext, RateLimitConfig } from "../types.js";
@@ -21,9 +36,62 @@ const TTL = {
 export class RateLimitRule implements PolicyRule {
   readonly name = "rate-limit";
   private readonly config: RateLimitConfig;
+  /** POLICY-007 fix: Scoped key prefix for store keys to avoid counter collisions */
+  private readonly scopedKeyPrefix: string;
 
   constructor(config: RateLimitConfig) {
+    // MED-30 fix: Validate rate limit values at construction time to catch
+    // misconfigurations early (e.g., NaN, Infinity, negative, or fractional values).
+    if (config.maxTransactionsPerMinute !== undefined) {
+      if (
+        !Number.isFinite(config.maxTransactionsPerMinute) ||
+        !Number.isInteger(config.maxTransactionsPerMinute) ||
+        config.maxTransactionsPerMinute <= 0
+      ) {
+        throw new Error(
+          `RateLimitRule: maxTransactionsPerMinute must be a positive finite integer, got ${config.maxTransactionsPerMinute}`,
+        );
+      }
+    }
+    if (config.maxTransactionsPerHour !== undefined) {
+      if (
+        !Number.isFinite(config.maxTransactionsPerHour) ||
+        !Number.isInteger(config.maxTransactionsPerHour) ||
+        config.maxTransactionsPerHour <= 0
+      ) {
+        throw new Error(
+          `RateLimitRule: maxTransactionsPerHour must be a positive finite integer, got ${config.maxTransactionsPerHour}`,
+        );
+      }
+    }
+    // POLICY-014 fix: Require at least one limit to be configured. A RateLimitRule
+    // with no limits would be a no-op, silently allowing all transactions through.
+    if (config.maxTransactionsPerMinute === undefined && config.maxTransactionsPerHour === undefined) {
+      throw new Error("RateLimitRule requires at least one limit (maxTransactionsPerMinute or maxTransactionsPerHour)");
+    }
     this.config = config;
+    // M-07 FIX + POLICY-007 fix: Prepend keyPrefix to all store keys for wallet/agent scoping.
+    //
+    // M-07 FIX: Without a keyPrefix, rate limit counters are SHARED across all wallet
+    // instances using the same store backend, causing counter collisions in multi-wallet
+    // deployments. For example, two agents sharing a MemoryStore would share the same
+    // "ratelimit:minute" counter, effectively halving each agent's rate limit.
+    //
+    // CRITICAL: In multi-wallet setups, ALWAYS configure EITHER:
+    //   1. A unique keyPrefix per wallet/agent in RateLimitConfig, OR
+    //   2. PrefixedStore (from stores/prefixed.ts) to wrap the base store:
+    //        new PrefixedStore(baseStore, `wallet:${walletAddress}:`)
+    //
+    // If neither is configured, a warning is emitted to alert operators.
+    if (!config.keyPrefix) {
+      process.emitWarning(
+        "M-07: RateLimitRule created without keyPrefix. Rate limit counters will be " +
+        "shared across all wallet instances using the same store. Configure keyPrefix " +
+        "in RateLimitConfig or use PrefixedStore for per-wallet scoping.",
+        "KovaRateLimitWarning",
+      );
+    }
+    this.scopedKeyPrefix = config.keyPrefix ? `${config.keyPrefix}:${KEY_PREFIX}` : KEY_PREFIX;
   }
 
   /** Get the rate limit configuration (for policy introspection) */
@@ -42,7 +110,7 @@ export class RateLimitRule implements PolicyRule {
     try {
       // 1. Check per-minute limit (atomic increment-then-check)
       if (this.config.maxTransactionsPerMinute !== undefined) {
-        const key = `${KEY_PREFIX}minute`;
+        const key = `${this.scopedKeyPrefix}minute`;
         await this.ensureKeyWithTTL(context, key, TTL.minute);
         const newCount = await context.store.increment(key, 1);
         incrementedKeys.push({ key, ttl: TTL.minute });
@@ -59,7 +127,7 @@ export class RateLimitRule implements PolicyRule {
 
       // 2. Check per-hour limit (atomic increment-then-check)
       if (this.config.maxTransactionsPerHour !== undefined) {
-        const key = `${KEY_PREFIX}hour`;
+        const key = `${this.scopedKeyPrefix}hour`;
         await this.ensureKeyWithTTL(context, key, TTL.hour);
         const newCount = await context.store.increment(key, 1);
         incrementedKeys.push({ key, ttl: TTL.hour });
@@ -99,12 +167,10 @@ export class RateLimitRule implements PolicyRule {
 
   /**
    * Ensure a counter key exists with TTL (initialize if needed).
-   * HIGH-05 fix: Always sets TTL on initialization to prevent permanent counter lock.
+   * MED-04 fix: Uses atomic setIfNotExists to prevent TOCTOU race where concurrent
+   * calls to get()+set() could reset a counter's TTL, erasing rate limit counts.
    */
   private async ensureKeyWithTTL(context: PolicyContext, key: string, ttl: number): Promise<void> {
-    const existing = await context.store.get(key);
-    if (existing === null) {
-      await context.store.set(key, "0", ttl);
-    }
+    await context.store.setIfNotExists(key, "0", ttl);
   }
 }

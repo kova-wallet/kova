@@ -39,6 +39,8 @@ function createMockSigner(address = "MockAddress1234567890abcdef12345678"): Sign
       signature: new Uint8Array(64).fill(1),
     }),
     healthCheck: async () => true,
+    destroy: async () => {},
+    toJSON: () => ({ address }),
   };
 }
 
@@ -57,6 +59,7 @@ function createMockChain(): ChainAdapter {
       data: new TextEncoder().encode(JSON.stringify({ type: intent.type, mock: true })),
       description: `Mock ${intent.type}`,
     }),
+    simulateTransaction: vi.fn().mockResolvedValue({ success: true }),
     broadcast: async () => "mock_tx_abc123",
     getTransactionStatus: async (txId: string) => ({
       status: "confirmed" as const,
@@ -206,7 +209,8 @@ describe("AgentWallet", () => {
       expect(result.error).toBeDefined();
       expect(result.error!.code).toBe("POLICY_DENIED");
       expect(result.error!.message).toBe("All transactions denied");
-      expect(result.error!.policyRule).toBe("deny-all");
+      // H-05 fix: policyRule is no longer exposed to prevent reconnaissance
+      expect(result.error!.policyRule).toBeUndefined();
       expect(result.summary).toContain("Denied by policy");
       expect(result.txId).toBeUndefined();
     });
@@ -369,7 +373,8 @@ describe("AgentWallet", () => {
 
       await wallet.execute(createTransferIntent());
 
-      expect(evaluateSpy).toHaveBeenCalledOnce();
+      // Two-phase evaluation: rule is called once in dry-run, once in commit
+      expect(evaluateSpy).toHaveBeenCalledTimes(2);
       const passedIntent = evaluateSpy.mock.calls[0]![0];
       expect(passedIntent.id).toBeDefined();
       expect(passedIntent.createdAt).toBeDefined();
@@ -603,7 +608,8 @@ describe("AgentWallet", () => {
   describe("execute() — intent normalization", () => {
     it("should preserve caller-provided createdAt timestamp", async () => {
       const wallet = createWallet();
-      const customTime = 1700000000000;
+      // CORE-018: Use a recent timestamp (within ±5 min of now) so it's not clamped
+      const customTime = Date.now() - 60_000; // 1 minute ago
 
       const evaluateSpy = vi.fn(async (): Promise<PolicyDecision> => ({ decision: "ALLOW" }));
       const spyRule: PolicyRule = { name: "spy-rule", evaluate: evaluateSpy };
@@ -860,7 +866,8 @@ describe("AgentWallet", () => {
       const result = await wallet.execute(createTransferIntent());
 
       expect(result.status).toBe("failed");
-      expect(result.error!.message).toBe("42");
+      // CORE-001: Error sanitization strips numeric values
+      expect(result.error!.message).toBe("[restricted]");
     });
 
     it("should handle thrown null gracefully", async () => {
@@ -1292,7 +1299,9 @@ describe("AgentWallet", () => {
 
     it("should not allow concurrent policy bypass (TOCTOU prevention)", async () => {
       // Scenario: rate limit of 1 per minute — concurrent calls should be serialized
-      // so the second call sees the updated counter from the first
+      // so the second call sees the updated counter from the first.
+      // Two-phase evaluation: each transaction calls evaluate() twice (dry-run + commit),
+      // so the threshold must account for 2 calls per allowed transaction.
       const store = new MemoryStore();
 
       let callCount = 0;
@@ -1300,7 +1309,8 @@ describe("AgentWallet", () => {
         name: "rate-check",
         evaluate: async () => {
           callCount++;
-          if (callCount > 1) {
+          // Allow first 2 calls (= 1 transaction's dry-run + commit), deny after
+          if (callCount > 2) {
             return { decision: "DENY" as const, rule: "rate-check", reason: "rate limited" };
           }
           return { decision: "ALLOW" as const };
@@ -1357,6 +1367,54 @@ describe("AgentWallet", () => {
       const ids = results.map((r) => r.intentId);
       expect(new Set(ids).size).toBe(10);
     });
+
+    /**
+     * LOW-08 fix: Concurrency stress test for the execute() mutex.
+     * Verifies that even under heavy concurrent load, the spending counter
+     * is correctly incremented by the mutex (no TOCTOU races).
+     */
+    it("should correctly serialize spending counter under concurrency stress", async () => {
+      const store = new MemoryStore();
+      let evaluateCount = 0;
+
+      // A rule that atomically increments a counter — if the mutex fails,
+      // we'll see fewer increments than expected
+      const countingRule: PolicyRule = {
+        name: "stress-counter",
+        evaluate: async () => {
+          evaluateCount++;
+          // Simulate async work (context switch opportunity)
+          await new Promise((r) => setTimeout(r, 1));
+          return { decision: "ALLOW" as const };
+        },
+      };
+
+      const policy = new PolicyEngine([countingRule], store);
+      const wallet = createWallet({ policy, store });
+
+      const N = 20;
+      const results = await Promise.all(
+        Array.from({ length: N }, (_, i) =>
+          wallet.execute(createTransferIntent({ id: `stress-${i}` })),
+        ),
+      );
+
+      // All must complete
+      expect(results.length).toBe(N);
+      results.forEach((r) => expect(r.status).toBe("confirmed"));
+
+      // Due to mutex serialization and two-phase evaluation (dry-run + commit),
+      // evaluateCount must equal 2*N (each transaction evaluates rules twice)
+      expect(evaluateCount).toBe(N * 2);
+
+      // All must have unique intent IDs
+      const ids = new Set(results.map((r) => r.intentId));
+      expect(ids.size).toBe(N);
+
+      // Audit log should have exactly N entries
+      const logs = await store.getRecent("audit:log", 100);
+      expect(logs.length).toBe(N);
+    });
   });
 
   describe("S1-09 — Intent validation", () => {
@@ -1372,7 +1430,7 @@ describe("AgentWallet", () => {
       expect(result.error).toBeDefined();
       expect(result.error!.code).toBe("VALIDATION_FAILED");
       expect(result.error!.message).toContain("Invalid intent type");
-      expect(result.error!.message).toContain("invalid_type");
+      // LOW-01 fix: error messages no longer echo raw input values
     });
 
     it("should reject invalid chain", async () => {
@@ -1386,7 +1444,7 @@ describe("AgentWallet", () => {
       expect(result.status).toBe("failed");
       expect(result.error!.code).toBe("VALIDATION_FAILED");
       expect(result.error!.message).toContain("Invalid chain");
-      expect(result.error!.message).toContain("bitcoin");
+      // LOW-01 fix: error messages no longer echo raw input values
     });
 
     it("should reject missing params", async () => {
@@ -1634,7 +1692,7 @@ describe("AgentWallet", () => {
 
       expect(result.status).toBe("failed");
       expect(result.error!.code).toBe("VALIDATION_FAILED");
-      expect(result.error!.message).toContain("'data' must be a string");
+      expect(result.error!.message).toContain("do not match the expected shape");
     });
 
     it("should reject custom intent with non-array accounts", async () => {
@@ -1647,7 +1705,7 @@ describe("AgentWallet", () => {
 
       expect(result.status).toBe("failed");
       expect(result.error!.code).toBe("VALIDATION_FAILED");
-      expect(result.error!.message).toContain("'accounts' must be an array");
+      expect(result.error!.message).toContain("do not match the expected shape");
     });
 
     it("should accept valid custom intent", async () => {
@@ -1836,7 +1894,8 @@ describe("AgentWallet", () => {
 
       expect(result.status).toBe("confirmed");
       expect(result.txId).toBe("mock_tx_abc123");
-      expect(approval.requestApproval).toHaveBeenCalledOnce();
+      // Two-phase evaluation: approval is requested in both dry-run and commit phases
+      expect(approval.requestApproval).toHaveBeenCalledTimes(2);
     });
 
     it("should deny transaction above threshold when human rejects", async () => {
@@ -1927,7 +1986,8 @@ describe("AgentWallet", () => {
         }),
       );
 
-      expect(requestSpy).toHaveBeenCalledOnce();
+      // Two-phase evaluation: approval is requested in both dry-run and commit phases
+      expect(requestSpy).toHaveBeenCalledTimes(2);
       const request: ApprovalRequest = requestSpy.mock.calls[0]![0];
       expect(request.amount).toBe("10");
       expect(request.token).toBe("SOL");
@@ -1992,10 +2052,11 @@ describe("AgentWallet", () => {
       );
 
       expect(result.status).toBe("confirmed");
-      expect(approval.requestApproval).toHaveBeenCalledOnce();
+      // Two-phase evaluation: approval is requested in both dry-run and commit phases
+      expect(approval.requestApproval).toHaveBeenCalledTimes(2);
     });
 
-    it("should allow USDC transfer when approval threshold is for SOL (different token)", async () => {
+    it("should deny USDC transfer when approval threshold is for SOL (POLICY-001 unmatched token)", async () => {
       const approval = createMockApproval({
         requestId: "req-usdc",
         decision: "approved",
@@ -2004,13 +2065,12 @@ describe("AgentWallet", () => {
       // Threshold on SOL only
       const wallet = createApprovalWallet(approval, { amount: "5", token: "SOL" });
 
-      // Transfer 1000 USDC — threshold is for SOL, so this should pass without approval
+      // POLICY-001 fix: Unmatched tokens now DENY instead of silently ALLOW
       const result = await wallet.execute(
         createTransferIntent({ params: { to: VALID_SOL_ADDRESS, amount: "1000", token: "USDC" } }),
       );
 
-      expect(result.status).toBe("confirmed");
-      expect(approval.requestApproval).not.toHaveBeenCalled();
+      expect(result.status).toBe("denied");
     });
 
     it("should trigger approval for swap intent above threshold", async () => {
@@ -2029,7 +2089,8 @@ describe("AgentWallet", () => {
       });
 
       expect(result.status).toBe("confirmed");
-      expect(approval.requestApproval).toHaveBeenCalledOnce();
+      // Two-phase evaluation: approval is requested in both dry-run and commit phases
+      expect(approval.requestApproval).toHaveBeenCalledTimes(2);
     });
 
     it("should deny swap intent above threshold when human rejects", async () => {

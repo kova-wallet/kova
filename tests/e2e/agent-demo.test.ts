@@ -25,8 +25,8 @@ import type {
 
 // ── Mock helpers ──────────────────────────────────────────────────
 
-const MOCK_ADDRESS = "MockAddress1234567890abcdef12345678";
-const ALLOWLISTED_RECIPIENT = "RecipientAddr1234567890abcdef1234";
+const MOCK_ADDRESS = "7v91N7iZ9mNicL8WfG6cgSCKyRXydQjLh6UYBWwm6y1Q";
+const ALLOWLISTED_RECIPIENT = "GsbwXfJraMomNxBcjYLcG3mxkBUiyWXAB32fGbSQQRre";
 
 function createMockSigner(
   address = MOCK_ADDRESS,
@@ -39,6 +39,8 @@ function createMockSigner(
       signature: new Uint8Array(64).fill(1),
     }),
     healthCheck: async () => true,
+    destroy: async () => {},
+    toJSON: () => ({ address }),
   };
 }
 
@@ -66,6 +68,7 @@ function createMockChain(): ChainAdapter {
       ),
       description: `Mock ${intent.type}`,
     }),
+    simulateTransaction: vi.fn().mockResolvedValue({ success: true }),
     broadcast: async () =>
       "mock_tx_" + Math.random().toString(36).slice(2, 10),
     getTransactionStatus: async (txId: string) => ({
@@ -100,7 +103,7 @@ function buildStandardPolicy(store: MemoryStore, approval?: ApprovalChannel) {
   const rules: PolicyRule[] = [
     new RateLimitRule({ maxTransactionsPerMinute: 5, maxTransactionsPerHour: 20 }),
     new AllowlistRule({
-      allowAddresses: [ALLOWLISTED_RECIPIENT, "AnotherAddr1234567890abcdef123456"],
+      allowAddresses: [ALLOWLISTED_RECIPIENT, "CoLLecTion1111111111111111111111111111111111"],
     }),
     new SpendingLimitRule({
       perTransaction: { amount: "1", token: "SOL" },
@@ -130,19 +133,19 @@ describe("Agent Demo — E2E Workflow", () => {
 
       const summary = await wallet.getPolicy();
 
-      // Spending limits
+      // Spending limits — HIGH-T3-01: amounts are redacted
       expect(summary.spendingLimits.perTransaction).toEqual({
-        amount: "1",
+        amount: "[redacted]",
         token: "SOL",
       });
       expect(summary.spendingLimits.daily).toBeDefined();
-      expect(summary.spendingLimits.daily!.amount).toBe("5");
+      expect(summary.spendingLimits.daily!.amount).toBe("[redacted]");
       expect(summary.spendingLimits.daily!.token).toBe("SOL");
 
-      // Rate limits
+      // Rate limits — HIGH-T3-01: thresholds are redacted
       expect(summary.rateLimits).toBeDefined();
-      expect(summary.rateLimits!.maxPerMinute).toBe(5);
-      expect(summary.rateLimits!.maxPerHour).toBe(20);
+      expect(summary.rateLimits!.maxPerMinute).toBe("[redacted]" as unknown as number);
+      expect(summary.rateLimits!.maxPerHour).toBe("[redacted]" as unknown as number);
 
       // Allowlist count
       expect(summary.allowlistedAddresses).toBe(2);
@@ -273,7 +276,7 @@ describe("Agent Demo — E2E Workflow", () => {
       expect(result.status).toBe("denied");
       expect(result.error).toBeDefined();
       expect(result.error!.code).toBe("POLICY_DENIED");
-      expect(result.error!.message).toContain("Per-transaction limit exceeded");
+      expect(result.error!.message).toContain("Per-transaction spending limit exceeded");
     });
 
     it("denies a transfer to a non-allowlisted address", async () => {
@@ -289,7 +292,7 @@ describe("Agent Demo — E2E Workflow", () => {
       const result = await wallet.execute(
         createTransferIntent({
           params: {
-            to: "UnknownAddr9999999999abcdef999999",
+            to: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
             amount: "0.1",
             token: "SOL",
           },
@@ -298,7 +301,9 @@ describe("Agent Demo — E2E Workflow", () => {
 
       expect(result.status).toBe("denied");
       expect(result.error!.code).toBe("POLICY_DENIED");
-      expect(result.error!.message).toContain("not in the allowlist");
+      // H-05: "allowlist" is sanitized to "policy rule" in error messages
+      expect(result.error!.message).toContain("not in");
+      expect(result.error!.message).toContain("policy rule");
     });
 
     it("denies after rate limit is exceeded by rapid transfers", async () => {
@@ -366,7 +371,8 @@ describe("Agent Demo — E2E Workflow", () => {
       );
       expect(r2.status).toBe("denied");
       expect(r2.error!.code).toBe("POLICY_DENIED");
-      expect(r2.error!.message).toContain("Daily spending limit exceeded");
+      // M-61: Denial reason no longer reveals window type
+      expect(r2.error!.message).toContain("Spending limit exceeded");
     });
   });
 
@@ -415,7 +421,8 @@ describe("Agent Demo — E2E Workflow", () => {
 
       expect(result.status).toBe("confirmed");
       expect(result.txId).toBeDefined();
-      expect(mockApproval.requestApproval).toHaveBeenCalledOnce();
+      // Two-phase evaluation: approval is requested in both dry-run and commit phases
+      expect(mockApproval.requestApproval).toHaveBeenCalledTimes(2);
     });
 
     it("denies when the approval channel returns rejected", async () => {
@@ -458,7 +465,10 @@ describe("Agent Demo — E2E Workflow", () => {
       expect(result.status).toBe("denied");
       expect(result.error!.code).toBe("POLICY_DENIED");
       expect(result.error!.message).toContain("rejected");
+      // H-05: Error messages are sanitized, but "admin-user" should still be present
+      // as it's not a rule name or number
       expect(result.error!.message).toContain("admin-user");
+      // Phase 1 dry-run gets rejection -> DENY, Phase 2 never runs
       expect(mockApproval.requestApproval).toHaveBeenCalledOnce();
     });
 
@@ -589,8 +599,11 @@ describe("Agent Demo — E2E Workflow", () => {
         name: "sometimes-deny",
         evaluate: async () => {
           denyCount++;
-          // Deny the first 3, allow the 4th, then deny again
-          if (denyCount <= 3 || denyCount >= 5) {
+          // Two-phase evaluation: DENY calls evaluate once (Phase 1 only),
+          // ALLOW calls evaluate twice (Phase 1 + Phase 2).
+          // Deny the first 3 calls (= 3 transactions), allow the 4th+5th calls
+          // (= 1 transaction: Phase 1 dry-run + Phase 2 commit), then deny again.
+          if (denyCount <= 3 || denyCount >= 6) {
             return {
               decision: "DENY" as const,
               rule: "sometimes-deny",
@@ -609,13 +622,14 @@ describe("Agent Demo — E2E Workflow", () => {
         circuitBreaker: { threshold: 5, cooldownMs: 60_000 },
       });
 
-      // 3 denials
+      // 3 denials (denyCount goes to 1, 2, 3)
       for (let i = 0; i < 3; i++) {
         const r = await wallet.execute(createTransferIntent());
         expect(r.status).toBe("denied");
       }
 
       // 4th call is allowed -- resets the denial counter
+      // (denyCount=4 Phase 1 ALLOW, denyCount=5 Phase 2 ALLOW)
       const allowed = await wallet.execute(createTransferIntent());
       expect(allowed.status).toBe("confirmed");
 
@@ -641,6 +655,12 @@ describe("Agent Demo — E2E Workflow", () => {
         chain: createMockChain(),
         policy,
         store,
+        // H-06: enabledTools must explicitly include write tools and wallet_get_policy
+        enabledTools: new Set([
+          "wallet_transfer", "wallet_swap", "wallet_mint", "wallet_stake",
+          "wallet_execute_custom", "wallet_get_balance", "wallet_get_policy",
+          "wallet_get_transaction_history",
+        ]),
       });
     }
 
@@ -693,12 +713,12 @@ describe("Agent Demo — E2E Workflow", () => {
       const tools = wallet.toAnthropicTools();
 
       expect(Array.isArray(tools)).toBe(true);
-      expect(tools.length).toBeGreaterThanOrEqual(7);
+      // API-002/API-003: Default safe tools are 6 (dangerous tools opt-in only)
+      expect(tools.length).toBeGreaterThanOrEqual(6);
 
       const names = tools.map((t) => t.name);
       expect(names).toContain("wallet_transfer");
       expect(names).toContain("wallet_get_balance");
-      expect(names).toContain("wallet_get_policy");
       expect(names).toContain("wallet_get_transaction_history");
 
       // Anthropic format uses input_schema
@@ -713,7 +733,8 @@ describe("Agent Demo — E2E Workflow", () => {
       const tools = wallet.toOpenAITools();
 
       expect(Array.isArray(tools)).toBe(true);
-      expect(tools.length).toBeGreaterThanOrEqual(7);
+      // API-002/API-003: Default safe tools are 6 (dangerous tools opt-in only)
+      expect(tools.length).toBeGreaterThanOrEqual(6);
 
       for (const tool of tools) {
         expect(tool.type).toBe("function");
@@ -837,7 +858,7 @@ describe("Agent Demo — E2E Workflow", () => {
           perTransaction: { amount: "1", token: "SOL" },
           daily: { amount: "10", token: "SOL" },
         })
-        .allowAddresses([ALLOWLISTED_RECIPIENT, "AnotherAddr1234567890abcdef123456"])
+        .allowAddresses([ALLOWLISTED_RECIPIENT, "CoLLecTion1111111111111111111111111111111111"])
         .rateLimit({ maxTransactionsPerMinute: 5, maxTransactionsPerHour: 20 })
         .requireApproval({ above: { amount: "5", token: "SOL" }, timeout: 30000 })
         .build();

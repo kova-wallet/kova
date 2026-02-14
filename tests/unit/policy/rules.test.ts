@@ -60,7 +60,8 @@ describe("AllowlistRule", () => {
     const result = await rule.evaluate(makeIntent(), makeContext());
     expect(result.decision).toBe("DENY");
     if (result.decision === "DENY") {
-      expect(result.reason).toContain("denylisted");
+      // H-38 fix: generic denial message, no longer says "denylisted"
+      expect(result.reason).toContain("not permitted");
     }
   });
 
@@ -71,7 +72,8 @@ describe("AllowlistRule", () => {
     const result = await rule.evaluate(makeIntent(), makeContext());
     expect(result.decision).toBe("DENY");
     if (result.decision === "DENY") {
-      expect(result.reason).toContain("not in the allowlist");
+      // H-38 fix: generic denial message
+      expect(result.reason).toContain("not in allowlist");
     }
   });
 
@@ -178,17 +180,19 @@ describe("SpendingLimitRule", () => {
     const result = await rule.evaluate(makeIntent(), makeContext());
     expect(result.decision).toBe("DENY");
     if (result.decision === "DENY") {
-      expect(result.reason).toContain("Per-transaction limit exceeded");
+      expect(result.reason).toContain("Per-transaction spending limit exceeded");
     }
   });
 
-  it("should ALLOW when token doesn't match the per-transaction limit", async () => {
+  it("should DENY when token doesn't match any configured limit and no USD limits exist", async () => {
     const rule = new SpendingLimitRule({
       perTransaction: { amount: "0.5", token: "USDC" },
     });
-    // Intent is for SOL, limit is for USDC — should pass
+    // AUDIT-CRIT-01: Intent is for SOL but only USDC limit is configured (no USD limits).
+    // Cross-token bypass prevention denies untracked tokens.
     const result = await rule.evaluate(makeIntent(), makeContext());
-    expect(result.decision).toBe("ALLOW");
+    expect(result.decision).toBe("DENY");
+    expect(result.reason).toContain("no configured spending limit");
   });
 
   it("should DENY when daily limit is exceeded", async () => {
@@ -212,7 +216,7 @@ describe("SpendingLimitRule", () => {
     );
     expect(result2.decision).toBe("DENY");
     if (result2.decision === "DENY") {
-      expect(result2.reason).toContain("Daily spending limit exceeded");
+      expect(result2.reason).toContain("Spending limit exceeded");
     }
   });
 
@@ -248,7 +252,7 @@ describe("SpendingLimitRule", () => {
     expect(result.decision).toBe("DENY");
   });
 
-  it("should ALLOW custom intents with no amount", async () => {
+  it("should DENY custom intents with no amount (CRIT-01 fail-closed)", async () => {
     const rule = new SpendingLimitRule({
       perTransaction: { amount: "1", token: "SOL" },
     });
@@ -257,7 +261,8 @@ describe("SpendingLimitRule", () => {
       params: { programId: "prog", data: "abc", accounts: [] } as any,
     });
     const result = await rule.evaluate(intent, makeContext());
-    expect(result.decision).toBe("ALLOW");
+    // CRIT-01 fix: can't determine cost → DENY
+    expect(result.decision).toBe("DENY");
   });
 
   it("should handle case-insensitive token comparison", async () => {
@@ -287,14 +292,14 @@ describe("SpendingLimitRule", () => {
 // ─────────────────────────────────────────────────
 describe("RateLimitRule", () => {
   it("should instantiate with a name of 'rate-limit'", () => {
-    const rule = new RateLimitRule({});
+    // POLICY-014: RateLimitRule now requires at least one limit
+    const rule = new RateLimitRule({ maxTransactionsPerMinute: 10 });
     expect(rule.name).toBe("rate-limit");
   });
 
-  it("should ALLOW when no limits are configured", async () => {
-    const rule = new RateLimitRule({});
-    const result = await rule.evaluate(makeIntent(), makeContext());
-    expect(result.decision).toBe("ALLOW");
+  it("should throw when no limits are configured (POLICY-014)", () => {
+    // POLICY-014: Empty config is now rejected to prevent no-op rules
+    expect(() => new RateLimitRule({})).toThrow("requires at least one limit");
   });
 
   it("should ALLOW when within per-minute limit", async () => {
@@ -440,13 +445,12 @@ describe("TimeWindowRule", () => {
     }
   });
 
-  it("should fail closed on invalid timezone", async () => {
-    const rule = new TimeWindowRule({
+  it("should throw on invalid timezone in constructor", () => {
+    // TimeWindowRule now validates timezone in constructor and throws for invalid values
+    expect(() => new TimeWindowRule({
       timezone: "Invalid/Timezone",
       windows: [{ days: ["mon", "tue", "wed", "thu", "fri", "sat", "sun"], start: "00:00", end: "23:59" }],
-    });
-    const result = await rule.evaluate(makeIntent(), makeContext());
-    expect(result.decision).toBe("DENY");
+    })).toThrow("invalid timezone");
   });
 
   it("should support timezone-aware evaluation", async () => {
@@ -560,16 +564,16 @@ describe("ApprovalGateRule", () => {
     }
   });
 
-  it("should ALLOW when token doesn't match threshold token", async () => {
+  it("should DENY when token doesn't match threshold token (POLICY-001 fix)", async () => {
     const rule = new ApprovalGateRule({
       above: { amount: "0.5", token: "USDC" },
     });
-    // Intent is for SOL, threshold is for USDC — rule doesn't apply
+    // POLICY-001: Unmatched tokens now DENY instead of silently ALLOW
     const result = await rule.evaluate(makeIntent(), makeContext());
-    expect(result.decision).toBe("ALLOW");
+    expect(result.decision).toBe("DENY");
   });
 
-  it("should ALLOW custom intents with no amount", async () => {
+  it("should DENY custom intents with no amount when no approval channel (CRIT-01 fail-closed)", async () => {
     const rule = new ApprovalGateRule({
       above: { amount: "0.5", token: "SOL" },
     });
@@ -578,7 +582,8 @@ describe("ApprovalGateRule", () => {
       params: { programId: "prog", data: "abc", accounts: [] } as any,
     });
     const result = await rule.evaluate(intent, makeContext());
-    expect(result.decision).toBe("ALLOW");
+    // CRIT-01 fix: can't determine amount → DENY (no approval channel)
+    expect(result.decision).toBe("DENY");
   });
 
   it("should include decidedBy in rejection reason", async () => {
@@ -613,34 +618,34 @@ describe("ApprovalGateRule", () => {
 // SpendingLimitRule — Edge Cases
 // ─────────────────────────────────────────────────
 describe("SpendingLimitRule — Edge Cases", () => {
-  it("should ALLOW when amount is zero (0 <= limit)", async () => {
+  it("should DENY when amount is zero (CRIT-01: extractAmount returns null for non-positive)", async () => {
     const rule = new SpendingLimitRule({
       perTransaction: { amount: "5", token: "SOL" },
     });
     const intent = makeIntent({ params: { to: "addr", amount: "0", token: "SOL" } });
     const result = await rule.evaluate(intent, makeContext());
-    // parseFloat("0") = 0, 0 > 5 is false, so ALLOW
-    expect(result.decision).toBe("ALLOW");
+    // CRIT-01 fix: extractAmount returns null for zero → DENY (fail-closed)
+    expect(result.decision).toBe("DENY");
   });
 
-  it("should treat NaN amount as no-amount intent (ALLOW)", async () => {
+  it("should DENY NaN amount (CRIT-01: extractAmount returns null → fail-closed)", async () => {
     const rule = new SpendingLimitRule({
       perTransaction: { amount: "5", token: "SOL" },
     });
     const intent = makeIntent({ params: { to: "addr", amount: "not-a-number", token: "SOL" } });
     const result = await rule.evaluate(intent, makeContext());
-    // extractAmount returns null for NaN, so the rule allows through
-    expect(result.decision).toBe("ALLOW");
+    // CRIT-01 fix: extractAmount returns null for NaN → DENY (fail-closed)
+    expect(result.decision).toBe("DENY");
   });
 
-  it("should ALLOW negative amounts (parsed as number, negative <= limit)", async () => {
+  it("should DENY negative amounts (CRIT-01: extractAmount returns null for non-positive)", async () => {
     const rule = new SpendingLimitRule({
       perTransaction: { amount: "5", token: "SOL" },
     });
     const intent = makeIntent({ params: { to: "addr", amount: "-1.0", token: "SOL" } });
     const result = await rule.evaluate(intent, makeContext());
-    // parseFloat("-1.0") = -1, -1 > 5 is false
-    expect(result.decision).toBe("ALLOW");
+    // CRIT-01 fix: extractAmount returns null for negative → DENY (fail-closed)
+    expect(result.decision).toBe("DENY");
   });
 
   it("should ALLOW when amount exactly equals per-transaction limit", async () => {
@@ -685,7 +690,7 @@ describe("SpendingLimitRule — Edge Cases", () => {
     );
     expect(r2.decision).toBe("DENY");
     if (r2.decision === "DENY") {
-      expect(r2.reason).toContain("Daily spending limit exceeded");
+      expect(r2.reason).toContain("Spending limit exceeded");
     }
   });
 
@@ -741,25 +746,27 @@ describe("SpendingLimitRule — Edge Cases", () => {
     expect(r3.decision).toBe("DENY");
   });
 
-  it("should independently track different tokens in window limits", async () => {
+  it("should DENY untracked token when no USD limits exist (AUDIT-CRIT-01)", async () => {
     const store = new MemoryStore();
     const rule = new SpendingLimitRule({
       daily: { amount: "10", token: "SOL" },
     });
     const ctx = makeContext({ store });
 
-    // Spend 9 SOL
+    // Spend 9 SOL — within limit
     await rule.evaluate(
       makeIntent({ params: { to: "addr", amount: "9", token: "SOL" } }),
       ctx,
     );
 
-    // Spend USDC — different token from daily limit, should ALLOW
+    // AUDIT-CRIT-01: USDC has no configured limit and no USD limits exist,
+    // so cross-token bypass prevention kicks in and denies
     const r2 = await rule.evaluate(
       makeIntent({ params: { to: "addr", amount: "100", token: "USDC" } }),
       ctx,
     );
-    expect(r2.decision).toBe("ALLOW");
+    expect(r2.decision).toBe("DENY");
+    expect(r2.reason).toContain("no configured spending limit");
   });
 
   it("should handle very large amounts", async () => {
@@ -786,7 +793,7 @@ describe("SpendingLimitRule — Edge Cases", () => {
 // AllowlistRule — Edge Cases
 // ─────────────────────────────────────────────────
 describe("AllowlistRule — Edge Cases", () => {
-  it("should ALLOW when intent has no target address (no to/programId/collection/validator)", async () => {
+  it("should DENY swap intent when allowAddresses is configured but no token checks cover swaps (CRIT-05)", async () => {
     const rule = new AllowlistRule({
       allowAddresses: ["SomeAddress"],
     });
@@ -796,18 +803,33 @@ describe("AllowlistRule — Edge Cases", () => {
       params: { fromToken: "SOL", toToken: "USDC", amount: "1.0" },
     });
     const result = await rule.evaluate(intent, makeContext());
-    // targetAddress is null, so the address checks are skipped, and it ALLOWs
-    expect(result.decision).toBe("ALLOW");
+    // CRIT-05 fix: swap with no verifiable target + address allowlist configured → DENY
+    expect(result.decision).toBe("DENY");
   });
 
-  it("should ALLOW when target address is empty string (empty string is falsy, skips checks)", async () => {
+  it("should DENY swap intent when address allowlist is configured but swap tokens are not addresses in the list (M-03 fix)", async () => {
+    const rule = new AllowlistRule({
+      allowAddresses: ["SomeAddress"],
+      allowTokens: ["SOL", "USDC"],
+    });
+    const intent = makeIntent({
+      type: "swap",
+      params: { fromToken: "SOL", toToken: "USDC", amount: "1.0" },
+    });
+    const result = await rule.evaluate(intent, makeContext());
+    // M-03 fix: checkSwapAddresses runs before token checks. Since swap token symbols
+    // (SOL, USDC) are not in the address allowlist, this is denied.
+    expect(result.decision).toBe("DENY");
+  });
+
+  it("should DENY when target address is empty string (POLICY-005 fix rejects empty addresses)", async () => {
+    // POLICY-005: Empty/whitespace-only addresses are now rejected
     const rule = new AllowlistRule({
       denyAddresses: [""],
     });
-    // Empty string 'to' is falsy, so `if (targetAddress && ...)` skips deny check
     const intent = makeIntent({ params: { to: "", amount: "1", token: "SOL" } });
     const result = await rule.evaluate(intent, makeContext());
-    expect(result.decision).toBe("ALLOW");
+    expect(result.decision).toBe("DENY");
   });
 
   it("should handle empty allowAddresses array (no whitelist restriction)", async () => {
@@ -829,7 +851,8 @@ describe("AllowlistRule — Edge Cases", () => {
     const result = await rule.evaluate(intent, makeContext());
     expect(result.decision).toBe("DENY");
     if (result.decision === "DENY") {
-      expect(result.reason).toContain("denylisted");
+      // H-38 fix: generic denial message, no longer says "denylisted"
+      expect(result.reason).toContain("not permitted");
     }
   });
 
@@ -884,25 +907,16 @@ describe("AllowlistRule — Edge Cases", () => {
 // RateLimitRule — Edge Cases
 // ─────────────────────────────────────────────────
 describe("RateLimitRule — Edge Cases", () => {
-  it("should DENY immediately with limit of 0 per minute", async () => {
-    const store = new MemoryStore();
-    const rule = new RateLimitRule({ maxTransactionsPerMinute: 0 });
-    const ctx = makeContext({ store });
-
-    const result = await rule.evaluate(makeIntent(), ctx);
-    expect(result.decision).toBe("DENY");
-    if (result.decision === "DENY") {
-      expect(result.reason).toContain("Rate limit exceeded");
-    }
+  it("should throw on construction with limit of 0 per minute (MED-30 fix)", () => {
+    expect(() => new RateLimitRule({ maxTransactionsPerMinute: 0 })).toThrow(
+      "maxTransactionsPerMinute must be a positive finite integer",
+    );
   });
 
-  it("should DENY immediately with limit of 0 per hour", async () => {
-    const store = new MemoryStore();
-    const rule = new RateLimitRule({ maxTransactionsPerHour: 0 });
-    const ctx = makeContext({ store });
-
-    const result = await rule.evaluate(makeIntent(), ctx);
-    expect(result.decision).toBe("DENY");
+  it("should throw on construction with limit of 0 per hour (MED-30 fix)", () => {
+    expect(() => new RateLimitRule({ maxTransactionsPerHour: 0 })).toThrow(
+      "maxTransactionsPerHour must be a positive finite integer",
+    );
   });
 
   it("should ALLOW exactly 1 transaction with limit of 1 per minute", async () => {
@@ -948,20 +962,10 @@ describe("RateLimitRule — Edge Cases", () => {
     expect(parseFloat(val!)).toBe(2);
   });
 
-  it("should handle both minute and hour limits with limit of 0", async () => {
-    const store = new MemoryStore();
-    const rule = new RateLimitRule({
-      maxTransactionsPerMinute: 0,
-      maxTransactionsPerHour: 0,
-    });
-    const ctx = makeContext({ store });
-
-    const result = await rule.evaluate(makeIntent(), ctx);
-    expect(result.decision).toBe("DENY");
-    if (result.decision === "DENY") {
-      // Per-minute check is first
-      expect(result.reason).toContain("per minute");
-    }
+  it("should throw on construction with both minute and hour limits of 0 (MED-30 fix)", () => {
+    expect(
+      () => new RateLimitRule({ maxTransactionsPerMinute: 0, maxTransactionsPerHour: 0 }),
+    ).toThrow("maxTransactionsPerMinute must be a positive finite integer");
   });
 
   it("should handle high-volume traffic within limits", async () => {
@@ -1075,11 +1079,13 @@ describe("TimeWindowRule — Edge Cases", () => {
   });
 
   it("should handle overnight window that wraps past midnight", async () => {
-    // Tuesday at 02:00 UTC — within 22:00-06:00 overnight range on Tuesday
+    // POLICY-004 fix: Tuesday at 02:00 UTC — within 22:00-06:00 overnight range.
+    // The window 22:00-06:00 on "mon" covers Mon 22:00 to Tue 06:00.
+    // At Tue 02:00, the PREVIOUS day (mon) must be in the days list.
     const tue2am = new Date("2026-01-13T02:00:00Z");
     const rule = new TimeWindowRule({
       timezone: "UTC",
-      windows: [{ days: ["tue"], start: "22:00", end: "06:00" }],
+      windows: [{ days: ["mon"], start: "22:00", end: "06:00" }],
     });
     const result = await rule.evaluate(
       makeIntent(),
@@ -1201,7 +1207,9 @@ describe("ApprovalGateRule — Edge Cases", () => {
     await rule.evaluate(intent, makeContext({ approval: channel }));
 
     expect(capturedRequest).toBeDefined();
-    expect(capturedRequest.id).toBe("test-intent-42");
+    // Approval request ID is a random UUID (not the intent ID)
+    expect(typeof capturedRequest.id).toBe("string");
+    expect(capturedRequest.id.length).toBeGreaterThan(0);
     expect(capturedRequest.summary).toBe("transfer 10.5 SOL");
     expect(capturedRequest.amount).toBe("10.5");
     expect(capturedRequest.token).toBe("SOL");
@@ -1266,7 +1274,10 @@ describe("ApprovalGateRule — Edge Cases", () => {
 
     await rule.evaluate(intent, makeContext({ approval: channel }));
 
-    expect(capturedRequest.reason).toBe("monthly payroll");
+    // HIGH-T4-01: Agent-provided reason is now tagged as untrusted
+    expect(capturedRequest.reason).toContain("monthly payroll");
+    expect(capturedRequest.reason).toContain("[AGENT-PROVIDED");
+
   });
 
   it("should extract agentId from intent metadata in approval request", async () => {
@@ -1371,7 +1382,7 @@ describe("ApprovalGateRule — Edge Cases", () => {
     expect(result.decision).toBe("ALLOW");
   });
 
-  it("should ALLOW intent with negative amount (parsed as null by extractAmount)", async () => {
+  it("should DENY intent with negative amount when no approval channel (CRIT-01 fail-closed)", async () => {
     const rule = new ApprovalGateRule({
       above: { amount: "0.5", token: "SOL" },
     });
@@ -1379,11 +1390,11 @@ describe("ApprovalGateRule — Edge Cases", () => {
       params: { to: "addr", amount: "-5", token: "SOL" },
     });
     const result = await rule.evaluate(intent, makeContext());
-    // extractAmount returns null for negative, so rule allows through
-    expect(result.decision).toBe("ALLOW");
+    // CRIT-01 fix: extractAmount returns null for negative → DENY (no approval channel)
+    expect(result.decision).toBe("DENY");
   });
 
-  it("should ALLOW intent with zero amount (parsed as null by extractAmount)", async () => {
+  it("should DENY intent with zero amount when no approval channel (CRIT-01 fail-closed)", async () => {
     const rule = new ApprovalGateRule({
       above: { amount: "0.5", token: "SOL" },
     });
@@ -1391,10 +1402,11 @@ describe("ApprovalGateRule — Edge Cases", () => {
       params: { to: "addr", amount: "0", token: "SOL" },
     });
     const result = await rule.evaluate(intent, makeContext());
-    expect(result.decision).toBe("ALLOW");
+    // CRIT-01 fix: extractAmount returns null for zero → DENY (no approval channel)
+    expect(result.decision).toBe("DENY");
   });
 
-  it("should ALLOW intent with NaN amount (parsed as null by extractAmount)", async () => {
+  it("should DENY intent with NaN amount when no approval channel (CRIT-01 fail-closed)", async () => {
     const rule = new ApprovalGateRule({
       above: { amount: "0.5", token: "SOL" },
     });
@@ -1402,7 +1414,8 @@ describe("ApprovalGateRule — Edge Cases", () => {
       params: { to: "addr", amount: "not-a-number", token: "SOL" },
     });
     const result = await rule.evaluate(intent, makeContext());
-    expect(result.decision).toBe("ALLOW");
+    // CRIT-01 fix: extractAmount returns null for NaN → DENY (no approval channel)
+    expect(result.decision).toBe("DENY");
   });
 
   it("should extract target from stake intent (validator field) in approval request", async () => {
@@ -1430,9 +1443,9 @@ describe("ApprovalGateRule — Edge Cases", () => {
     expect(capturedRequest.target).toBe("ValidatorAddr123");
   });
 
-  it("should extract target from mint intent (collection field) in approval request", async () => {
-    // Note: mint intents typically don't have an amount field, so this tests
-    // that the rule returns ALLOW for intents with no extractable amount
+  it("should DENY mint intent with no amount when no approval channel (CRIT-01 fail-closed)", async () => {
+    // Mint intents don't have an amount field. CRIT-01 fix: DENY when
+    // amount can't be determined and no approval channel is configured.
     const rule = new ApprovalGateRule({
       above: { amount: "5", token: "SOL" },
     });
@@ -1443,7 +1456,23 @@ describe("ApprovalGateRule — Edge Cases", () => {
     });
 
     const result = await rule.evaluate(intent, makeContext());
-    // No amount in mint params, so extractAmount returns null -> ALLOW
+    // CRIT-01 fix: no extractable amount + no approval channel → DENY
+    expect(result.decision).toBe("DENY");
+  });
+
+  it("should request approval for mint intent when channel is configured (CRIT-01)", async () => {
+    const rule = new ApprovalGateRule({
+      above: { amount: "5", token: "SOL" },
+    });
+    const channel = makeApprovalChannel("approved");
+
+    const intent = makeIntent({
+      type: "mint",
+      params: { collection: "Collection123", metadataUri: "https://example.com/meta.json" },
+    });
+
+    const result = await rule.evaluate(intent, makeContext({ approval: channel }));
+    // CRIT-01 fix: with approval channel, requests approval → ALLOW if approved
     expect(result.decision).toBe("ALLOW");
   });
 

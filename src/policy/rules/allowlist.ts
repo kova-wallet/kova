@@ -7,10 +7,26 @@
  * 3. If programId is in denyPrograms → DENY
  * 4. If allowPrograms is configured and programId is NOT in it → DENY
  * 5. Otherwise → ALLOW
+ *
+ * MED-05 LIMITATION: This rule does NOT verify the DEX program used for swap intents.
+ * When a swap intent is evaluated, the allowlist checks the fromToken/toToken via
+ * allowTokens/denyTokens, but it does NOT validate which DEX aggregator program
+ * (e.g., Jupiter, Raydium, Orca) is used to execute the swap. A malicious or
+ * compromised DEX program could drain funds even if token checks pass. To mitigate
+ * this, configure allowPrograms with trusted DEX program IDs and ensure swap intents
+ * include a programId field, or use a dedicated DEX allowlist in the chain adapter.
+ *
+ * M-05 FIX (supersedes POLICY-006): Program allowlist/denylist is now checked for ALL
+ * intent types that include a programId field, not just custom intents. While the chain
+ * adapter typically hardcodes programs for transfer/swap intents, checking the programId
+ * field (when present) provides defense-in-depth against malicious intent construction.
+ * If the programId field is absent from a transfer/swap intent, program checks are skipped
+ * for that intent (the chain adapter is trusted to use the correct program).
  */
 
 import type { PolicyRule, PolicyDecision, PolicyContext } from "../types.js";
 import type { TransactionIntent } from "../../core/intent.js";
+import { normalizeTokenId } from "../utils.js";
 
 export interface AllowlistConfig {
   allowAddresses?: string[];
@@ -26,6 +42,12 @@ export interface AllowlistConfig {
 /**
  * HIGH-03 fix: Normalize EVM addresses to lowercase for case-insensitive matching.
  * Solana addresses are case-sensitive (base58), so they are left as-is.
+ *
+ * POLICY-015: Address format validation (e.g., verifying that a Solana address is valid
+ * base58 of the correct length, or that an EVM address has a valid checksum) is NOT
+ * performed here. Format validation is the responsibility of the wallet/chain adapter
+ * layer, which has chain-specific knowledge. The policy rule treats addresses as opaque
+ * strings and only performs set-membership checks against the allow/deny lists.
  */
 function normalizeAddress(address: string): string {
   // EVM addresses start with 0x and are 42 characters long (case-insensitive per EIP-55)
@@ -33,18 +55,6 @@ function normalizeAddress(address: string): string {
     return address.toLowerCase();
   }
   return address;
-}
-
-/**
- * SEC: Normalize token identifiers for comparison.
- * - Token symbols are case-insensitive ("usdc" == "USDC")
- * - Address-like identifiers (e.g. Solana base58 mints) remain case-sensitive
- * - EVM addresses are normalized to lowercase
- */
-function normalizeTokenId(token: string): string {
-  if (token.startsWith("0x") && token.length === 42) return token.toLowerCase();
-  if (/^[A-Za-z0-9_]{2,16}$/.test(token)) return token.toUpperCase();
-  return token;
 }
 
 export class AllowlistRule implements PolicyRule {
@@ -92,12 +102,29 @@ export class AllowlistRule implements PolicyRule {
     const targetAddress = rawTargetAddress ? normalizeAddress(rawTargetAddress) : null;
     const programId = this.extractProgramId(intent);
 
+    // POLICY-005 fix: Reject empty string addresses. An empty or whitespace-only address
+    // could bypass both allowlist and denylist checks since it wouldn't match any entry,
+    // effectively allowing transactions to proceed without proper address validation.
+    if (rawTargetAddress !== null && (!rawTargetAddress || rawTargetAddress.trim().length === 0)) {
+      return {
+        decision: "DENY",
+        rule: this.name,
+        reason: "Empty target address is not permitted",
+      };
+    }
+
+    // H-38 FIX: All denial messages below use generic wording that does NOT expose
+    // specific allowed/denied addresses or programs. Previously, messages included the
+    // actual address (e.g., "Address is denylisted: 0x123..."), which could leak
+    // information about the allowlist/denylist configuration to an attacker probing
+    // the system. Generic messages prevent this information disclosure.
+
     // 1. Check deny addresses (deny takes precedence)
     if (targetAddress && this.denyAddresses.has(targetAddress)) {
       return {
         decision: "DENY",
         rule: this.name,
-        reason: `Address is denylisted: ${targetAddress}`,
+        reason: "Address is not permitted",
       };
     }
 
@@ -106,7 +133,7 @@ export class AllowlistRule implements PolicyRule {
       return {
         decision: "DENY",
         rule: this.name,
-        reason: `Address is not in the allowlist: ${targetAddress}`,
+        reason: "Address not in allowlist",
       };
     }
 
@@ -115,7 +142,7 @@ export class AllowlistRule implements PolicyRule {
       return {
         decision: "DENY",
         rule: this.name,
-        reason: `Program is denylisted: ${programId}`,
+        reason: "Program is not permitted",
       };
     }
 
@@ -124,9 +151,13 @@ export class AllowlistRule implements PolicyRule {
       return {
         decision: "DENY",
         rule: this.name,
-        reason: `Program is not in the allowlist: ${programId}`,
+        reason: "Program not in allowlist",
       };
     }
+
+    // M-03 FIX: Check swap intent fromToken/toToken mint addresses against address lists
+    const swapAddrDenial = this.checkSwapAddresses(intent);
+    if (swapAddrDenial) return swapAddrDenial;
 
     // 5. SEC: Check swap token allowlist/denylist
     const swapTokens = this.extractSwapTokens(intent);
@@ -134,17 +165,42 @@ export class AllowlistRule implements PolicyRule {
       for (const token of swapTokens) {
         const normalized = normalizeTokenId(token);
         if (this.denyTokens.has(normalized)) {
+          // H-38 FIX: Generic message that does not reveal which tokens are denied
           return {
             decision: "DENY",
             rule: this.name,
-            reason: `Token is denylisted for swaps: ${token}`,
+            reason: "Token is not permitted for swaps",
           };
         }
         if (this.hasAllowTokens && !this.allowTokens.has(normalized)) {
+          // H-38 FIX: Generic message that does not reveal which tokens are allowed
           return {
             decision: "DENY",
             rule: this.name,
-            reason: `Token is not in the swap allowlist: ${token}`,
+            reason: "Token not in swap allowlist",
+          };
+        }
+      }
+    }
+
+    // CRIT-05 fix: Fail-closed for intent types that can move funds but have no extractable target.
+    // If address or program allowlists are configured, intents without a verifiable target
+    // must be explicitly covered by token-level checks (for swaps) or denied.
+    // This prevents swaps from silently bypassing address/program restrictions.
+    if (!targetAddress && !programId) {
+      const hasFundsMovingIntent = intent.type === "swap" || intent.type === "custom";
+      if (hasFundsMovingIntent) {
+        // Swaps: if we have no token checks covering them, and address/program lists exist, deny
+        const isSwapCoveredByTokenChecks = intent.type === "swap" &&
+          (this.hasAllowTokens || this.denyTokens.size > 0);
+
+        if (!isSwapCoveredByTokenChecks && (this.hasAllowAddresses || this.hasAllowPrograms)) {
+          return {
+            decision: "DENY",
+            rule: this.name,
+            reason: `Intent type "${intent.type}" has no verifiable target address or program. ` +
+              `Address/program allowlists are configured but cannot be checked for this intent type. ` +
+              `Configure token allowlists (allowTokens/denyTokens) to explicitly cover swap intents.`,
           };
         }
       }
@@ -153,7 +209,14 @@ export class AllowlistRule implements PolicyRule {
     return { decision: "ALLOW" };
   }
 
-  /** Extract the target/recipient address from an intent */
+  /**
+   * Extract the target/recipient address from an intent.
+   *
+   * M-03 FIX: For swap intents, extract fromToken and toToken mint addresses
+   * so they can be checked against the address allowlist/denylist. A swap to a
+   * denylisted token mint address should be blocked even if it passes token
+   * symbol checks.
+   */
   private extractTargetAddress(intent: TransactionIntent): string | null {
     const params = intent.params as unknown as Record<string, unknown>;
 
@@ -180,10 +243,70 @@ export class AllowlistRule implements PolicyRule {
     return null;
   }
 
-  /** Extract the program ID from an intent (only for custom intents) */
+  /**
+   * M-03 FIX: Validate swap intent token mint addresses against address allowlist/denylist.
+   * Checks both fromToken and toToken as addresses (not just as token symbols).
+   * This catches cases where token mint addresses are denylisted even if the token
+   * symbol passes the token allowlist check.
+   */
+  private checkSwapAddresses(intent: TransactionIntent): PolicyDecision | null {
+    if (intent.type !== "swap") return null;
+    const params = intent.params as unknown as Record<string, unknown>;
+
+    const tokenAddresses: string[] = [];
+    if ("fromToken" in params && typeof params.fromToken === "string") {
+      tokenAddresses.push(params.fromToken);
+    }
+    if ("toToken" in params && typeof params.toToken === "string") {
+      tokenAddresses.push(params.toToken);
+    }
+
+    for (const rawAddr of tokenAddresses) {
+      const addr = normalizeAddress(rawAddr);
+
+      // Check deny addresses
+      if (this.denyAddresses.has(addr)) {
+        return {
+          decision: "DENY",
+          rule: this.name,
+          reason: "Swap token address is not permitted",
+        };
+      }
+
+      // Check allow addresses (if configured, swap token address must be in the list)
+      if (this.hasAllowAddresses && !this.allowAddresses.has(addr)) {
+        return {
+          decision: "DENY",
+          rule: this.name,
+          reason: "Swap token address not in allowlist",
+        };
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Extract the program ID from an intent.
+   *
+   * M-05 FIX: Extended program allowlist/denylist checking to all intent types that
+   * include a programId field, not just custom intents. While POLICY-006 noted that
+   * the chain adapter hardcodes programs for transfer/swap intents, the intent object
+   * may still carry a programId field (e.g., for auditing or verification). If present,
+   * it should be checked against the program allowlist/denylist for defense-in-depth.
+   *
+   * This ensures that:
+   * - Swap intents specifying a DEX program ID are checked against the program lists
+   * - Transfer intents specifying a token program ID are checked
+   * - Custom intents continue to require program ID validation
+   * - Intents without a programId field are unaffected (returns null)
+   *
+   * If the programId field is absent from a swap/transfer intent, program checks
+   * are skipped for that intent (the chain adapter is trusted to use the correct program).
+   */
   private extractProgramId(intent: TransactionIntent): string | null {
     const params = intent.params as unknown as Record<string, unknown>;
-    if (intent.type === "custom" && "programId" in params && typeof params.programId === "string") {
+    if ("programId" in params && typeof params.programId === "string") {
       return params.programId;
     }
     return null;

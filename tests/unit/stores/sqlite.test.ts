@@ -6,7 +6,7 @@ describe("SqliteStore", () => {
   let store: SqliteStore;
 
   beforeEach(() => {
-    store = new SqliteStore({ path: ":memory:" });
+    store = new SqliteStore({ path: ":memory:", requireEncryption: false });
   });
 
   afterEach(() => {
@@ -257,10 +257,11 @@ describe("SqliteStore", () => {
   // ── Very Long Keys and Values ──────────────────────────────────
 
   describe("very long keys and values", () => {
-    it("should handle a very long key (1000 chars)", async () => {
+    it("should reject a very long key (1000 chars) exceeding max length", async () => {
       const longKey = "k".repeat(1000);
-      await store.set(longKey, "value");
-      expect(await store.get(longKey)).toBe("value");
+      await expect(store.set(longKey, "value")).rejects.toThrow(
+        /Store key exceeds max length of 512/,
+      );
     });
 
     it("should handle a very long value (10000 chars)", async () => {

@@ -5,9 +5,16 @@
 
 /** Describes a single parameter in a wallet tool definition. */
 export interface ToolParameter {
-  type: string;
+  /** LOW-17: Constrained to JSON Schema primitive types to prevent arbitrary type injection. */
+  type: "string" | "number" | "boolean" | "integer" | "object" | "array";
   description: string;
   enum?: string[];
+  /** Optional maximum constraint (e.g., for numeric limits). */
+  maximum?: number;
+  /** HIGH-T3-04 fix: Maximum string length for input validation. */
+  maxLength?: number;
+  /** HIGH-T3-04 fix: Maximum array length (for array-typed fields passed as JSON strings). */
+  maxItems?: number;
 }
 
 export interface ToolDefinition {
@@ -17,6 +24,7 @@ export interface ToolDefinition {
     type: "object";
     properties: Record<string, ToolParameter>;
     required: string[];
+    additionalProperties?: boolean;
   };
 }
 

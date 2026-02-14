@@ -10,8 +10,38 @@ coverage/
 .local-keypair.json
 .local-recipient.json
 .validator.pid
+.validator.log
 test-ledger/
+
+# Security audit files (H-34: prevent leaking security findings into repo)
+security_audit*.md
+SECURITY_AUDIT*.md
+
+# SQLite databases (H-35: wallet stores may use SQLite; exclude DB files from repo)
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Source maps (H-36: prevent source map leaks in published packages)
+*.map
 
 # Documentation & internal
 docs/
+docs-site/
 implementation/
+
+# --- Dependency Security Notes ---
+# H-27: bigint-buffer transitive dependency has a known CVE. This requires a
+#   dependency update (not a .gitignore fix). Track and update when upstream
+#   publishes a patched version. See CRIT chain: @solana/web3.js -> bigint-buffer.
+#
+# L-26: devDependency vitepress pulls in esbuild which has a moderate CVE.
+#   DevDependencies do not affect production builds, but should be updated
+#   periodically. Run `npm audit` to check current status.
+#
+# L-28: better-sqlite3 includes a native binary (prebuilt N-API addon) which
+#   introduces supply chain risk. Pin exact versions, verify checksums, and
+#   consider auditing the prebuilt binary or building from source in CI.

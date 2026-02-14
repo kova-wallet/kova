@@ -4,22 +4,66 @@
 
 export type TransactionStatus = "confirmed" | "failed" | "pending" | "denied";
 
-export interface TransactionResult {
-  /** The status of the transaction */
-  status: TransactionStatus;
-  /** Transaction ID / signature on the blockchain (if submitted) */
-  txId?: string;
-  /** Human-readable summary of what happened */
-  summary: string;
-  /** The intent ID this result corresponds to */
-  intentId: string;
-  /** Timestamp when the result was produced */
-  timestamp: number;
-  /** Error details if status is "failed" or "denied" */
-  error?: TransactionError;
-  /** Chain-specific details */
-  chainData?: Record<string, unknown>;
-}
+/**
+ * CORE-013 fix: TransactionResult is now a discriminated union keyed on `status`.
+ * This enforces at the type level that:
+ * - "confirmed" results MUST have a `txId` and CANNOT have an `error`
+ * - "denied" and "failed" results CAN have an `error` and CANNOT have a `txId`
+ * - "pending" results CANNOT have a `txId` or `error`
+ *
+ * CORE-013 INVARIANTS:
+ * 1. `intentId` is always present and matches the original intent's ID.
+ * 2. `timestamp` is always present and represents the wall-clock time (ms since epoch)
+ *    when the result was produced. It is NOT the on-chain confirmation timestamp.
+ * 3. `summary` is always present and is a sanitized human-readable string (control
+ *    characters stripped). It MUST NOT contain raw user input or policy-internal values.
+ * 4. For "confirmed" status, `txId` is the on-chain transaction signature/hash. An
+ *    empty string indicates the broadcast succeeded but the adapter did not return a
+ *    transaction ID (should not happen in normal operation).
+ * 5. For "denied" and "failed" status, `error` is optional but when present contains
+ *    a sanitized error code and message. The `message` field MUST NOT contain raw
+ *    policy limits, RPC URLs, or internal error details (see sanitizePolicyDenialForAgent
+ *    and sanitizeTransactionError in wallet.ts).
+ * 6. `chainData` is reserved for chain-adapter-specific metadata (e.g., slot number,
+ *    block hash) and is not currently populated by the core wallet.
+ */
+export type TransactionResult =
+  | {
+      status: "confirmed";
+      txId: string;
+      summary: string;
+      intentId: string;
+      timestamp: number;
+      error?: never;
+      chainData?: Record<string, unknown>;
+    }
+  | {
+      status: "denied";
+      summary: string;
+      intentId: string;
+      timestamp: number;
+      error?: TransactionError;
+      txId?: never;
+      chainData?: Record<string, unknown>;
+    }
+  | {
+      status: "failed";
+      summary: string;
+      intentId: string;
+      timestamp: number;
+      error?: TransactionError;
+      txId?: never;
+      chainData?: Record<string, unknown>;
+    }
+  | {
+      status: "pending";
+      summary: string;
+      intentId: string;
+      timestamp: number;
+      error?: never;
+      txId?: never;
+      chainData?: Record<string, unknown>;
+    };
 
 export interface TransactionError {
   /** Error code for programmatic handling */
@@ -43,6 +87,7 @@ export type TransactionErrorCode =
   | "APPROVAL_REJECTED"
   | "APPROVAL_TIMEOUT"
   | "INSUFFICIENT_BALANCE"
+  | "SIMULATION_FAILED"
   | "TRANSACTION_FAILED"
   | "SIGNER_ERROR"
   | "CHAIN_ERROR"

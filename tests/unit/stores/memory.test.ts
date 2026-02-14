@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { MemoryStore } from "../../../src/stores/memory.js";
 
 describe("MemoryStore", () => {
@@ -6,6 +6,10 @@ describe("MemoryStore", () => {
 
   beforeEach(() => {
     store = new MemoryStore();
+  });
+
+  afterEach(() => {
+    store.stopGc();
   });
 
   describe("get/set", () => {
@@ -262,6 +266,42 @@ describe("MemoryStore", () => {
     it("should handle empty string key", async () => {
       await store.set("", "value");
       expect(await store.get("")).toBe("value");
+    });
+  });
+
+  describe("LOW-04 — periodic GC", () => {
+    it("should sweep expired entries when GC runs", async () => {
+      await store.set("expires-fast", "value1", 0.001); // 1ms TTL
+      await store.set("permanent", "value2"); // no TTL
+
+      // Wait for expiry
+      await new Promise((r) => setTimeout(r, 10));
+
+      // Start GC with a very short interval
+      store.startGc(10);
+      await new Promise((r) => setTimeout(r, 30));
+      store.stopGc();
+
+      // Expired key should have been swept
+      expect(await store.get("expires-fast")).toBeNull();
+      // Permanent key should remain
+      expect(await store.get("permanent")).toBe("value2");
+    });
+
+    it("should stop GC cleanly", () => {
+      store.startGc(100);
+      store.stopGc();
+      // No error — timer is cleared
+      store.stopGc(); // Double-stop should be safe
+    });
+
+    it("should replace previous GC timer on restart", async () => {
+      store.startGc(10_000); // long interval
+      store.startGc(10);     // short interval — replaces the long one
+      await store.set("temp", "val", 0.001);
+      await new Promise((r) => setTimeout(r, 30));
+      store.stopGc();
+      expect(await store.get("temp")).toBeNull();
     });
   });
 

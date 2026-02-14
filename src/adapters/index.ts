@@ -1,6 +1,6 @@
 export type { ToolDefinition, ToolParameter, ToolCallResult } from "./types.js";
-export { WALLET_TOOLS, WALLET_TOOL_NAMES, getToolByName } from "./tools.js";
-export type { WalletToolName } from "./tools.js";
+export { WALLET_TOOLS, DANGEROUS_TOOLS, ALL_WALLET_TOOLS, WALLET_TOOL_NAMES, WRITE_TOOL_NAMES, getToolByName, getFilteredTools, validateToolInput, safeHandleToolCall, sanitizeToolResponse, WRITE_RATE_LIMIT_PER_MINUTE } from "./tools.js";
+export type { WalletToolName, WalletToolDefinition } from "./tools.js";
 export { toAnthropicTools } from "./claude.js";
 export type { AnthropicTool } from "./claude.js";
 export { toOpenAITools } from "./openai.js";

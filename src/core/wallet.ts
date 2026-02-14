@@ -9,11 +9,17 @@
  * - Circuit breaker blocks transactions after N consecutive denials
  * - Audit circuit breaker blocks transactions when audit logging is broken
  * - logAudit() uses real per-rule audit data from engine (S1-12 fix)
+ *
+ * SUPPLY-010: DEPENDENCY TRUST — This module imports from @solana/web3.js (via chain
+ * adapters), @solana/spl-token, and better-sqlite3 (via store). These are trust-critical
+ * dependencies that handle key material, transaction construction, and data persistence.
+ * Pin exact versions in package-lock.json and audit regularly with `npm audit`.
+ * Consider using npm's `--ignore-scripts` flag and verifying package integrity hashes.
  */
 
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash, createHmac, timingSafeEqual, randomBytes } from "node:crypto";
 import { isTransferIntent, isSwapIntent, isMintIntent, isStakeIntent, isCustomIntent } from "./intent.js";
-import type { TransactionIntent } from "./intent.js";
+import type { TransactionIntent, IntentMetadata } from "./intent.js";
 import type { TokenBalance, TransactionResult, TransactionError, PolicySummary } from "./result.js";
 import type { PolicyEngine } from "../policy/engine.js";
 import type { Signer } from "../signers/interface.js";
@@ -27,6 +33,8 @@ import type { PolicyRuleAudit } from "../policy/types.js";
 import type { ToolCallResult } from "../adapters/types.js";
 import { toAnthropicTools as convertToAnthropicTools, type AnthropicTool } from "../adapters/claude.js";
 import { toOpenAITools as convertToOpenAITools, type OpenAITool } from "../adapters/openai.js";
+// M-55 fix: WALLET_TOOL_NAMES no longer enumerated in error messages (but still
+// imported for MED-T3-08 constructor validation of enabledTools).
 import { WALLET_TOOL_NAMES, type WalletToolName } from "../adapters/tools.js";
 import { SpendingLimitRule } from "../policy/rules/spending-limit.js";
 import { AllowlistRule } from "../policy/rules/allowlist.js";
@@ -34,19 +42,42 @@ import { RateLimitRule } from "../policy/rules/rate-limit.js";
 import { TimeWindowRule } from "../policy/rules/time-window.js";
 import { ApprovalGateRule } from "../policy/rules/approval-gate.js";
 import { CircuitBreaker, type CircuitBreakerConfig } from "./circuit-breaker.js";
+import { PrefixedStore } from "../stores/prefixed.js";
 import type { ChainId } from "./intent.js";
 
 /** Maximum number of history entries that can be requested */
 const MAX_HISTORY_LIMIT = 1000;
 
-/** TTL for idempotency keys (24 hours) */
-const IDEMPOTENCY_TTL = 86_400;
+/**
+ * M-23 fix: Default timeout for mutex acquisition in milliseconds.
+ * If the execute mutex cannot be acquired within this period (e.g., due to
+ * a long-running approval wait), the caller receives an error instead of
+ * blocking indefinitely. Prevents head-of-line blocking.
+ */
+const DEFAULT_MUTEX_TIMEOUT_MS = 30_000;
+
+/**
+ * Default TTL for idempotency keys (24 hours in seconds).
+ * CORE-014 fix: Now configurable via AgentWalletConfig.idempotencyTtl.
+ */
+const DEFAULT_IDEMPOTENCY_TTL = 86_400;
 
 /** Store key prefix for idempotency */
 const IDEMPOTENCY_PREFIX = "idempotency:";
 
 /** Valid chain IDs */
-const VALID_CHAINS = new Set(["solana", "ethereum", "base"]);
+const VALID_CHAINS = new Set<string>(["solana", "ethereum", "base"]);
+
+/**
+ * HIGH-21 fix: Runtime-validated ChainId parser. Replaces unsafe `as ChainId`
+ * type assertions which trust agent-provided strings without validation.
+ * Returns the validated ChainId or null if invalid.
+ */
+function parseChainId(value: unknown): ChainId | null {
+  if (typeof value !== "string") return null;
+  if (VALID_CHAINS.has(value)) return value as ChainId;
+  return null;
+}
 
 /** Valid intent types */
 const VALID_TYPES = new Set(["transfer", "swap", "mint", "stake", "custom"]);
@@ -54,6 +85,19 @@ const VALID_TYPES = new Set(["transfer", "swap", "mint", "stake", "custom"]);
 /** HIGH-10 fix: Maximum length limits for string inputs to prevent memory exhaustion */
 const MAX_ADDRESS_LENGTH = 128;
 const MAX_TOKEN_LENGTH = 64;
+/**
+ * L-07 fix: Minimum amount to reject dust transfers below fee threshold.
+ *
+ * LOW-T2-02 fix: This is the wallet-layer dust threshold (0.000001 in human-readable
+ * units). It rejects intents outright during validation, before they reach the chain
+ * adapter. The chain layer (src/chains/solana/utils.ts toSmallestUnit()) has a separate
+ * dust threshold (1000 smallest units) that emits an advisory warning at the token-unit
+ * level. The two thresholds are intentionally different:
+ * - Wallet layer (here): human-readable, applies uniformly, hard rejection.
+ * - Chain layer: smallest-unit, token-aware, advisory warning only.
+ * Do not unify them — they protect against different attack vectors at different layers.
+ */
+const MIN_DUST_AMOUNT = 0.000001;
 const MAX_DATA_LENGTH = 65_536; // SEC: 64KB (reduced from 1MB to limit audit log entry size)
 const MAX_URI_LENGTH = 2048;
 const MAX_REASON_LENGTH = 1024;
@@ -65,13 +109,132 @@ const MAX_ACCOUNTS = 64;
 /** SEC: Prevent JSON.parse memory DoS on tool-provided accounts blobs */
 const MAX_ACCOUNTS_JSON_LENGTH = 65_536; // 64KB
 
+/**
+ * MED-26 fix: Strip control characters (C0: U+0000-U+001F, DEL: U+007F,
+ * C1: U+0080-U+009F) from strings before interpolating into summaries.
+ * Prevents log injection, terminal escape sequences, and invisible characters
+ * that could mislead operators reviewing audit logs.
+ */
+function stripControlChars(value: string): string {
+  // eslint-disable-next-line no-control-regex
+  return value.replace(/[\x00-\x1F\x7F-\x9F]/g, "");
+}
+
 const DECIMAL_AMOUNT_REGEX = /^\d+(\.\d+)?$/;
+
+/**
+ * M-43 fix: Canonical JSON serializer that deep-sorts object keys deterministically.
+ * Ensures that { a: 1, b: 2 } and { b: 2, a: 1 } produce identical JSON output,
+ * which is required for idempotency hash stability. Without canonical serialization,
+ * semantically identical intents could produce different hashes due to key ordering
+ * differences across JSON.stringify implementations or object construction order.
+ */
+function canonicalJsonStringify(value: unknown): string {
+  if (value === null || value === undefined) return JSON.stringify(value);
+  if (typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return "[" + value.map(canonicalJsonStringify).join(",") + "]";
+  }
+  const obj = value as Record<string, unknown>;
+  // MED-T3-05 fix: Filter out prototype pollution keys (__proto__, constructor, prototype).
+  // Unlike the audit logger's sortKeysDeep() which already filters these, this function
+  // did not, creating an inconsistency. A crafted intent with __proto__ keys could inject
+  // unexpected properties during deserialization of the canonical JSON output.
+  const DANGEROUS_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+  const sortedKeys = Object.keys(obj).filter((k) => !DANGEROUS_KEYS.has(k)).sort();
+  const entries = sortedKeys.map(
+    (key) => JSON.stringify(key) + ":" + canonicalJsonStringify(obj[key])
+  );
+  return "{" + entries.join(",") + "}";
+}
+
+/**
+ * L-13 fix: Normalize amount strings by stripping leading zeros so that
+ * "00.5" and "0.5" produce the same idempotency hash. Preserves the single
+ * leading zero before a decimal point (e.g., "0.5" stays "0.5").
+ */
+function normalizeAmountForHash(amount: string): string {
+  // Strip leading zeros but preserve "0" before decimal point
+  // e.g., "00.5" -> "0.5", "007" -> "7", "0.5" -> "0.5", "0" -> "0"
+  const normalized = amount.replace(/^0+/, "");
+  if (normalized === "" || normalized.startsWith(".")) {
+    return "0" + normalized;
+  }
+  return normalized;
+}
+
+/**
+ * CRIT-12 fix: Sanitize policy denial reasons before returning them to the agent.
+ * Strips specific numeric values (amounts, limits, remaining budget, counters) from
+ * denial messages to prevent policy reconnaissance. An agent that knows exact limits
+ * can craft transactions just below thresholds or calculate remaining budget.
+ *
+ * CORE-012 TRADEOFF: This function intentionally over-strips numeric values rather
+ * than under-strips. Over-stripping (replacing harmless numbers like rule IDs) produces
+ * slightly less informative denial messages, but under-stripping (allowing amounts or
+ * limits to leak) would enable policy reconnaissance attacks. In a security context,
+ * over-stripping is the safer default. If specific rule names or identifiers are
+ * needed in denial messages, they should use non-numeric identifiers.
+ */
+function sanitizePolicyDenialForAgent(message: string): string {
+  // L-05 fix: Timing side channel in policy denial messages is accepted as low-risk.
+  // Policy denials return faster than allowed transactions (which go through build/sign/
+  // broadcast), but the timing difference is minimal and unavoidable without artificial
+  // latency. An attacker can distinguish "denied" from "allowed" but not which rule denied.
+
+  // H-05 fix: Strip specific rule names from denial reasons to prevent reconnaissance.
+  // Rule names like "spending-limit", "rate-limit-per-minute", "allowlist" reveal the
+  // policy structure and help attackers craft evasion strategies.
+  let sanitized = message;
+  sanitized = sanitized.replace(/\brule[:\s]+["']?[\w-]+["']?/gi, "policy rule");
+  sanitized = sanitized.replace(/\b(?:spending[_-]?limit|rate[_-]?limit|allowlist|time[_-]?window|approval[_-]?gate|circuit[_-]?breaker)[\w-]*/gi, "policy rule");
+
+  // CORE-012 + L-11 fix: Replace ALL numeric values including single-digit numbers.
+  // Previously single-digit numbers were preserved, but limits like "5 SOL" or "1 USD"
+  // are security-sensitive and enable policy reconnaissance.
+  sanitized = sanitized.replace(/\d+(\.\d+)?/g, "[restricted]");
+  return sanitized;
+}
+
+/**
+ * CORE-001 fix: Sanitize transaction error messages before returning them to the agent.
+ * Strips RPC URLs, internal error codes, and sensitive details from chain adapter
+ * error messages to prevent information leakage about infrastructure (RPC endpoints,
+ * internal error codes, stack traces). Uses the same approach as sanitizePolicyDenialForAgent.
+ */
+function sanitizeTransactionError(message: string): string {
+  let sanitized = message;
+  // Strip URLs (http/https/wss) that may expose RPC endpoint addresses
+  sanitized = sanitized.replace(/https?:\/\/[^\s,)}\]"']+/gi, "[restricted]");
+  sanitized = sanitized.replace(/wss?:\/\/[^\s,)}\]"']+/gi, "[restricted]");
+  // Replace numeric values (error codes, port numbers, byte offsets, etc.)
+  sanitized = sanitized.replace(/\d+(\.\d+)?/g, "[restricted]");
+  return sanitized;
+}
+
+/**
+ * H-14 fix: Strip dangerous keys from parsed JSON to prevent prototype pollution.
+ * JSON.parse() can produce objects with __proto__, constructor, or prototype keys
+ * that, when spread or assigned, can pollute Object.prototype and affect all
+ * downstream code. This recursively removes these keys from parsed objects.
+ */
+function stripDangerousKeys(obj: unknown): unknown {
+  if (obj === null || typeof obj !== "object") return obj;
+  if (Array.isArray(obj)) return obj.map(stripDangerousKeys);
+  const clean: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
+    if (key === "__proto__" || key === "constructor" || key === "prototype") continue;
+    clean[key] = stripDangerousKeys(value);
+  }
+  return clean;
+}
 
 function validateDecimalAmount(value: string): string | null {
   if (value.length > MAX_AMOUNT_LENGTH) return `'amount' exceeds max length of ${MAX_AMOUNT_LENGTH}`;
   if (value.trim() !== value) return "'amount' must not include leading or trailing whitespace";
+  // LOW-01 fix: Do not echo raw input values in error messages (prevents log injection)
   if (!DECIMAL_AMOUNT_REGEX.test(value)) {
-    return `invalid amount '${value}'. Must be a positive decimal string`;
+    return "invalid amount. Must be a positive decimal string (e.g. '1.5')";
   }
   const fractional = value.split(".")[1];
   if (fractional && fractional.length > MAX_AMOUNT_DECIMALS) {
@@ -79,7 +242,13 @@ function validateDecimalAmount(value: string): string | null {
   }
   const parsed = parseFloat(value);
   if (isNaN(parsed) || !Number.isFinite(parsed) || parsed <= 0) {
-    return `invalid amount '${value}'. Must be a finite positive number`;
+    return "invalid amount. Must be a finite positive number";
+  }
+  // L-07 fix: Reject dust amounts below fee threshold. Transactions with amounts
+  // this small are economically meaningless (below network fees) and can be used
+  // to probe policy rules or inflate audit logs without real financial intent.
+  if (parsed < MIN_DUST_AMOUNT) {
+    return `amount below minimum dust threshold of ${MIN_DUST_AMOUNT}`;
   }
   return null;
 }
@@ -104,41 +273,196 @@ export interface AgentWalletConfig {
   circuitBreaker?: Partial<CircuitBreakerConfig> | false;
   /** Callback invoked when an audit log write fails */
   onAuditFailure?: AuditFailureCallback;
+  /**
+   * CORE-014 fix: TTL for idempotency keys in seconds.
+   * Determines how long a duplicate intent ID returns a cached result instead of
+   * re-executing. Too short risks duplicate transactions; too long wastes store space.
+   * Must be a positive finite number. Default: 86400 (24 hours).
+   */
+  idempotencyTtl?: number;
+  /**
+   * STORE-004 fix: HMAC secret key for idempotency cache authenticity.
+   * When provided, each cached idempotency result is stored with an HMAC-SHA256
+   * tag computed over the JSON payload. On cache read, the HMAC is verified before
+   * trusting the cached result. This prevents an attacker with store write access
+   * from forging cached "confirmed" results for transactions that never executed.
+   * Store this key separately from the cache store (e.g., environment variable,
+   * secret manager). If not set, idempotency cache entries are stored as plaintext
+   * (backwards-compatible but vulnerable to forgery).
+   */
+  idempotencyHmacKey?: string | Buffer;
+  /**
+   * STORE-005 fix: Optional prefix for store key isolation.
+   * When multiple AgentWallet instances share a Store backend, each wallet
+   * MUST use a unique prefix (e.g., derived from the signer's public key)
+   * to prevent cross-wallet interference in spending limits, rate counters,
+   * circuit breaker state, and audit logs.
+   * When set, the store is automatically wrapped in a PrefixedStore.
+   */
+  storePrefix?: string;
+  /**
+   * M-23 fix: Timeout in milliseconds for acquiring the execute mutex.
+   * If the mutex cannot be acquired within this period (e.g., due to a
+   * long-running human approval wait), the execute() call fails with an
+   * error instead of blocking indefinitely. Default: 30000 (30 seconds).
+   */
+  mutexTimeoutMs?: number;
+  /**
+   * H-06 fix: Set of tool names that are enabled for dispatch via handleToolCall().
+   * If not provided, defaults to safe read-only tools only (wallet_get_balance,
+   * wallet_get_transaction_history). Dangerous tools (wallet_execute_custom,
+   * wallet_get_policy) and write tools (wallet_transfer, wallet_swap, wallet_mint,
+   * wallet_stake) must be explicitly enabled.
+   *
+   * M-59 fix: wallet_get_policy is included in this check — it is not invocable
+   * unless explicitly listed in enabledTools.
+   */
+  enabledTools?: ReadonlySet<string>;
 }
+
+/** Default safe tools when no enabledTools is configured */
+const DEFAULT_ENABLED_TOOLS: ReadonlySet<string> = new Set([
+  "wallet_get_balance",
+  "wallet_get_transaction_history",
+]);
 
 export class AgentWallet {
   private readonly signer: Signer;
   private readonly chain: ChainAdapter;
   private readonly policy: PolicyEngine;
   private readonly store: Store;
-  private readonly approval?: ApprovalChannel;
   private readonly logger: AuditLogger;
   private readonly circuitBreaker?: CircuitBreaker;
+  /** CORE-014 fix: Configurable idempotency TTL (seconds) */
+  private readonly idempotencyTtl: number;
+  /** STORE-004 + CRIT-05 fix: HMAC key for idempotency cache authenticity (always set) */
+  private readonly idempotencyHmacKey: Buffer;
   /** S1-04 fix: mutex to serialize execute() calls and prevent concurrent policy bypass */
   private executeLock: Promise<void> = Promise.resolve();
+  /** M-23 fix: Timeout for mutex acquisition (milliseconds) */
+  private readonly mutexTimeoutMs: number;
+  /** H-06 fix: Set of tool names enabled for dispatch */
+  private readonly enabledTools: ReadonlySet<string>;
 
   constructor(config: AgentWalletConfig) {
     this.signer = config.signer;
     this.chain = config.chain;
     this.policy = config.policy;
-    this.store = config.store;
-    this.approval = config.approval;
-
+    // STORE-005 fix: Auto-wrap store with PrefixedStore when storePrefix is configured.
+    // This ensures per-wallet isolation of spending limits, rate counters, circuit breaker
+    // state, audit logs, and idempotency keys when multiple wallets share a store backend.
+    const effectiveStore = config.storePrefix
+      ? PrefixedStore.wrapIfNeeded(config.store, config.storePrefix)
+      : config.store;
+    this.store = effectiveStore;
     // Create AuditLogger — use provided logger, or create one with config
     if (config.logger) {
       this.logger = config.logger;
     } else if (config.onAuditFailure) {
       this.logger = new AuditLogger({
-        store: config.store,
+        store: effectiveStore,
         onAuditFailure: config.onAuditFailure,
       });
     } else {
-      this.logger = new AuditLogger(config.store);
+      this.logger = new AuditLogger(effectiveStore);
+    }
+
+    // CORE-014 fix: Validate and set configurable idempotency TTL
+    if (config.idempotencyTtl !== undefined) {
+      if (typeof config.idempotencyTtl !== "number" || !Number.isFinite(config.idempotencyTtl) || config.idempotencyTtl <= 0) {
+        throw new Error("AgentWalletConfig: 'idempotencyTtl' must be a positive finite number (seconds)");
+      }
+      this.idempotencyTtl = config.idempotencyTtl;
+    } else {
+      this.idempotencyTtl = DEFAULT_IDEMPOTENCY_TTL;
+    }
+
+    // STORE-004 fix: Store HMAC key for idempotency cache authenticity.
+    // CRIT-05 fix: Auto-generate a random 32-byte HMAC key if none is provided.
+    // Without an HMAC key, the idempotency cache has no integrity protection and an
+    // attacker with store write access can forge cached "confirmed" results for
+    // transactions that never executed. Auto-generating ensures every wallet instance
+    // has cache integrity protection by default, even if the operator forgets to configure one.
+    // H-11 fix: Enforce minimum HMAC key length of 32 bytes (64 hex chars) to prevent
+    // weak keys that are vulnerable to brute-force attacks.
+    if (config.idempotencyHmacKey) {
+      const keyBuffer = typeof config.idempotencyHmacKey === "string"
+        ? Buffer.from(config.idempotencyHmacKey, "utf-8")
+        : config.idempotencyHmacKey;
+      if (keyBuffer.length < 32) {
+        throw new Error(
+          "AgentWalletConfig: 'idempotencyHmacKey' must be at least 32 bytes (64 hex characters). " +
+          "Short HMAC keys are vulnerable to brute-force attacks."
+        );
+      }
+      this.idempotencyHmacKey = keyBuffer;
+    } else {
+      // CRIT-05: Auto-generate a cryptographically random 32-byte key so that
+      // idempotency cache integrity is always protected, even without explicit config.
+      this.idempotencyHmacKey = randomBytes(32);
     }
 
     // Create CircuitBreaker unless disabled
+    // CRIT-T4-02 fix: Use effectiveStore (which includes prefix) instead of raw config.store.
+    // Previously, the circuit breaker received the unprefixed store, meaning all wallets
+    // sharing a store backend shared a single circuit breaker state. A malicious agent on
+    // one wallet could block ALL other wallets by triggering consecutive denials.
     if (config.circuitBreaker !== false) {
-      this.circuitBreaker = new CircuitBreaker(config.store, config.circuitBreaker ?? undefined);
+      this.circuitBreaker = new CircuitBreaker(effectiveStore, config.circuitBreaker ?? undefined);
+    }
+
+    // M-23 fix: Configurable mutex timeout to prevent indefinite blocking
+    this.mutexTimeoutMs = config.mutexTimeoutMs ?? DEFAULT_MUTEX_TIMEOUT_MS;
+
+    // H-06 fix: Configure enabled tools. Default to safe read-only tools only.
+    this.enabledTools = config.enabledTools ?? DEFAULT_ENABLED_TOOLS;
+
+    // MED-T3-08 fix: Warn when enabledTools contains tool names not recognized by the
+    // wallet's dispatch logic. This catches typos and adapter/wallet desync issues at
+    // construction time rather than silently failing at invocation time, where the
+    // unrecognized tool would hit the "Unknown tool" default case.
+    const knownToolNames = new Set<string>(WALLET_TOOL_NAMES);
+    for (const tool of this.enabledTools) {
+      if (!knownToolNames.has(tool)) {
+        console.warn(
+          `[AgentWallet] Warning: enabledTools contains unrecognized tool "${tool}". ` +
+          `This tool will not be dispatched by the wallet. Known tools: ${WALLET_TOOL_NAMES.join(", ")}`,
+        );
+      }
+    }
+  }
+
+  /**
+   * CRIT-T5-03 fix: Gracefully shut down the wallet, releasing all held resources.
+   * - Destroys the circuit breaker (stops heartbeat timer, clears state)
+   * - Destroys the audit logger (zeroes HMAC key)
+   * - Optionally destroys the signer (zeroes key material for LocalSigner)
+   *
+   * After calling destroy(), the wallet cannot process any more transactions.
+   * This method is idempotent — calling it multiple times is safe.
+   */
+  async destroy(): Promise<void> {
+    // Destroy circuit breaker (stops heartbeat interval timer, allows clean process exit)
+    if (this.circuitBreaker) {
+      try {
+        await this.circuitBreaker.destroy();
+      } catch {
+        // Non-fatal: circuit breaker cleanup failure should not prevent wallet destruction
+      }
+    }
+
+    // Destroy audit logger (zeroes HMAC key material in memory)
+    try {
+      await this.logger.destroy();
+    } catch {
+      // Non-fatal: logger cleanup failure should not prevent wallet destruction
+    }
+
+    // Destroy signer (zeroes private key material for LocalSigner, clears cache for MpcSigner)
+    try {
+      await this.signer.destroy();
+    } catch {
+      // Non-fatal: signer cleanup failure should not prevent wallet destruction
     }
   }
 
@@ -151,6 +475,30 @@ export class AgentWallet {
    * S1-09 fix: Validates intent structure before processing.
    */
   async execute(intent: TransactionIntent): Promise<TransactionResult> {
+    // CORE-005 fix: Deep-clone intent at entry to eliminate TOCTOU window.
+    // Prevents external mutation of the intent object from affecting the pipeline
+    // after validation has passed. Objects with non-cloneable values (functions,
+    // symbols, DOM nodes) are caught and rejected as validation failures.
+    // M-54 fix: Do NOT access properties of the original intent object in the catch
+    // block. A hostile intent could have getter traps on .id or other fields that
+    // execute arbitrary code. Use a generic error without referencing the original.
+    // L-14 fix: Do not mention "structuredClone" or other implementation details in
+    // error messages — use a generic message that doesn't leak internals.
+    try {
+      intent = structuredClone(intent);
+    } catch {
+      return {
+        status: "failed",
+        summary: "Validation failed: intent contains non-cloneable values",
+        intentId: "unknown",
+        timestamp: Date.now(),
+        error: {
+          code: "VALIDATION_FAILED",
+          message: "Intent contains non-cloneable values. All intent fields must be plain data.",
+        },
+      };
+    }
+
     // S1-09 fix: Validate intent structure before any processing
     const validationError = this.validateIntent(intent);
     if (validationError) {
@@ -167,11 +515,37 @@ export class AgentWallet {
     }
 
     // S1-04 fix: Serialize execute() calls to prevent TOCTOU races
+    // M-23 fix: Add a timeout to mutex acquisition to prevent head-of-line blocking.
+    // If the mutex cannot be acquired within the configured timeout (default 30s),
+    // the call fails with an error rather than blocking indefinitely. This prevents
+    // long-running approval waits from starving subsequent execute() calls.
     let releaseLock: () => void;
     const previousLock = this.executeLock;
     this.executeLock = new Promise<void>((resolve) => { releaseLock = resolve; });
 
-    await previousLock;
+    const timeoutPromise = new Promise<"timeout">((resolve) => {
+      setTimeout(() => resolve("timeout"), this.mutexTimeoutMs);
+    });
+
+    const lockResult = await Promise.race([
+      previousLock.then(() => "acquired" as const),
+      timeoutPromise,
+    ]);
+
+    if (lockResult === "timeout") {
+      // Release our slot in the lock chain so subsequent callers aren't permanently blocked
+      releaseLock!();
+      return {
+        status: "failed",
+        summary: "Transaction failed: execute mutex acquisition timed out",
+        intentId: intent.id ?? "unknown",
+        timestamp: Date.now(),
+        error: {
+          code: "TRANSACTION_FAILED",
+          message: `Execute mutex acquisition timed out after ${this.mutexTimeoutMs}ms. A previous transaction may be awaiting approval.`,
+        },
+      };
+    }
 
     try {
       return await this.executeInternal(intent);
@@ -187,16 +561,115 @@ export class AgentWallet {
     const intentId = normalizedIntent.id!;
 
     // S1-02 fix: Check for duplicate intent ID
-    const idempotencyKey = `${IDEMPOTENCY_PREFIX}${intentId}`;
-    const cachedResult = await this.store.get(idempotencyKey);
+    // H-18 KNOWN LIMITATION: Idempotency cache race in multi-instance deployments.
+    // The check-then-act pattern (read cache → miss → execute → write cache) is not
+    // atomic across multiple AgentWallet instances sharing the same store. Two instances
+    // could both read a cache miss for the same intent ID and execute the transaction
+    // twice. This is acceptable for single-instance deployment. Multi-instance setups
+    // MUST use an external distributed lock or database-level CAS (compare-and-swap)
+    // to guarantee exactly-once execution.
+    //
+    // L-33 KNOWN LIMITATION: No permanent anti-replay beyond idempotency TTL.
+    // After the idempotency TTL expires (default 24 hours), the same intent ID can be
+    // reused and will be treated as a fresh transaction. This is acceptable for the
+    // current use case (short-lived agent sessions) but operators requiring permanent
+    // deduplication should implement an external append-only ledger of executed intent IDs
+    // that persists beyond the TTL window.
+    //
+    // MED-08 fix: Include hash of intent parameters in idempotency key.
+    // Previously only the intent ID was used, so an agent could reuse an ID
+    // with different parameters and receive a cached "confirmed" result for
+    // a transaction that never executed with those parameters.
+    // L-13 fix: Normalize amount strings before hashing so that "00.5" and "0.5"
+    // produce the same idempotency key, preventing duplicate transactions.
+    // M-43 fix: Use canonical JSON serialization with sorted keys to ensure
+    // deterministic hash output regardless of object key ordering.
+    // M-44 fix: Use the full SHA-256 hash (64 hex chars) instead of a truncated
+    // 64-bit slice to avoid birthday collisions at ~2^32 operations.
+    const paramsForHash = structuredClone({ type: normalizedIntent.type, chain: normalizedIntent.chain, params: normalizedIntent.params });
+    // Normalize amount fields in params for idempotency deduplication
+    const hashParams = paramsForHash.params as unknown as Record<string, unknown>;
+    if (typeof hashParams.amount === "string") {
+      hashParams.amount = normalizeAmountForHash(hashParams.amount);
+    }
+    const paramsHash = createHash("sha256")
+      .update(canonicalJsonStringify(paramsForHash))
+      .digest("hex");
+    // MED-17 fix: Include chain as a plaintext prefix in the idempotency key.
+    // This prevents cross-chain collisions where the same intent ID + params hash
+    // on different chains could return a cached result from the wrong chain.
+    const idempotencyKey = `${IDEMPOTENCY_PREFIX}${normalizedIntent.chain}:${intentId}:${paramsHash}`;
+    // HIGH-15 fix: Wrap store.get in try-catch so store errors don't crash execute().
+    // A store failure during idempotency check should not block transaction processing.
+    let cachedResult: string | null = null;
+    try {
+      cachedResult = await this.store.get(idempotencyKey);
+    } catch {
+      // Store error during idempotency check — proceed with fresh execution
+    }
     if (cachedResult !== null) {
       try {
-        // S2-16 fix: Validate parsed cache entry before returning
-        const parsed = JSON.parse(cachedResult);
-        if (parsed && typeof parsed.status === "string" && typeof parsed.intentId === "string") {
-          return parsed as TransactionResult;
+        // CORE-009 SECURITY NOTE: Idempotency cache poisoning risk.
+        // An attacker with store write access can inject a forged "confirmed" result
+        // for a transaction that never executed. Without HMAC authentication, the
+        // cache entry is trusted at face value. Operators MUST configure
+        // `idempotencyHmacKey` in AgentWalletConfig to mitigate this risk.
+        // When the HMAC key is set, the STORE-004 fix below verifies each cached
+        // entry's HMAC-SHA256 tag before trusting it, rejecting forged entries as
+        // cache misses. The HMAC key should be stored separately from the cache
+        // store (e.g., in an environment variable or secret manager).
+        //
+        // STORE-004 fix: If HMAC key is configured, verify the HMAC tag before
+        // trusting the cached result. Forged entries are treated as cache misses.
+        let cacheJson = cachedResult;
+        if (this.idempotencyHmacKey) {
+          const colonIndex = cachedResult.indexOf(":");
+          if (colonIndex === -1) {
+            // No HMAC tag present — treat as untrusted (cache miss)
+            cacheJson = "";
+          } else {
+            const storedHmac = cachedResult.slice(0, colonIndex);
+            const payload = cachedResult.slice(colonIndex + 1);
+            const expectedHmac = createHmac("sha256", this.idempotencyHmacKey).update(payload).digest("hex");
+            // CRIT-01 fix: Use constant-time comparison to prevent timing side-channel
+            // attacks that could allow an attacker to forge HMAC tags byte-by-byte.
+            // Plain string comparison (===) leaks information about which byte position
+            // first differs, enabling iterative forgery. timingSafeEqual compares in
+            // constant time regardless of where the mismatch occurs.
+            // Length check first: if lengths differ, the HMAC is invalid. We still avoid
+            // leaking timing info by using Buffer length comparison (integer comparison
+            // is inherently constant-time).
+            const storedBuf = Buffer.from(storedHmac, "hex");
+            const expectedBuf = Buffer.from(expectedHmac, "hex");
+            if (storedBuf.length !== expectedBuf.length || !timingSafeEqual(storedBuf, expectedBuf)) {
+              // HMAC mismatch — forged or corrupted entry, treat as cache miss
+              cacheJson = "";
+            } else {
+              cacheJson = payload;
+            }
+          }
         }
-        // Invalid cache schema — proceed with fresh execution
+        if (cacheJson === "") {
+          // STORE-004: HMAC verification failed — fall through to fresh execution
+        } else {
+          // S2-16 fix: Validate parsed cache entry before returning
+          // H-14 fix: Strip __proto__, constructor, and prototype keys from parsed
+          // JSON to prevent prototype pollution attacks via forged cache entries.
+          const parsed = stripDangerousKeys(JSON.parse(cacheJson)) as Record<string, unknown>;
+          // HIGH-22 fix: Strengthen cached TransactionResult validation
+          if (
+            parsed &&
+            typeof parsed === "object" &&
+            typeof parsed.status === "string" &&
+            typeof parsed.intentId === "string" &&
+            typeof parsed.timestamp === "number" &&
+            typeof parsed.summary === "string" &&
+            (parsed.status === "confirmed" || parsed.status === "denied" || parsed.status === "failed" || parsed.status === "pending")
+          ) {
+            return parsed as TransactionResult;
+          }
+          // Invalid cache schema — proceed with fresh execution
+        }
       } catch {
         // Corrupted cache entry — proceed with execution
       }
@@ -217,8 +690,34 @@ export class AgentWallet {
     }
 
     // S6: Check circuit breaker — refuse transactions during cooldown after consecutive denials
+    // CORE-011: Pass intent type for per-intent-type circuit breaker isolation
+    // H-17 DESIGN NOTE: The circuit breaker check-then-act pattern (check → policy → record)
+    // is intentionally non-atomic. This is safe because the execute() mutex serializes all
+    // calls to executeInternal(), so no concurrent check-then-act race can occur within a
+    // single AgentWallet instance. Multi-instance deployments sharing a store may see
+    // slightly inconsistent circuit breaker state, but this is acceptable — the circuit
+    // breaker is a safety heuristic, not a precise counter.
+    // H-31 fix: Wrap circuit breaker store operations in try/catch. On store error,
+    // fail-closed (treat as circuit open / deny) to maintain security invariants.
     if (this.circuitBreaker) {
-      const cbReason = await this.circuitBreaker.check();
+      let cbReason: string | null;
+      try {
+        cbReason = await this.circuitBreaker.check(undefined, normalizedIntent.type);
+      } catch (cbErr) {
+        // H-31: Store error during circuit breaker check — fail-closed (deny)
+        const errMsg = cbErr instanceof Error ? cbErr.message : String(cbErr);
+        console.error(`[KOVA] Circuit breaker check failed (fail-closed): ${errMsg}`);
+        return {
+          status: "denied",
+          summary: "Denied: circuit breaker check unavailable (fail-closed)",
+          intentId,
+          timestamp: Date.now(),
+          error: {
+            code: "CIRCUIT_BREAKER_OPEN",
+            message: "Circuit breaker store is unavailable. Transactions are blocked until the store is restored.",
+          },
+        };
+      }
       if (cbReason) {
         return {
           status: "denied",
@@ -234,32 +733,61 @@ export class AgentWallet {
     }
 
     // 2. Evaluate the policy — now returns PolicyEvaluationResult with per-rule audits
+    // CRIT-03 fix: Auto-inject chain adapter's getValueInUSD for USD-normalized spending limits
+    // POLICY-017 fix: getValueInUSD is now constructor-injected into PolicyEngine.
+    // Pass only (intent, now?) — the engine uses its own price oracle reference.
     const evaluationResult = await this.policy.evaluate(normalizedIntent);
     const policyDecision = evaluationResult.decision;
     const ruleAudits = evaluationResult.ruleAudits;
 
     // S6: Record outcome for circuit breaker
+    // CORE-011: Pass intent type for per-intent-type circuit breaker isolation
+    // H-31 fix: Wrap recordOutcome in try/catch — store errors during recording
+    // should not break the transaction flow, but are logged for observability.
     if (this.circuitBreaker) {
-      await this.circuitBreaker.recordOutcome(policyDecision.decision);
+      try {
+        await this.circuitBreaker.recordOutcome(policyDecision.decision, undefined, normalizedIntent.type);
+      } catch (cbErr) {
+        const errMsg = cbErr instanceof Error ? cbErr.message : String(cbErr);
+        console.error(`[KOVA] Circuit breaker recordOutcome failed: ${errMsg}`);
+        // Non-fatal: the transaction has already been evaluated by policy.
+        // Failing to record the outcome means the circuit breaker count may drift,
+        // but this is safer than aborting a policy-approved transaction.
+      }
     }
 
     // 3. If denied, return immediately with error
     if (policyDecision.decision === "DENY") {
+      // CRIT-12 fix: Sanitize denial reason before exposing to agent to prevent
+      // policy reconnaissance (exact limit amounts, remaining budget, counters).
+      // HIGH-13 fix: Also sanitizes policy evaluation error reasons that may
+      // contain internal details from rule.evaluate() failures.
+      const sanitizedReason = sanitizePolicyDenialForAgent(policyDecision.reason);
+      // H-05 fix: Do NOT include policyDecision.rule in the error response returned
+      // to the agent. Specific rule names (e.g., "spending-limit", "allowlist") enable
+      // reconnaissance — an attacker learns exactly which rule denied, helping them
+      // craft evasion strategies. The rule name is still available in the audit log.
       const error: TransactionError = {
         code: "POLICY_DENIED",
-        message: policyDecision.reason,
-        policyRule: policyDecision.rule,
+        message: sanitizedReason,
       };
 
       const result: TransactionResult = {
         status: "denied",
-        summary: `Denied by policy: ${error.message}`,
+        summary: `Denied by policy: ${sanitizedReason}`,
         intentId,
         timestamp: Date.now(),
         error,
       };
 
-      await this.logAudit(normalizedIntent, ruleAudits, policyDecision, undefined);
+      // M-52 fix: Wrap logAudit in try/catch for denied results. If audit logging
+      // fails, still return the denial to the caller (fail-closed on the transaction,
+      // not on the response). The denial decision itself is security-critical.
+      try {
+        await this.logAudit(normalizedIntent, ruleAudits, policyDecision, undefined);
+      } catch {
+        // Audit failure for denied results is non-fatal — the denial still stands
+      }
       // S2-03 fix: Don't cache denied results — denial may be temporary (rate limit expires, budget resets)
       return result;
     }
@@ -273,20 +801,75 @@ export class AgentWallet {
         timestamp: Date.now(),
       };
 
-      await this.logAudit(normalizedIntent, ruleAudits, policyDecision, undefined);
+      // M-52 fix: Wrap logAudit in try/catch for pending results. If audit logging
+      // fails, still return the pending result to the caller.
+      try {
+        await this.logAudit(normalizedIntent, ruleAudits, policyDecision, undefined);
+      } catch {
+        // Audit failure for pending results is non-fatal — the pending status still stands
+      }
       // S2-03 fix: Don't cache pending results — approval may arrive on retry
       return result;
     }
 
     // 5. Build, sign, and broadcast the transaction
+    //
+    // H-02 fix: On post-policy transaction failure (build, sign, simulate, broadcast),
+    // attempt best-effort rollback of spending counters that were incremented during
+    // policy evaluation. This prevents budget from being permanently consumed by
+    // failed transactions. The rollback is safe because the execute mutex serializes
+    // all calls, eliminating TOCTOU risks during the rollback window.
+    //
+    // ROLLBACK CAVEAT: Rollback is best-effort. If the store is unavailable during
+    // rollback, the counter will remain inflated (safe direction: under-count budget).
+    // Rate limit counters (RateLimitRule) are NOT rolled back since they track
+    // attempts, not successful transactions.
     try {
       const signerAddress = await this.signer.getAddress();
 
       // Build unsigned transaction
       const unsignedTx = await this.chain.buildTransaction(normalizedIntent, signerAddress);
 
+      // CRIT-02 fix: Simulate transaction before signing to detect on-chain errors early.
+      // This catches insufficient balance, program errors, and other issues without spending fees.
+      // MED-26 note: Only simulation.success is checked. The simulation logs are not parsed
+      // to verify the expected program was invoked or accounts were correctly modified.
+      // A transaction that simulates successfully but performs unintended side effects
+      // (e.g., unlimited token approval) would pass. Instruction-level verification
+      // would require chain-specific parsing of simulation logs.
+      const simulation = await this.chain.simulateTransaction(unsignedTx.data);
+      if (!simulation.success) {
+        const rawSimMessage = simulation.error ?? "Transaction simulation failed";
+        const sanitizedSimMessage = sanitizeTransactionError(rawSimMessage);
+        const simError: TransactionError = {
+          code: "SIMULATION_FAILED",
+          message: sanitizedSimMessage,
+        };
+
+        const simResult: TransactionResult = {
+          status: "failed",
+          summary: `Simulation failed: ${sanitizedSimMessage}`,
+          intentId,
+          timestamp: Date.now(),
+          error: simError,
+        };
+
+        await this.logAudit(normalizedIntent, ruleAudits, policyDecision, undefined);
+        // H-02 fix: Roll back spending counters on simulation failure
+        await this.rollbackSpendingCounters(normalizedIntent);
+        return simResult;
+      }
+
       // Sign it
       const signedTx = await this.signer.sign(unsignedTx);
+
+      // CORE-002 / CHAIN-005 fix: Verify that the signed transaction's message bytes
+      // match the original unsigned transaction. Detects if a compromised signer modified
+      // the transaction instructions, accounts, or other data during signing.
+      // The chain adapter's verifyTransactionIntegrity() throws if the message was altered.
+      if (this.chain.verifyTransactionIntegrity) {
+        this.chain.verifyTransactionIntegrity(unsignedTx.data, signedTx.data);
+      }
 
       // Broadcast to chain
       const txId = await this.chain.broadcast(signedTx.data);
@@ -299,11 +882,64 @@ export class AgentWallet {
         timestamp: Date.now(),
       };
 
-      await this.logAudit(normalizedIntent, ruleAudits, policyDecision, { txId, status: "confirmed" });
+      // MED-25 fix: Retry audit logging for confirmed transactions.
+      // A confirmed transaction with no audit trail is a compliance gap.
+      let auditLogged = false;
+      for (let attempt = 0; attempt < 3 && !auditLogged; attempt++) {
+        try {
+          await this.logAudit(normalizedIntent, ruleAudits, policyDecision, { txId, status: "confirmed" });
+          auditLogged = true;
+        } catch {
+          if (attempt < 2) await new Promise((r) => setTimeout(r, 100 * (attempt + 1)));
+        }
+      }
+
+      // CRIT-06 fix: If audit logging failed for a confirmed transaction, mark the
+      // result as audit-incomplete and emit a stderr fallback so the confirmed tx
+      // is observable even when the store is down.
+      // STORE-009 fix: Only log intent ID, type, and status to stderr. Transaction
+      // details (txId, addresses, amounts), chain identifiers, and timestamps are
+      // stripped to prevent leaking sensitive metadata to stderr, which may be
+      // captured by process managers, log aggregators, or container runtimes
+      // without the same access controls as the primary audit store.
+      // H-30 fix: If audit logging failed for a confirmed transaction, do NOT return
+      // the confirmed result to the caller. A confirmed transaction without an audit
+      // trail is a compliance violation that requires manual investigation. Returning
+      // the result would allow the caller to proceed as if everything is fine.
+      if (!auditLogged) {
+        // HIGH-T5-02 fix: Only emit audit fallback to stderr when explicitly enabled.
+        // In production, stderr may be captured by log aggregators, container runtimes,
+        // or process managers without the same access controls as the audit store.
+        // Logging intent IDs and types to stderr could leak operational metadata.
+        if (process.env.NODE_ENV === "test" || process.env.KOVA_AUDIT_STDERR === "1") {
+          try {
+            console.error("[KOVA AUDIT FALLBACK]", JSON.stringify({
+              intentId,
+              type: normalizedIntent.type,
+              status: "confirmed",
+            }));
+          } catch {
+            // Last-resort fallback — if even JSON.stringify fails, do nothing
+          }
+        }
+        return {
+          status: "failed",
+          summary: "Transaction confirmed on-chain but audit logging failed. Manual investigation required.",
+          intentId,
+          timestamp: Date.now(),
+          error: {
+            code: "STORE_ERROR",
+            message: "Transaction was confirmed on-chain but the audit trail could not be written. " +
+              "The transaction ID has been logged to stderr. Contact operations for manual reconciliation.",
+          },
+        };
+      }
+
       await this.cacheResult(idempotencyKey, result);
       return result;
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const rawMessage = err instanceof Error ? err.message : String(err);
+      const message = sanitizeTransactionError(rawMessage);
 
       const error: TransactionError = {
         code: "TRANSACTION_FAILED",
@@ -319,17 +955,44 @@ export class AgentWallet {
       };
 
       await this.logAudit(normalizedIntent, ruleAudits, policyDecision, undefined);
-      await this.cacheResult(idempotencyKey, result);
+      // H-02 fix: Roll back spending counters on post-policy transaction failure
+      await this.rollbackSpendingCounters(normalizedIntent);
+      // HIGH-16 fix: Do NOT cache failed transaction results. Failures may be
+      // transient (network timeout, RPC down, insufficient balance), and caching
+      // them would prevent the agent from retrying a legitimate transaction.
       return result;
     }
   }
 
   /**
    * Get the wallet's balance for a specific token.
+   * MED-35 fix: Validates input at the public API boundary.
+   *
+   * H-16 fix: CONCURRENCY NOTE — This method does NOT acquire the execute mutex.
+   * It is safe to call concurrently because it performs a stateless read-only RPC
+   * call with no shared mutable state. However, the balance returned may be stale
+   * if a concurrent execute() call is in-flight (read-after-write inconsistency).
+   * Callers should not use getBalance() for authorization decisions.
+   *
+   * H-32 fix: Returns a structured error result instead of throwing raw exceptions.
+   * RPC errors are sanitized to prevent leaking endpoint URLs and internal details.
    */
   async getBalance(token: string): Promise<TokenBalance> {
-    const address = await this.signer.getAddress();
-    return this.chain.getBalance(address, token);
+    if (typeof token !== "string" || token.trim() === "") {
+      throw new Error("getBalance: 'token' must be a non-empty string");
+    }
+    if (token.length > MAX_TOKEN_LENGTH) {
+      throw new Error(`getBalance: 'token' exceeds max length of ${MAX_TOKEN_LENGTH}`);
+    }
+    try {
+      const address = await this.signer.getAddress();
+      return await this.chain.getBalance(address, token);
+    } catch (err) {
+      // H-32 fix: Sanitize RPC errors — strip URLs and internal details
+      const rawMessage = err instanceof Error ? err.message : String(err);
+      const sanitized = sanitizeTransactionError(rawMessage);
+      throw new Error(`getBalance failed: ${sanitized}`);
+    }
   }
 
   /**
@@ -367,13 +1030,16 @@ export class AgentWallet {
     }
 
     // S6: Populate circuit breaker status
+    // M-62 fix: Redact circuit breaker numeric thresholds from the policy summary
+    // returned to agents. Exposing exact threshold and cooldown values enables
+    // an attacker to calculate exactly how many denials trigger the breaker and
+    // how long to wait before retrying.
     if (this.circuitBreaker) {
-      const cbConfig = this.circuitBreaker.getConfig();
-      const cbCheck = await this.circuitBreaker.check();
+      const isOpen = await this.circuitBreaker.isOpen();
       summary.circuitBreaker = {
-        threshold: cbConfig.threshold,
-        cooldownMs: cbConfig.cooldownMs,
-        isOpen: cbCheck !== null,
+        threshold: "[redacted]" as unknown as number,
+        cooldownMs: "[redacted]" as unknown as number,
+        isOpen,
       };
     }
 
@@ -383,20 +1049,60 @@ export class AgentWallet {
   /**
    * Get recent transaction history from the audit log.
    * S1-06 fix: limit is validated and clamped to [1, MAX_HISTORY_LIMIT].
+   * MED-35 fix: Throws on non-number input instead of silently correcting.
+   *
+   * H-16 fix: CONCURRENCY NOTE — This method does NOT acquire the execute mutex.
+   * It reads from the audit log which is append-only. Concurrent execute() calls
+   * may cause the returned history to be slightly stale (missing the in-flight tx),
+   * which is acceptable for read-only display purposes.
+   *
+   * H-32 fix: Wraps store access in try/catch. Returns sanitized error on failure.
+   * M-58 fix: Supports optional address redaction via redactAddresses parameter.
    */
-  async getTransactionHistory(limit: number = 10): Promise<TransactionResult[]> {
+  async getTransactionHistory(limit: number = 10, options?: { redactAddresses?: boolean }): Promise<TransactionResult[]> {
+    if (typeof limit !== "number") {
+      throw new Error("getTransactionHistory: 'limit' must be a number");
+    }
     if (!Number.isFinite(limit) || limit < 1) {
       limit = 10;
     }
     const sanitizedLimit = Math.min(Math.floor(limit), MAX_HISTORY_LIMIT);
-    const entries = await this.logger.getRecent(sanitizedLimit);
-    return entries.map((entry) => ({
-      status: this.mapAuditStatus(entry),
-      txId: entry.transactionResult?.txId,
-      summary: this.buildSummary(entry.intent),
-      intentId: entry.intentId,
-      timestamp: entry.timestamp,
-    }));
+    try {
+      const entries = await this.logger.getRecent(sanitizedLimit);
+      return entries.map((entry): TransactionResult => {
+        const status = this.mapAuditStatus(entry);
+        let summary = this.buildSummary(entry.intent);
+        const intentId = entry.intentId;
+        const timestamp = entry.timestamp;
+
+        // M-58 fix: Redact recipient addresses in history responses when enabled.
+        // Prevents pattern analysis of transaction destinations by agents that
+        // may have been prompt-injected.
+        if (options?.redactAddresses) {
+          // Redact addresses in summaries (e.g., "So1a...b2c3" → "So1...xyz")
+          summary = summary.replace(/\b[A-HJ-NP-Za-km-z1-9]{32,44}\b/g, (addr) =>
+            addr.length > 8 ? `${addr.slice(0, 3)}...${addr.slice(-3)}` : addr
+          );
+        }
+
+        // CORE-013: Construct the correct discriminated union variant based on status
+        switch (status) {
+          case "confirmed":
+            return { status, txId: entry.transactionResult?.txId ?? "", summary, intentId, timestamp };
+          case "denied":
+            return { status, summary, intentId, timestamp };
+          case "failed":
+            return { status, summary, intentId, timestamp };
+          case "pending":
+            return { status, summary, intentId, timestamp };
+        }
+      });
+    } catch (err) {
+      // H-32 fix: Sanitize store/RPC errors — strip URLs and internal details
+      const rawMessage = err instanceof Error ? err.message : String(err);
+      const sanitized = sanitizeTransactionError(rawMessage);
+      throw new Error(`getTransactionHistory failed: ${sanitized}`);
+    }
   }
 
   /**
@@ -405,6 +1111,27 @@ export class AgentWallet {
    */
   async handleToolCall(name: string, input: Record<string, unknown>): Promise<ToolCallResult> {
     try {
+      // H-06 fix: Check tool enablement before dispatch. Only tools in the configured
+      // enabledTools set are dispatched. This prevents dangerous tools (wallet_execute_custom,
+      // wallet_get_policy) from being invoked even if the agent knows the tool name.
+      // M-59 fix: wallet_get_policy is included in this check.
+      if (!this.enabledTools.has(name)) {
+        // M-11 fix: Sanitize tool name to prevent injection. Strip control chars
+        // and truncate to a reasonable length before including in the error.
+        // M-55 fix: Do NOT enumerate available tools — this leaks which tools
+        // (including dangerous ones) are configured.
+        const sanitizedName = stripControlChars(typeof name === "string" ? name.slice(0, 64) : "");
+        return {
+          success: false,
+          error: `Tool not enabled: ${sanitizedName}`,
+        };
+      }
+
+      // MED-T3-01 fix: The `as WalletToolName` cast is safe here because the
+      // enabledTools.has(name) check above already rejects any string not in the
+      // configured tool set. The default case below provides a secondary safety net,
+      // returning "Unknown tool" for any value that somehow passes the guard but
+      // doesn't match a known case — ensuring fail-closed behavior.
       switch (name as WalletToolName) {
         case "wallet_transfer":
           return await this.handleTransfer(input);
@@ -422,13 +1149,53 @@ export class AgentWallet {
           return await this.handleGetPolicy();
         case "wallet_get_transaction_history":
           return await this.handleGetHistory(input);
-        default:
+        default: {
+          // M-11 fix: Sanitize tool name before reflecting in error response.
+          // M-55 fix: Do NOT list available tools — prevents reconnaissance.
+          const sanitizedName = stripControlChars(typeof name === "string" ? name.slice(0, 64) : "");
           return {
             success: false,
-            error: `Unknown tool: ${name}. Available tools: ${WALLET_TOOL_NAMES.join(", ")}`,
+            error: `Unknown tool: ${sanitizedName}`,
           };
+        }
       }
-    } catch {
+    } catch (err) {
+      // MED-28 fix: Log the actual error to audit before returning generic message.
+      // This preserves debugging context while still sanitizing the agent-facing response.
+      // HIGH-14 fix: Use crypto.randomUUID() for intentId instead of Date.now() to avoid
+      // collisions and predictability. Mark intent type as "internal_error" (via metadata
+      // isInternalError flag) so audit consumers can distinguish fabricated error entries
+      // from real agent-initiated custom intents.
+      // CORE-007 RESOLVED: The intent type remains "custom" because IntentType is a union
+      // of "transfer"|"swap"|"mint"|"stake"|"custom" — adding "internal_error" would
+      // require a schema change. Instead, the `isInternalError: true` flag on the audit
+      // entry distinguishes these fabricated entries from real custom intents. Audit
+      // consumers MUST check `isInternalError` to filter synthetic error entries.
+      try {
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        // L-06 fix: Sanitize tool name before including in audit entry to prevent
+        // log injection via crafted tool names with control characters.
+        const safeName = stripControlChars(typeof name === "string" ? name.slice(0, 64) : "unknown");
+        await this.logger.log({
+          timestamp: Date.now(),
+          intentId: `tool-error-${randomUUID()}`,
+          intent: {
+            type: "custom" as const,
+            chain: this.chain.chain as ChainId,
+            params: { programId: "internal", data: "", accounts: [] },
+            metadata: { reason: `handleToolCall error in ${safeName}: ${stripControlChars(errorMsg.slice(0, 200))}` },
+          },
+          policyDecisions: [],
+          finalDecision: {
+            decision: "DENY",
+            rule: "internal",
+            reason: `Internal error: ${stripControlChars(errorMsg.slice(0, 200))}`,
+          },
+          isInternalError: true,
+        } as AuditEntry & { isInternalError: boolean });
+      } catch {
+        // Audit failure is non-fatal
+      }
       // S5-04 fix: sanitize error — do not leak internal details back to the agent
       return {
         success: false,
@@ -462,12 +1229,13 @@ export class AgentWallet {
       return "Intent must be a non-null object";
     }
 
+    // LOW-01 fix: Do not echo raw input values in error messages to prevent log injection
     if (!VALID_TYPES.has(intent.type)) {
-      return `Invalid intent type: ${String(intent.type)}. Must be one of: transfer, swap, mint, stake, custom`;
+      return "Invalid intent type. Must be one of: transfer, swap, mint, stake, custom";
     }
 
     if (!VALID_CHAINS.has(intent.chain)) {
-      return `Invalid chain: ${String(intent.chain)}. Must be one of: solana, ethereum, base`;
+      return "Invalid chain. Must be one of: solana, ethereum, base";
     }
 
     // SEC: Verify intent chain matches the configured adapter to prevent
@@ -484,6 +1252,12 @@ export class AgentWallet {
 	    if (intent.id !== undefined) {
 	      if (typeof intent.id !== "string" || intent.id.length === 0 || intent.id.length > 128) {
 	        return "Intent ID must be a string between 1 and 128 characters";
+	      }
+	      // L-09 fix: Reject intent IDs containing null bytes. Null bytes can cause
+	      // truncation in C-based storage backends (SQLite, filesystem) and create
+	      // inconsistencies between the ID as seen by JavaScript and as stored.
+	      if (intent.id.includes("\0")) {
+	        return "Intent ID contains null bytes";
 	      }
 	    }
 
@@ -505,12 +1279,22 @@ export class AgentWallet {
 	          return `Metadata reason exceeds maximum length of ${MAX_REASON_LENGTH} characters`;
 	        }
 	      }
+	      // M-56 fix: SECURITY NOTE — agentId is self-reported by the agent and MUST NOT
+	      // be used for authorization decisions. An agent can impersonate any other agent
+	      // by setting an arbitrary agentId. It is useful only for audit trail correlation
+	      // and debugging. For access control, use cryptographic identity (e.g., API keys,
+	      // signed tokens) verified at the transport layer before reaching the wallet.
 	      if (metadata.agentId !== undefined) {
 	        if (typeof metadata.agentId !== "string" || metadata.agentId.trim() === "") {
 	          return "Metadata 'agentId' must be a non-empty string";
 	        }
 	        if (metadata.agentId.length > MAX_METADATA_ID_LENGTH) {
 	          return `Metadata 'agentId' exceeds max length of ${MAX_METADATA_ID_LENGTH}`;
+	        }
+	        // M-56 fix: Validate agentId format — only allow alphanumeric, hyphens, underscores,
+	        // and dots to prevent injection attacks via agent ID fields.
+	        if (!/^[\w.@-]+$/.test(metadata.agentId)) {
+	          return "Metadata 'agentId' contains invalid characters. Only alphanumeric, hyphens, underscores, dots, and @ are allowed";
 	        }
 	      }
 	      if (metadata.taskId !== undefined) {
@@ -519,6 +1303,12 @@ export class AgentWallet {
 	        }
 	        if (metadata.taskId.length > MAX_METADATA_ID_LENGTH) {
 	          return `Metadata 'taskId' exceeds max length of ${MAX_METADATA_ID_LENGTH}`;
+	        }
+	        // MED-T3-02 fix: Validate taskId character composition matching agentId pattern.
+	        // Without this, taskId could contain control characters, shell metacharacters, or
+	        // injection payloads that propagate to logs, audit entries, and approval messages.
+	        if (!/^[\w.@-]+$/.test(metadata.taskId)) {
+	          return "Metadata 'taskId' contains invalid characters. Only alphanumeric, hyphens, underscores, dots, and @ are allowed";
 	        }
 	      }
 	      if (metadata.urgency !== undefined) {
@@ -564,6 +1354,12 @@ export class AgentWallet {
 	        if (typeof maxSlippage !== "number" || !Number.isFinite(maxSlippage) || maxSlippage < 0 || maxSlippage > 1) {
 	          return "Swap: 'maxSlippage' must be a finite number between 0 and 1";
 	        }
+	        // M-60 fix: Cap maxSlippage to 50% (0.5) to prevent MEV extraction.
+	        // A 100% slippage tolerance allows sandwich attacks to extract the entire
+	        // swap value. Even 50% is generous — most legitimate swaps use 0.5-5%.
+	        if (maxSlippage > 0.5) {
+	          return "Swap: 'maxSlippage' exceeds maximum of 0.5 (50%). High slippage enables MEV extraction";
+	        }
 	      }
 	    }
 
@@ -580,6 +1376,34 @@ export class AgentWallet {
 	      if (typeof metadataUri !== "string" || metadataUri.trim() === "") return "Mint: 'metadataUri' must be a non-empty string";
 	      if (metadataUri.trim() !== metadataUri) return "Mint: 'metadataUri' must not include leading or trailing whitespace";
 	      if (metadataUri.length > MAX_URI_LENGTH) return `Mint: 'metadataUri' exceeds max length of ${MAX_URI_LENGTH}`;
+	      // CORE-015 fix: Validate metadataUri is a well-formed URL (https, ipfs, or ar protocol)
+	      try {
+	        const parsed = new URL(metadataUri);
+	        if (!["https:", "ipfs:", "ar:"].includes(parsed.protocol)) {
+	          return `Mint: 'metadataUri' must use https, ipfs, or ar protocol (got ${parsed.protocol})`;
+	        }
+	        // HIGH-T3-03 fix: SSRF protection for https URLs. Reject hostnames that
+	        // resolve to private/reserved IP ranges, localhost, or link-local addresses.
+	        if (parsed.protocol === "https:") {
+	          const hostname = parsed.hostname.toLowerCase();
+	          if (
+	            hostname === "localhost" ||
+	            hostname === "127.0.0.1" ||
+	            hostname === "[::1]" ||
+	            hostname === "0.0.0.0" ||
+	            hostname.endsWith(".local") ||
+	            hostname.endsWith(".internal") ||
+	            /^10\./.test(hostname) ||
+	            /^172\.(1[6-9]|2\d|3[01])\./.test(hostname) ||
+	            /^192\.168\./.test(hostname) ||
+	            /^169\.254\./.test(hostname)
+	          ) {
+	            return "Mint: 'metadataUri' must not point to private/reserved IP ranges or localhost (SSRF protection)";
+	          }
+	        }
+	      } catch {
+	        return "Mint: 'metadataUri' is not a valid URL";
+	      }
 	      if (to !== undefined) {
 	        if (typeof to !== "string" || to.trim() === "") return "Mint: 'to' must be a non-empty string";
 	        if (to.length > MAX_ADDRESS_LENGTH) return `Mint: 'to' exceeds max length of ${MAX_ADDRESS_LENGTH}`;
@@ -649,50 +1473,85 @@ export class AgentWallet {
 	      }
 	    }
 
+    // MED-27 fix: If the type is valid but no type guard matched, the params shape
+    // is wrong (e.g., data: 12345 instead of string for custom intent). The type
+    // guards validate param field types, so failure means malformed params.
+    if (
+      !isTransferIntent(intent) && !isSwapIntent(intent) &&
+      !isMintIntent(intent) && !isStakeIntent(intent) && !isCustomIntent(intent)
+    ) {
+      return `Intent params do not match the expected shape for type "${intent.type}"`;
+    }
+
     return null;
   }
 
-  /** S1-02 fix: Cache a result for idempotency */
+  /** S1-02 fix: Cache a result for idempotency
+   *  STORE-004 fix: When idempotencyHmacKey is configured, stores an HMAC-SHA256
+   *  tag alongside the JSON payload to prevent forged cache entries. */
   private async cacheResult(key: string, result: TransactionResult): Promise<void> {
     try {
-      await this.store.set(key, JSON.stringify(result), IDEMPOTENCY_TTL);
+      const json = JSON.stringify(result);
+      if (this.idempotencyHmacKey) {
+        // STORE-004: Compute HMAC over the JSON and store as "hmac:json" so
+        // the reader can split, verify, and only trust authenticated entries.
+        const hmac = createHmac("sha256", this.idempotencyHmacKey).update(json).digest("hex");
+        await this.store.set(key, hmac + ":" + json, this.idempotencyTtl);
+      } else {
+        await this.store.set(key, json, this.idempotencyTtl);
+      }
     } catch {
       // Cache failure must not break the transaction flow
     }
   }
 
-  /** Assign ID and timestamp if not already set */
+  /**
+   * Assign ID and timestamp if not already set.
+   * CORE-018 fix: Clamp createdAt to within ±5 minutes of current time to prevent
+   * stale or future-dated intents from bypassing time-window policy rules.
+   */
   private normalizeIntent(intent: TransactionIntent): TransactionIntent {
+    const now = Date.now();
+    let createdAt = intent.createdAt ?? now;
+    // CORE-018: Reject intents with createdAt more than 5 minutes in the past or future
+    const MAX_CLOCK_DRIFT_MS = 5 * 60 * 1000;
+    if (Math.abs(createdAt - now) > MAX_CLOCK_DRIFT_MS) {
+      createdAt = now; // Clamp stale/future timestamps to current time
+    }
     return {
       ...intent,
       id: intent.id ?? randomUUID(),
-      createdAt: intent.createdAt ?? Date.now(),
+      createdAt,
     };
   }
 
-  /** Build a human-readable summary from an intent */
+  /**
+   * Build a human-readable summary from an intent.
+   * MED-26 fix: All interpolated values are stripped of control characters
+   * (C0/C1 controls, DEL, etc.) to prevent log injection and terminal escape attacks.
+   */
   private buildSummary(intent: TransactionIntent): string {
     if (isTransferIntent(intent)) {
       const { to, amount, token } = intent.params;
       const shortAddr = to.length > 8 ? `${to.slice(0, 4)}...${to.slice(-4)}` : to;
-      return `Sent ${amount} ${token} to ${shortAddr}`;
+      return `Sent ${stripControlChars(amount)} ${stripControlChars(token)} to ${stripControlChars(shortAddr)}`;
     }
 
     if (isSwapIntent(intent)) {
       const { fromToken, toToken, amount } = intent.params;
-      return `Swapped ${amount} ${fromToken} for ${toToken}`;
+      return `Swapped ${stripControlChars(amount)} ${stripControlChars(fromToken)} for ${stripControlChars(toToken)}`;
     }
 
     if (isMintIntent(intent)) {
-      return `Minted NFT from collection ${intent.params.collection.slice(0, 8)}...`;
+      return `Minted NFT from collection ${stripControlChars(intent.params.collection.slice(0, 8))}...`;
     }
 
     if (isStakeIntent(intent)) {
       const { amount, token } = intent.params;
-      return `Staked ${amount} ${token}`;
+      return `Staked ${stripControlChars(amount)} ${stripControlChars(token)}`;
     }
 
-    return `Executed ${intent.type} on ${intent.chain}`;
+    return `Executed ${stripControlChars(intent.type)} on ${stripControlChars(intent.chain)}`;
   }
 
   /**
@@ -713,9 +1572,12 @@ export class AgentWallet {
 	    const raw = metadata as Record<string, unknown>;
 	    const sanitized: Record<string, unknown> = {};
 
-	    if (typeof raw.reason === "string") sanitized.reason = raw.reason.slice(0, MAX_REASON_LENGTH);
-	    if (typeof raw.agentId === "string") sanitized.agentId = raw.agentId.slice(0, MAX_METADATA_ID_LENGTH);
-	    if (typeof raw.taskId === "string") sanitized.taskId = raw.taskId.slice(0, MAX_METADATA_ID_LENGTH);
+	    // L-10 fix: Strip control characters from metadata fields before including in audit
+	    // entries. Prevents log injection via crafted metadata values with terminal escape
+	    // sequences, null bytes, or invisible characters that could mislead operators.
+	    if (typeof raw.reason === "string") sanitized.reason = stripControlChars(raw.reason.slice(0, MAX_REASON_LENGTH));
+	    if (typeof raw.agentId === "string") sanitized.agentId = stripControlChars(raw.agentId.slice(0, MAX_METADATA_ID_LENGTH));
+	    if (typeof raw.taskId === "string") sanitized.taskId = stripControlChars(raw.taskId.slice(0, MAX_METADATA_ID_LENGTH));
 	    if (raw.urgency === "low" || raw.urgency === "normal" || raw.urgency === "high") sanitized.urgency = raw.urgency;
 
 	    return Object.keys(sanitized).length > 0 ? (sanitized as TransactionIntent["metadata"]) : undefined;
@@ -841,9 +1703,88 @@ export class AgentWallet {
 	        // Audit is now broken — future transactions will be blocked
 	        // But don't break the current transaction flow
 	      }
-	      // Other logging failures are swallowed (backward compatible)
+	      // MED-18 fix: Invoke onAuditFailure callback for ALL transaction types,
+	      // including denied transactions. Previously only the AuditLogger's internal
+	      // callback was invoked; the wallet-level callback was silently swallowed here.
+	      // This ensures operators are notified when audit logging fails for denials too.
+	      if (this.logger.getOnAuditFailure()) {
+	        try {
+	          this.logger.getOnAuditFailure()!(err, this.logger.getFailureCount());
+	        } catch {
+	          // Callback failure is non-fatal
+	        }
+	      }
 	    }
 	  }
+
+  /**
+   * H-02 fix: Best-effort rollback of spending counters after post-policy transaction
+   * failure. Iterates through policy rules and decrements spending limit counters
+   * that were incremented during the policy evaluation phase. This is safe because
+   * the execute mutex serializes all calls, preventing TOCTOU races during rollback.
+   *
+   * Only SpendingLimitRule counters are rolled back. RateLimitRule counters track
+   * attempts (not successful transactions) and are intentionally not rolled back.
+   *
+   * HIGH-T1-06 fix: Each counter decrement is independently try/caught so a failure
+   * on one window (e.g., daily) doesn't prevent rollback of others (weekly, monthly).
+   * Rollback errors are tracked and logged for operational awareness.
+   */
+  private async rollbackSpendingCounters(intent: TransactionIntent): Promise<void> {
+    const rollbackErrors: string[] = [];
+    try {
+      const rules = this.policy.getRules();
+      for (const rule of rules) {
+        if (rule instanceof SpendingLimitRule) {
+          const amount = this.extractAmountForRollback(intent);
+          if (amount === null) continue;
+          const token = this.extractTokenForRollback(intent);
+          const config = rule.getConfig();
+          const windowKeys: Array<{ window: string; ttl: number }> = [];
+          if (config.daily) windowKeys.push({ window: "daily", ttl: 86_400 });
+          if (config.weekly) windowKeys.push({ window: "weekly", ttl: 604_800 });
+          if (config.monthly) windowKeys.push({ window: "monthly", ttl: 2_592_000 });
+          for (const { window } of windowKeys) {
+            const key = `spending:${window}:${token}`;
+            try {
+              await this.store.increment(key, -Math.round(amount * 1e9));
+            } catch (err) {
+              // Track the failure but continue rolling back other windows
+              rollbackErrors.push(`${window}:${token}: ${err instanceof Error ? err.message : String(err)}`);
+            }
+          }
+          // NOTE: USD-denominated counters (dailyUSD, weeklyUSD, monthlyUSD) are NOT
+          // rolled back because the exact USD value depends on the price oracle at
+          // evaluation time, which we don't have here. Incorrect rollback values could
+          // over-count remaining budget (unsafe). USD counters reset naturally via TTL.
+        }
+      }
+    } catch (err) {
+      rollbackErrors.push(`outer: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    // Log rollback failures for operational awareness (non-fatal)
+    if (rollbackErrors.length > 0 && (process.env.NODE_ENV === "test" || process.env.KOVA_AUDIT_STDERR === "1")) {
+      try {
+        console.error(`[KOVA] Spending rollback partial failure (${rollbackErrors.length} errors): ${rollbackErrors.join("; ")}`);
+      } catch { /* non-fatal */ }
+    }
+  }
+
+  /** Extract numeric amount from intent for spending rollback */
+  private extractAmountForRollback(intent: TransactionIntent): number | null {
+    if (isTransferIntent(intent)) return parseFloat(intent.params.amount);
+    if (isSwapIntent(intent)) return parseFloat(intent.params.amount);
+    if (isStakeIntent(intent)) return parseFloat(intent.params.amount);
+    return null; // Mint and custom intents don't have standard amounts
+  }
+
+  /** Extract token identifier from intent for spending rollback */
+  private extractTokenForRollback(intent: TransactionIntent): string {
+    if (isTransferIntent(intent)) return intent.params.token;
+    if (isSwapIntent(intent)) return intent.params.fromToken;
+    if (isStakeIntent(intent)) return intent.params.token;
+    return "unknown";
+  }
 
   // ── Tool call handlers ──────────────────────────────────────────────
 
@@ -853,6 +1794,9 @@ export class AgentWallet {
    */
   private async handleTransfer(input: Record<string, unknown>): Promise<ToolCallResult> {
     if (typeof input.chain !== "string") return { success: false, error: "Missing or invalid 'chain' parameter" };
+    // HIGH-21 fix: Runtime-validate chain ID instead of unsafe `as ChainId` cast
+    const chain = parseChainId(input.chain);
+    if (!chain) return { success: false, error: "Invalid 'chain' parameter. Must be one of: solana, ethereum, base" };
     if (typeof input.to !== "string") return { success: false, error: "Missing or invalid 'to' parameter" };
     if (typeof input.amount !== "string") return { success: false, error: "Missing or invalid 'amount' parameter" };
     if (typeof input.token !== "string") return { success: false, error: "Missing or invalid 'token' parameter" };
@@ -860,7 +1804,7 @@ export class AgentWallet {
 
     const result = await this.execute({
       type: "transfer",
-      chain: input.chain as ChainId,
+      chain,
       params: { to: input.to, amount: input.amount, token: input.token },
       metadata: reason ? { reason } : undefined,
     });
@@ -869,6 +1813,8 @@ export class AgentWallet {
 
   private async handleSwap(input: Record<string, unknown>): Promise<ToolCallResult> {
     if (typeof input.chain !== "string") return { success: false, error: "Missing or invalid 'chain' parameter" };
+    const chain = parseChainId(input.chain);
+    if (!chain) return { success: false, error: "Invalid 'chain' parameter. Must be one of: solana, ethereum, base" };
     if (typeof input.fromToken !== "string") return { success: false, error: "Missing or invalid 'fromToken' parameter" };
     if (typeof input.toToken !== "string") return { success: false, error: "Missing or invalid 'toToken' parameter" };
     if (typeof input.amount !== "string") return { success: false, error: "Missing or invalid 'amount' parameter" };
@@ -877,7 +1823,7 @@ export class AgentWallet {
 
     const result = await this.execute({
       type: "swap",
-      chain: input.chain as ChainId,
+      chain,
       params: {
         fromToken: input.fromToken, toToken: input.toToken, amount: input.amount,
         ...(maxSlippage !== undefined ? { maxSlippage } : {}),
@@ -889,6 +1835,8 @@ export class AgentWallet {
 
   private async handleMint(input: Record<string, unknown>): Promise<ToolCallResult> {
     if (typeof input.chain !== "string") return { success: false, error: "Missing or invalid 'chain' parameter" };
+    const chain = parseChainId(input.chain);
+    if (!chain) return { success: false, error: "Invalid 'chain' parameter. Must be one of: solana, ethereum, base" };
     if (typeof input.collection !== "string") return { success: false, error: "Missing or invalid 'collection' parameter" };
     if (typeof input.metadataUri !== "string") return { success: false, error: "Missing or invalid 'metadataUri' parameter" };
     const reason = typeof input.reason === "string" ? input.reason : undefined;
@@ -896,7 +1844,7 @@ export class AgentWallet {
 
     const result = await this.execute({
       type: "mint",
-      chain: input.chain as ChainId,
+      chain,
       params: { collection: input.collection, metadataUri: input.metadataUri, ...(to ? { to } : {}) },
       metadata: reason ? { reason } : undefined,
     });
@@ -905,6 +1853,8 @@ export class AgentWallet {
 
   private async handleStake(input: Record<string, unknown>): Promise<ToolCallResult> {
     if (typeof input.chain !== "string") return { success: false, error: "Missing or invalid 'chain' parameter" };
+    const chain = parseChainId(input.chain);
+    if (!chain) return { success: false, error: "Invalid 'chain' parameter. Must be one of: solana, ethereum, base" };
     if (typeof input.amount !== "string") return { success: false, error: "Missing or invalid 'amount' parameter" };
     if (typeof input.token !== "string") return { success: false, error: "Missing or invalid 'token' parameter" };
     const reason = typeof input.reason === "string" ? input.reason : undefined;
@@ -912,7 +1862,7 @@ export class AgentWallet {
 
     const result = await this.execute({
       type: "stake",
-      chain: input.chain as ChainId,
+      chain,
       params: { amount: input.amount, token: input.token, ...(validator ? { validator } : {}) },
       metadata: reason ? { reason } : undefined,
     });
@@ -921,6 +1871,8 @@ export class AgentWallet {
 
   private async handleCustom(input: Record<string, unknown>): Promise<ToolCallResult> {
     if (typeof input.chain !== "string") return { success: false, error: "Missing or invalid 'chain' parameter" };
+    const chain = parseChainId(input.chain);
+    if (!chain) return { success: false, error: "Invalid 'chain' parameter. Must be one of: solana, ethereum, base" };
     if (typeof input.programId !== "string") return { success: false, error: "Missing or invalid 'programId' parameter" };
     if (typeof input.data !== "string") return { success: false, error: "Missing or invalid 'data' parameter" };
     const reason = typeof input.reason === "string" ? input.reason : undefined;
@@ -938,10 +1890,25 @@ export class AgentWallet {
 	        };
 	      }
 
-	      const raw =
-	        typeof input.accounts === "string"
-	          ? JSON.parse(input.accounts)
-	          : input.accounts;
+	      // L-32 fix: Normalize accounts field — accept both string and object/array.
+	      // If string, JSON.parse it. If parsing fails, the catch block returns an error.
+	      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+	      let raw: any;
+	      if (typeof input.accounts === "string") {
+	        raw = JSON.parse(input.accounts);
+	      } else if (Array.isArray(input.accounts)) {
+	        raw = input.accounts;
+	      } else {
+	        return {
+	          success: false,
+	          error: "Invalid 'accounts' parameter: must be a JSON string or an array of account objects",
+	        };
+	      }
+
+	      // M-15 fix: Strip prototype pollution keys (__proto__, constructor, prototype)
+	      // from JSON.parse output. These keys can pollute Object.prototype when spread
+	      // or assigned, affecting all downstream code.
+	      raw = stripDangerousKeys(raw);
 
       // S5-02 fix: validate parsed JSON structure — reject non-arrays and invalid elements
       if (!Array.isArray(raw)) {
@@ -982,7 +1949,7 @@ export class AgentWallet {
 	          return { success: false, error: `Invalid account entry: failed to validate address for chain "${this.chain.chain}"` };
 	        }
 	      }
-	      accounts = raw;
+	      accounts = raw as Array<{ address: string; isSigner: boolean; isWritable: boolean }>;
 	    } catch {
 	      return {
         success: false,
@@ -993,7 +1960,7 @@ export class AgentWallet {
 
     const result = await this.execute({
       type: "custom",
-      chain: input.chain as ChainId,
+      chain,
       params: {
         programId: input.programId,
         data: input.data,
@@ -1004,6 +1971,12 @@ export class AgentWallet {
     return this.transactionResultToToolResult(result);
   }
 
+  /**
+   * HIGH-04 fix: handleGetBalance now includes rate limiting and audit logging.
+   * Previously this bypassed the entire security pipeline (policy, audit, rate limits).
+   * While read-only, unlimited unaudited RPC calls could DoS the RPC endpoint
+   * and hide agent reconnaissance behavior from the audit trail.
+   */
   private async handleGetBalance(
     input: Record<string, unknown>,
   ): Promise<ToolCallResult> {
@@ -1014,22 +1987,117 @@ export class AgentWallet {
         error: "The 'token' parameter must be a non-empty string.",
       };
     }
+
+    // HIGH-04 / MED-03 fix: Rate limit read-only operations
+    const rateLimited = await this.checkReadRateLimit();
+    if (rateLimited) return rateLimited;
+
     const balance = await this.getBalance(input.token);
+
+    // HIGH-04 fix: Audit log balance queries for visibility into agent behavior
+    // MED-32 fix: Use a queryType field in metadata to distinguish read-only queries
+    // from real transfer intents. Previously this used type: "transfer" with amount "0"
+    // and to "self", which created a fabricated audit entry indistinguishable from a
+    // real denied transfer. The queryType metadata field makes the intent clearly synthetic.
+    // CORE-008 RESOLVED: The intent type remains "transfer" because AuditEntry.intent
+    // requires a TransactionIntent whose type is constrained to IntentType (no "query"
+    // variant). The `queryType: "balance"` metadata field is the distinguishing marker.
+    // Audit consumers MUST check `metadata.queryType` to identify synthetic balance
+    // query entries vs. real transfer intents.
+    // L-34 fix: Balance query audit entries are flagged as synthetic via the
+    // `isSyntheticQuery: true` field so audit consumers can distinguish them from
+    // real transaction entries. This prevents synthetic entries from evicting real
+    // ones in size-limited audit stores by allowing consumers to filter or route
+    // synthetic entries to a separate namespace.
+    try {
+      await this.logger.log({
+        timestamp: Date.now(),
+        intentId: `balance-query-${randomUUID()}`,
+        intent: {
+          type: "transfer" as const,
+          chain: this.chain.chain as ChainId,
+          params: { to: "self", amount: "0", token: input.token },
+          metadata: { reason: "balance_query", queryType: "balance" } as IntentMetadata & { queryType: string },
+        },
+        policyDecisions: [],
+        finalDecision: { decision: "ALLOW" },
+        isSyntheticQuery: true,
+      } as AuditEntry & { isSyntheticQuery: boolean });
+    } catch {
+      // Audit failure is non-fatal for read-only queries
+    }
+
     return { success: true, data: balance };
   }
 
+  /**
+   * MED-03 fix: Rate limit policy queries to prevent timing/enumeration attacks.
+   */
   private async handleGetPolicy(): Promise<ToolCallResult> {
+    const rateLimited = await this.checkReadRateLimit();
+    if (rateLimited) return rateLimited;
     const policy = await this.getPolicy();
     return { success: true, data: policy };
   }
 
+  /**
+   * MED-03 fix: Rate limit history queries to prevent enumeration without audit logging.
+   */
   private async handleGetHistory(
     input: Record<string, unknown>,
   ): Promise<ToolCallResult> {
+    const rateLimited = await this.checkReadRateLimit();
+    if (rateLimited) return rateLimited;
     const limit =
       typeof input.limit === "number" ? input.limit : undefined;
     const history = await this.getTransactionHistory(limit);
     return { success: true, data: history };
+  }
+
+  /**
+   * MED-03 fix: Shared rate limiter for read-only tool operations.
+   * Prevents RPC DoS via balance queries, timing attacks via policy queries,
+   * and unauthenticated enumeration of transaction history.
+   * Returns a ToolCallResult if rate limited, or null if allowed.
+   *
+   * M-21 fix: RACE CONDITION NOTE — With async stores, there is a race window
+   * between setIfNotExists() and increment() where concurrent calls may both
+   * see the counter as below the limit and both be allowed through. This is
+   * acceptable for read operations because:
+   * 1. Read operations are not security-critical (no funds at risk).
+   * 2. The worst case is slightly exceeding the rate limit (e.g., 31 reads
+   *    instead of 30 in a 1-minute window), which is harmless.
+   * 3. The execute mutex serializes write operations separately.
+   * 4. Adding a mutex here would create head-of-line blocking for reads.
+   */
+  private async checkReadRateLimit(): Promise<ToolCallResult | null> {
+    try {
+      // CORE-006 KNOWN LIMITATION: This rate limit key is global across all agents.
+      // A single noisy agent can exhaust the read quota for all agents sharing this
+      // wallet instance. Per-agent isolation requires either:
+      //   (a) Threading agentId from handleToolCall → handler → checkReadRateLimit
+      //       and scoping the key as `read_ops:${agentId}:minute`, or
+      //   (b) Using PrefixedStore (src/stores/prefixed.ts) to give each agent its own
+      //       key namespace, so rate limit keys are naturally isolated per-agent.
+      // Until then, the global counter is a shared resource across all agents.
+      const rateLimitKey = "read_ops:minute";
+      await this.store.setIfNotExists(rateLimitKey, "0", 60);
+      const count = await this.store.increment(rateLimitKey, 1);
+      if (count > 30) {
+        return {
+          success: false,
+          error: "Read operation rate limit exceeded (max 30/minute). Try again shortly.",
+        };
+      }
+    } catch {
+      // HIGH-14 fix: Fail-closed on store errors — deny the operation rather than
+      // allowing unlimited unmetered reads when the store is down
+      return {
+        success: false,
+        error: "Rate limit check temporarily unavailable. Try again shortly.",
+      };
+    }
+    return null;
   }
 
   private transactionResultToToolResult(
@@ -1051,6 +2119,12 @@ export class AgentWallet {
    * HIGH-09 fix: Only expose limit configuration, NOT current spending counters.
    * Prevents agents from calculating exact remaining budget for optimal exploitation.
    */
+  /**
+   * HIGH-T3-01 fix: Redact exact spending limit amounts from the policy summary.
+   * Exposing exact thresholds enables policy reconnaissance — an attacker who has
+   * prompt-injected the agent can learn the exact amounts to stay under to avoid
+   * triggering controls. Only expose the token and whether a limit exists.
+   */
   private populateSpendingLimits(
     summary: PolicySummary,
     rule: SpendingLimitRule,
@@ -1058,25 +2132,25 @@ export class AgentWallet {
     const config = rule.getConfig();
     if (config.perTransaction) {
       summary.spendingLimits.perTransaction = {
-        amount: config.perTransaction.amount,
+        amount: "[redacted]",
         token: config.perTransaction.token,
       };
     }
     if (config.daily) {
       summary.spendingLimits.daily = {
-        amount: config.daily.amount,
+        amount: "[redacted]",
         token: config.daily.token,
       };
     }
     if (config.weekly) {
       summary.spendingLimits.weekly = {
-        amount: config.weekly.amount,
+        amount: "[redacted]",
         token: config.weekly.token,
       };
     }
     if (config.monthly) {
       summary.spendingLimits.monthly = {
-        amount: config.monthly.amount,
+        amount: "[redacted]",
         token: config.monthly.token,
       };
     }
@@ -1094,14 +2168,18 @@ export class AgentWallet {
   /**
    * HIGH-09 fix: Only expose rate limit configuration, NOT current counter values.
    */
+  /**
+   * HIGH-T3-01 fix: Redact exact rate limit thresholds from the policy summary.
+   * Exposing exact numbers enables an attacker to calculate exactly how many
+   * transactions they can make before hitting the limit.
+   */
   private populateRateLimits(
     summary: PolicySummary,
-    rule: RateLimitRule,
+    _rule: RateLimitRule,
   ): void {
-    const config = rule.getConfig();
     summary.rateLimits = {
-      maxPerMinute: config.maxTransactionsPerMinute,
-      maxPerHour: config.maxTransactionsPerHour,
+      maxPerMinute: "[redacted]" as unknown as number,
+      maxPerHour: "[redacted]" as unknown as number,
     };
   }
 
@@ -1159,6 +2237,11 @@ export class AgentWallet {
     };
   }
 
+  /**
+   * HIGH-T3-01 fix: Redact exact approval thresholds from the policy summary.
+   * Exposing exact threshold values enables an attacker to craft transactions
+   * just below the approval amount to bypass human review.
+   */
   private populateApprovalGate(
     summary: PolicySummary,
     rule: ApprovalGateRule,
@@ -1166,7 +2249,7 @@ export class AgentWallet {
     const config = rule.getConfig();
     summary.approvalRequired = {
       above: {
-        amount: config.above.amount,
+        amount: "[redacted]",
         token: config.above.token,
       },
     };

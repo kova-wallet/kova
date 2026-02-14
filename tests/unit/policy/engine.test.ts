@@ -147,11 +147,19 @@ describe("PolicyEngine", () => {
 
     const engine = new PolicyEngine([inspectRule], store);
     await engine.evaluate(makeIntent());
-    expect(receivedStore).toBe(store);
+    // Two-phase evaluation wraps the store in Phase2TrackingStore during commit.
+    // The rule sees the wrapped store, not the original. Verify it delegates correctly.
+    expect(receivedStore).toBeDefined();
+    expect(receivedStore).not.toBeNull();
+    // Verify the wrapped store delegates to the real store by testing a write operation.
+    await receivedStore!.set("test-key", "test-value");
+    expect(await store.get("test-key")).toBe("test-value");
   });
 
   it("should pass injectable now timestamp to context", async () => {
-    const fixedNow = 1700000000000;
+    // LOW-05 fix: Use a value within ±1 hour of Date.now() (the engine now
+    // clamps out-of-range values to prevent spending limit / time window bypass)
+    const fixedNow = Date.now() - 30_000; // 30 seconds ago — within range
     let receivedNow: number | null = null;
 
     const inspectRule: PolicyRule = {
@@ -165,6 +173,49 @@ describe("PolicyEngine", () => {
     const engine = new PolicyEngine([inspectRule], new MemoryStore());
     await engine.evaluate(makeIntent(), fixedNow);
     expect(receivedNow).toBe(fixedNow);
+  });
+
+  it("should clamp far-past `now` to Date.now() (LOW-05 fix)", async () => {
+    const farPast = 1000000000000; // 2001 — way outside ±1 hour
+    let receivedNow: number | null = null;
+
+    const inspectRule: PolicyRule = {
+      name: "inspector",
+      evaluate: async (_intent: TransactionIntent, ctx: PolicyContext) => {
+        receivedNow = ctx.now;
+        return { decision: "ALLOW" };
+      },
+    };
+
+    const engine = new PolicyEngine([inspectRule], new MemoryStore());
+    const before = Date.now();
+    await engine.evaluate(makeIntent(), farPast);
+    const after = Date.now();
+
+    // Should have been clamped to approximately Date.now(), not farPast
+    expect(receivedNow).not.toBe(farPast);
+    expect(receivedNow).toBeGreaterThanOrEqual(before);
+    expect(receivedNow).toBeLessThanOrEqual(after);
+  });
+
+  it("should clamp NaN `now` to Date.now() (LOW-05 fix)", async () => {
+    let receivedNow: number | null = null;
+
+    const inspectRule: PolicyRule = {
+      name: "inspector",
+      evaluate: async (_intent: TransactionIntent, ctx: PolicyContext) => {
+        receivedNow = ctx.now;
+        return { decision: "ALLOW" };
+      },
+    };
+
+    const engine = new PolicyEngine([inspectRule], new MemoryStore());
+    const before = Date.now();
+    await engine.evaluate(makeIntent(), NaN);
+    const after = Date.now();
+
+    expect(receivedNow).toBeGreaterThanOrEqual(before);
+    expect(receivedNow).toBeLessThanOrEqual(after);
   });
 
   it("should use Date.now() when no timestamp is provided", async () => {
@@ -202,9 +253,13 @@ describe("PolicyEngine", () => {
     const testIntent = makeIntent({ type: "swap" });
     await engine.evaluate(testIntent);
 
-    expect(receivedIntents).toHaveLength(2);
+    // H-09 fix: Two-phase evaluation means each rule is called twice
+    // (once in dry-run Phase 1, once in commit Phase 2)
+    expect(receivedIntents).toHaveLength(4);
     expect(receivedIntents[0]).toBe(testIntent);
     expect(receivedIntents[1]).toBe(testIntent);
+    expect(receivedIntents[2]).toBe(testIntent);
+    expect(receivedIntents[3]).toBe(testIntent);
   });
 
   it("should handle when first rule of multiple denies", async () => {
@@ -305,7 +360,12 @@ describe("PolicyEngine", () => {
     const engine = new PolicyEngine([rule1, rule2], new MemoryStore());
     await engine.evaluate(makeIntent());
 
-    expect(callOrder).toEqual(["rule1-start", "rule1-end", "rule2-start"]);
+    // H-09 fix: Two-phase evaluation runs all rules in Phase 1 (dry-run),
+    // then all rules again in Phase 2 (commit). Both phases are sequential.
+    expect(callOrder).toEqual([
+      "rule1-start", "rule1-end", "rule2-start",  // Phase 1 (dry-run)
+      "rule1-start", "rule1-end", "rule2-start",  // Phase 2 (commit)
+    ]);
   });
 
   it("should handle evaluation with different intent types", async () => {
@@ -407,8 +467,13 @@ describe("PolicyEngine", () => {
     expect(result.decision.decision).toBe("DENY");
     if (result.decision.decision === "DENY") {
       expect(result.decision.rule).toBe("broken-rule");
-      expect(result.decision.reason).toContain("Rule evaluation error");
-      expect(result.decision.reason).toContain("Store connection lost");
+      // H-33 fix: The returned decision.reason is sanitized to prevent leaking
+      // internal rule implementation details. Detailed error is only in ruleAudits.
+      expect(result.decision.reason).toContain("Policy evaluation error");
+      // Verify the detailed error is preserved in audit trail (for debug/audit logging)
+      const auditEntry = result.ruleAudits.find(a => a.rule === "broken-rule");
+      expect(auditEntry).toBeDefined();
+      expect(auditEntry!.reason).toContain("Store connection lost");
     }
   });
 
@@ -448,7 +513,13 @@ describe("PolicyEngine", () => {
 
     expect(result.decision.decision).toBe("DENY");
     if (result.decision.decision === "DENY") {
-      expect(result.decision.reason).toContain("string error");
+      // H-33 fix: The returned decision.reason is sanitized to prevent leaking
+      // internal details. Detailed error is preserved in ruleAudits.
+      expect(result.decision.reason).toContain("Policy evaluation error");
+      // Verify the detailed error is preserved in audit trail
+      const auditEntry = result.ruleAudits.find(a => a.rule === "string-thrower");
+      expect(auditEntry).toBeDefined();
+      expect(auditEntry!.reason).toContain("string error");
     }
   });
 
