@@ -145,23 +145,28 @@ describe("SolanaAdapter", () => {
 
   // ── getValueInUSD stablecoin fallback ──────────────────────────────────
 
-  describe("getValueInUSD stablecoin fallback", () => {
-    it("should fall back to $1 for USDC when price API is down", async () => {
+  // CRIT-CROSS-02 fix: Stablecoin fallback removed. All tokens now fail-closed
+  // when the price oracle is unavailable, including USDC/USDT.
+  describe("getValueInUSD fail-closed behavior", () => {
+    it("should throw for USDC when price API is down (no stablecoin fallback)", async () => {
       const adapter = new SolanaAdapter(defaultConfig);
-      const value = await adapter.getValueInUSD("USDC", "50.0");
-      expect(value).toBe(50);
+      await expect(adapter.getValueInUSD("USDC", "50.0")).rejects.toThrow(
+        "Price oracle unavailable",
+      );
     });
 
-    it("should fall back to $1 for USDT when price API is down", async () => {
+    it("should throw for USDT when price API is down (no stablecoin fallback)", async () => {
       const adapter = new SolanaAdapter(defaultConfig);
-      const value = await adapter.getValueInUSD("USDT", "25.0");
-      expect(value).toBe(25);
+      await expect(adapter.getValueInUSD("USDT", "25.0")).rejects.toThrow(
+        "Price oracle unavailable",
+      );
     });
 
-    it("should fall back to $1 for case-insensitive stablecoin names", async () => {
+    it("should throw for case-insensitive stablecoin names when price API is down", async () => {
       const adapter = new SolanaAdapter(defaultConfig);
-      const value = await adapter.getValueInUSD("usdc", "100.0");
-      expect(value).toBe(100);
+      await expect(adapter.getValueInUSD("usdc", "100.0")).rejects.toThrow(
+        "Price oracle unavailable",
+      );
     });
 
     it("should throw for non-stablecoin when price API is down", async () => {
@@ -176,35 +181,39 @@ describe("SolanaAdapter", () => {
       await expect(adapter.getValueInUSD("UNKNOWN_TOKEN", "1.0")).rejects.toThrow();
     });
 
-    it("should return 0 for USDC with zero amount", async () => {
+    it("should throw for USDC with zero amount when price API is down", async () => {
       const adapter = new SolanaAdapter(defaultConfig);
-      const value = await adapter.getValueInUSD("USDC", "0");
-      expect(value).toBe(0);
+      await expect(adapter.getValueInUSD("USDC", "0")).rejects.toThrow(
+        "Price oracle unavailable",
+      );
     });
 
-    it("should return 0 for USDT with zero amount", async () => {
+    it("should throw for USDT with zero amount when price API is down", async () => {
       const adapter = new SolanaAdapter(defaultConfig);
-      const value = await adapter.getValueInUSD("USDT", "0");
-      expect(value).toBe(0);
+      await expect(adapter.getValueInUSD("USDT", "0")).rejects.toThrow(
+        "Price oracle unavailable",
+      );
     });
 
-    it("should handle very large USDC amount (stablecoin fallback)", async () => {
+    it("should throw for large USDC amount when price API is down", async () => {
       const adapter = new SolanaAdapter(defaultConfig);
-      const value = await adapter.getValueInUSD("USDC", "999999999.99");
-      expect(value).toBeCloseTo(999999999.99);
+      await expect(adapter.getValueInUSD("USDC", "999999999.99")).rejects.toThrow(
+        "Price oracle unavailable",
+      );
     });
 
-    it("should return NaN for empty string amount with stablecoin", async () => {
+    it("should throw for empty string amount with stablecoin when price API is down", async () => {
       const adapter = new SolanaAdapter(defaultConfig);
-      const value = await adapter.getValueInUSD("USDC", "");
-      // parseFloat("") returns NaN
-      expect(value).toBeNaN();
+      await expect(adapter.getValueInUSD("USDC", "")).rejects.toThrow(
+        "Price oracle unavailable",
+      );
     });
 
-    it("should handle fractional stablecoin amounts correctly", async () => {
+    it("should throw for fractional stablecoin amounts when price API is down", async () => {
       const adapter = new SolanaAdapter(defaultConfig);
-      const value = await adapter.getValueInUSD("USDC", "0.01");
-      expect(value).toBeCloseTo(0.01);
+      await expect(adapter.getValueInUSD("USDC", "0.01")).rejects.toThrow(
+        "Price oracle unavailable",
+      );
     });
   });
 

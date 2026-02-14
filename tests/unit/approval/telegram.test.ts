@@ -1,6 +1,28 @@
+import { createHash, createHmac } from "node:crypto";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { TelegramApprovalBot } from "../../../src/approval/telegram.js";
 import type { ApprovalRequest } from "../../../src/approval/interface.js";
+
+/**
+ * HIGH-11 test helper: Compute the HMAC that the bot generates for callback data.
+ * This mirrors TelegramApprovalBot.computeCallbackHmac() for test verification.
+ * CRIT-04 fix: Uses domain-separated derived key (SHA-256 of "kova-callback-hmac:" + token)
+ * and 32-char truncation to match the actual implementation.
+ */
+function computeTestHmac(botToken: string, requestId: string, action: string): string {
+  const hmacSecret = createHash("sha256").update("kova-callback-hmac:" + botToken).digest();
+  return createHmac("sha256", hmacSecret)
+    .update(`${action}:${requestId}`)
+    .digest("hex")
+    .slice(0, 32);
+}
+
+/** Build callback data with HMAC (matches what the bot sends to Telegram) */
+function callbackData(botToken: string, action: string, requestId: string): string {
+  return `${action}:${requestId}:${computeTestHmac(botToken, requestId, action)}`;
+}
+
+const BOT_TOKEN = "bot-token-123";
 
 /**
  * Helper to create a mock fetch that responds to Telegram Bot API calls.
@@ -116,6 +138,7 @@ describe("TelegramApprovalBot", () => {
   const defaultConfig = {
     token: "bot-token-123",
     chatId: "123456789",
+    allowAllUsers: true as const,
   };
 
   let originalFetch: typeof globalThis.fetch;
@@ -176,6 +199,15 @@ describe("TelegramApprovalBot", () => {
       expect(bot).toBeDefined();
       expect(bot.name).toBe("telegram");
     });
+
+    it("should throw when neither allowedUserIds nor allowAllUsers is set", () => {
+      expect(() => {
+        new TelegramApprovalBot({
+          token: "bot-token-123",
+          chatId: "123456789",
+        });
+      }).toThrow("TelegramApprovalBot: 'allowedUserIds' is required");
+    });
   });
 
   // ── Approval Flow ──────────────────────────────────────────────────
@@ -186,7 +218,7 @@ describe("TelegramApprovalBot", () => {
       globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
-      queueCallback("approve:req-test-1");
+      queueCallback(callbackData(BOT_TOKEN, "approve", "req-test-1"));
       deliverOn(1);
 
       const result = await bot.requestApproval(makeRequest());
@@ -202,7 +234,7 @@ describe("TelegramApprovalBot", () => {
       globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
-      queueCallback("reject:req-test-1", 777, "Bob");
+      queueCallback(callbackData(BOT_TOKEN, "reject", "req-test-1"), 777, "Bob");
       deliverOn(1);
 
       const result = await bot.requestApproval(makeRequest());
@@ -216,7 +248,7 @@ describe("TelegramApprovalBot", () => {
       globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
-      queueCallback("approve:req-test-1");
+      queueCallback(callbackData(BOT_TOKEN, "approve", "req-test-1"));
       deliverOn(1);
 
       await bot.requestApproval(makeRequest());
@@ -229,8 +261,13 @@ describe("TelegramApprovalBot", () => {
       };
       expect(markup.inline_keyboard).toHaveLength(1);
       expect(markup.inline_keyboard[0]).toHaveLength(2);
-      expect(markup.inline_keyboard[0]![0]!.callback_data).toBe("approve:req-test-1");
-      expect(markup.inline_keyboard[0]![1]!.callback_data).toBe("reject:req-test-1");
+      // HIGH-11: Callback data now includes HMAC suffix
+      expect(markup.inline_keyboard[0]![0]!.callback_data).toBe(
+        callbackData(BOT_TOKEN, "approve", "req-test-1"),
+      );
+      expect(markup.inline_keyboard[0]![1]!.callback_data).toBe(
+        callbackData(BOT_TOKEN, "reject", "req-test-1"),
+      );
     });
 
     it("should answer callback query after decision", async () => {
@@ -238,7 +275,7 @@ describe("TelegramApprovalBot", () => {
       globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
-      queueCallback("approve:req-test-1");
+      queueCallback(callbackData(BOT_TOKEN, "approve", "req-test-1"));
       deliverOn(1);
 
       await bot.requestApproval(makeRequest());
@@ -253,7 +290,7 @@ describe("TelegramApprovalBot", () => {
       globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
-      queueCallback("approve:req-test-1");
+      queueCallback(callbackData(BOT_TOKEN, "approve", "req-test-1"));
       deliverOn(1);
 
       await bot.requestApproval(makeRequest());
@@ -269,7 +306,7 @@ describe("TelegramApprovalBot", () => {
       globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
-      queueCallback("approve:req-test-1");
+      queueCallback(callbackData(BOT_TOKEN, "approve", "req-test-1"));
       deliverOn(1);
 
       await bot.requestApproval(makeRequest());
@@ -287,7 +324,7 @@ describe("TelegramApprovalBot", () => {
       globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
-      queueCallback("approve:req-test-1");
+      queueCallback(callbackData(BOT_TOKEN, "approve", "req-test-1"));
       deliverOn(1);
 
       await bot.requestApproval(makeRequest({ amount: "2.5", token: "USDC" }));
@@ -303,7 +340,7 @@ describe("TelegramApprovalBot", () => {
       globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
-      queueCallback("approve:req-test-1");
+      queueCallback(callbackData(BOT_TOKEN, "approve", "req-test-1"));
       deliverOn(1);
 
       await bot.requestApproval(makeRequest({ target: "RecipientAddr123" }));
@@ -318,7 +355,7 @@ describe("TelegramApprovalBot", () => {
       globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
-      queueCallback("approve:req-test-1");
+      queueCallback(callbackData(BOT_TOKEN, "approve", "req-test-1"));
       deliverOn(1);
 
       await bot.requestApproval(makeRequest({ reason: "Payment for API access" }));
@@ -333,7 +370,7 @@ describe("TelegramApprovalBot", () => {
       globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
-      queueCallback("approve:req-test-1");
+      queueCallback(callbackData(BOT_TOKEN, "approve", "req-test-1"));
       deliverOn(1);
 
       await bot.requestApproval(makeRequest({ agentId: "agent-007" }));
@@ -348,7 +385,7 @@ describe("TelegramApprovalBot", () => {
       globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
-      queueCallback("approve:req-test-1");
+      queueCallback(callbackData(BOT_TOKEN, "approve", "req-test-1"));
       deliverOn(1);
 
       await bot.requestApproval(
@@ -369,7 +406,7 @@ describe("TelegramApprovalBot", () => {
       globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
-      queueCallback("approve:req-test-1");
+      queueCallback(callbackData(BOT_TOKEN, "approve", "req-test-1"));
       deliverOn(1);
 
       await bot.requestApproval(makeRequest({ usdValue: 225.50 }));
@@ -384,7 +421,7 @@ describe("TelegramApprovalBot", () => {
       globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
-      queueCallback("approve:req-test-1");
+      queueCallback(callbackData(BOT_TOKEN, "approve", "req-test-1"));
       deliverOn(1);
 
       await bot.requestApproval(makeRequest({ reason: "<script>alert('xss')</script>" }));
@@ -483,7 +520,7 @@ describe("TelegramApprovalBot", () => {
       });
 
       // Queue callback from user 777 (not allowed), then timeout
-      queueCallback("approve:req-test-1", 777, "Eve");
+      queueCallback(callbackData(BOT_TOKEN, "approve", "req-test-1"), 777, "Eve");
       deliverOn(1);
 
       const result = await bot.requestApproval(
@@ -504,7 +541,7 @@ describe("TelegramApprovalBot", () => {
         pollInterval: 1,
       });
 
-      queueCallback("approve:req-test-1", 777, "Alice");
+      queueCallback(callbackData(BOT_TOKEN, "approve", "req-test-1"), 777, "Alice");
       deliverOn(1);
 
       const result = await bot.requestApproval(makeRequest());
@@ -513,13 +550,18 @@ describe("TelegramApprovalBot", () => {
       expect(result.decidedBy).toBe("Alice");
     });
 
-    it("should allow any user when allowedUserIds is not set", async () => {
+    it("should allow any user when allowAllUsers is true and allowedUserIds is not set", async () => {
       const { mockFetch, queueCallback, deliverOn } = createTelegramMock();
       globalThis.fetch = mockFetch;
 
-      const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
+      const bot = new TelegramApprovalBot({
+        token: "bot-token-123",
+        chatId: "123456789",
+        allowAllUsers: true,
+        pollInterval: 1,
+      });
 
-      queueCallback("approve:req-test-1", 12345, "RandomUser");
+      queueCallback(callbackData(BOT_TOKEN, "approve", "req-test-1"), 12345, "RandomUser");
       deliverOn(1);
 
       const result = await bot.requestApproval(makeRequest());
@@ -539,7 +581,7 @@ describe("TelegramApprovalBot", () => {
         defaultTimeout: 100,
       });
 
-      queueCallback("approve:req-test-1", 777, "Eve", "cb-unauthorized");
+      queueCallback(callbackData(BOT_TOKEN, "approve", "req-test-1"), 777, "Eve", "cb-unauthorized");
       deliverOn(1);
 
       await bot.requestApproval(makeRequest({ expiresAt: Date.now() + 100 }));
@@ -565,8 +607,9 @@ describe("TelegramApprovalBot", () => {
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
 
+      // LOW-T3-06 fix changed error format from method-specific to generic
       await expect(bot.requestApproval(makeRequest())).rejects.toThrow(
-        "Telegram API sendMessage failed",
+        "Telegram API request failed",
       );
     });
 
@@ -742,10 +785,11 @@ describe("TelegramApprovalBot", () => {
       const bot = new TelegramApprovalBot({
         token: "123:ABC_def",
         chatId: "123456789",
+        allowAllUsers: true,
         pollInterval: 1,
       });
 
-      queueCallback("approve:req-test-1");
+      queueCallback(callbackData("123:ABC_def", "approve", "req-test-1"));
       deliverOn(1);
 
       await bot.requestApproval(makeRequest());
@@ -763,7 +807,7 @@ describe("TelegramApprovalBot", () => {
         pollInterval: 1,
       });
 
-      queueCallback("approve:req-test-1");
+      queueCallback(callbackData(BOT_TOKEN, "approve", "req-test-1"));
       deliverOn(1);
 
       await bot.requestApproval(makeRequest());
@@ -781,7 +825,7 @@ describe("TelegramApprovalBot", () => {
       globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
-      queueCallback("approve:req-test-1");
+      queueCallback(callbackData(BOT_TOKEN, "approve", "req-test-1"));
       deliverOn(1);
 
       await bot.requestApproval(makeRequest({
@@ -804,7 +848,7 @@ describe("TelegramApprovalBot", () => {
       globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
-      queueCallback("approve:req-test-1");
+      queueCallback(callbackData(BOT_TOKEN, "approve", "req-test-1"));
       deliverOn(1);
 
       await bot.requestApproval(makeRequest({ usdValue: 0 }));
@@ -819,7 +863,7 @@ describe("TelegramApprovalBot", () => {
       globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
-      queueCallback("approve:req-test-1");
+      queueCallback(callbackData(BOT_TOKEN, "approve", "req-test-1"));
       deliverOn(1);
 
       await bot.requestApproval(makeRequest({ reason: "Buy & sell tokens" }));
@@ -835,7 +879,7 @@ describe("TelegramApprovalBot", () => {
       globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
-      queueCallback("approve:req-test-1");
+      queueCallback(callbackData(BOT_TOKEN, "approve", "req-test-1"));
       deliverOn(1);
 
       await bot.requestApproval(makeRequest({ agentId: "<agent>test</agent>" }));
@@ -851,7 +895,7 @@ describe("TelegramApprovalBot", () => {
       globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
-      queueCallback("approve:req-test-1");
+      queueCallback(callbackData(BOT_TOKEN, "approve", "req-test-1"));
       deliverOn(1);
 
       await bot.requestApproval(makeRequest({ expiresAt: Date.now() + 60_000 }));
@@ -867,7 +911,7 @@ describe("TelegramApprovalBot", () => {
       globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
-      queueCallback("approve:req-test-1");
+      queueCallback(callbackData(BOT_TOKEN, "approve", "req-test-1"));
       deliverOn(1);
 
       await bot.requestApproval(makeRequest({ expiresAt: Date.now() - 5000 }));
@@ -882,7 +926,7 @@ describe("TelegramApprovalBot", () => {
       globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
-      queueCallback("approve:req-unique-xyz");
+      queueCallback(callbackData(BOT_TOKEN, "approve", "req-unique-xyz"));
       deliverOn(1);
 
       await bot.requestApproval(makeRequest({ id: "req-unique-xyz" }));
@@ -897,7 +941,7 @@ describe("TelegramApprovalBot", () => {
       globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
-      queueCallback("approve:req-full");
+      queueCallback(callbackData(BOT_TOKEN, "approve", "req-full"));
       deliverOn(1);
 
       await bot.requestApproval(makeRequest({
@@ -953,7 +997,7 @@ describe("TelegramApprovalBot", () => {
                   callback_query: {
                     id: "cb-right",
                     from: { id: 777, first_name: "Alice" },
-                    data: "approve:req-test-1",
+                    data: callbackData(BOT_TOKEN, "approve", "req-test-1"),
                     message: { message_id: 42, chat: { id: 123456789 } },
                   },
                 },
@@ -1117,7 +1161,7 @@ describe("TelegramApprovalBot", () => {
       globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
-      queueCallback("approve:req-test-1", 777, "Alice");
+      queueCallback(callbackData(BOT_TOKEN, "approve", "req-test-1"), 777, "Alice");
       deliverOn(1);
 
       await bot.requestApproval(makeRequest());
@@ -1135,7 +1179,7 @@ describe("TelegramApprovalBot", () => {
       globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
-      queueCallback("reject:req-test-1", 777, "Bob");
+      queueCallback(callbackData(BOT_TOKEN, "reject", "req-test-1"), 777, "Bob");
       deliverOn(1);
 
       await bot.requestApproval(makeRequest());
@@ -1172,7 +1216,7 @@ describe("TelegramApprovalBot", () => {
                 callback_query: {
                   id: "cb-1",
                   from: { id: 777, first_name: "Alice" },
-                  data: "approve:req-test-1",
+                  data: callbackData(BOT_TOKEN, "approve", "req-test-1"),
                   message: { message_id: 42, chat: { id: 123456789 } },
                 },
               }],
@@ -1206,7 +1250,7 @@ describe("TelegramApprovalBot", () => {
                 callback_query: {
                   id: "cb-1",
                   from: { id: 777, first_name: "Alice" },
-                  data: "approve:req-test-1",
+                  data: callbackData(BOT_TOKEN, "approve", "req-test-1"),
                   message: { message_id: 42, chat: { id: 123456789 } },
                 },
               }],
@@ -1268,7 +1312,7 @@ describe("TelegramApprovalBot", () => {
                 callback_query: {
                   id: "cb-1",
                   from: { id: 12345, first_name: "" },
-                  data: "approve:req-test-1",
+                  data: callbackData(BOT_TOKEN, "approve", "req-test-1"),
                   message: { message_id: 42, chat: { id: 123456789 } },
                 },
               }],
@@ -1300,7 +1344,7 @@ describe("TelegramApprovalBot", () => {
         pollInterval: 1,
         defaultTimeout: 5000,
       });
-      queueCallback("approve:req-test-1");
+      queueCallback(callbackData(BOT_TOKEN, "approve", "req-test-1"));
       deliverOn(2); // Deliver on second getUpdates call
 
       const result = await bot.requestApproval(

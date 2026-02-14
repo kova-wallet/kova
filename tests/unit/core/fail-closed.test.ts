@@ -37,7 +37,7 @@ const allowAllRule: PolicyRule = {
   evaluate: async () => ({ decision: "ALLOW" }),
 };
 
-function createMockSigner(address = "MockAddress1234567890abcdef12345678"): Signer {
+function createMockSigner(address = "7v91N7iZ9mNicL8WfG6cgSCKyRXydQjLh6UYBWwm6y1Q"): Signer {
   return {
     getAddress: async () => address,
     sign: async (tx: UnsignedTransaction): Promise<SignedTransaction> => ({
@@ -46,6 +46,8 @@ function createMockSigner(address = "MockAddress1234567890abcdef12345678"): Sign
       signature: new Uint8Array(64).fill(1),
     }),
     healthCheck: async () => true,
+    destroy: async () => {},
+    toJSON: () => ({ address }),
   };
 }
 
@@ -64,6 +66,7 @@ function createMockChain(): ChainAdapter {
       data: new TextEncoder().encode(JSON.stringify({ type: intent.type, mock: true })),
       description: `Mock ${intent.type}`,
     }),
+    simulateTransaction: vi.fn().mockResolvedValue({ success: true }),
     broadcast: async () => "mock_tx_abc123",
     getTransactionStatus: async (txId: string) => ({
       status: "confirmed" as const,
@@ -77,7 +80,7 @@ function createTransferIntent(overrides?: Partial<TransactionIntent>): Transacti
   return {
     type: "transfer",
     chain: "solana",
-    params: { to: "RecipientAddr1234567890abcdef1234", amount: "1.0", token: "SOL" },
+    params: { to: "GsbwXfJraMomNxBcjYLcG3mxkBUiyWXAB32fGbSQQRre", amount: "1.0", token: "SOL" },
     ...overrides,
   };
 }
@@ -132,8 +135,8 @@ describe("Fail-Closed Behavior Verification", () => {
       expect(result.status).toBe("denied");
       expect(result.error).toBeDefined();
       expect(result.error!.code).toBe("POLICY_DENIED");
-      expect(result.error!.message).toContain("Rule evaluation error");
-      expect(result.error!.message).toContain("Redis connection refused");
+      // H-33 fix: error messages are sanitized; internal details are no longer exposed
+      expect(result.error!.message).toContain("Policy evaluation error");
     });
 
     it("store.increment throws during rate limit -> DENY", async () => {
@@ -155,14 +158,15 @@ describe("Fail-Closed Behavior Verification", () => {
 
       expect(result.status).toBe("denied");
       expect(result.error!.code).toBe("POLICY_DENIED");
-      expect(result.error!.message).toContain("Rule evaluation error");
-      expect(result.error!.message).toContain("Store increment failed");
+      // H-33 fix: error messages are sanitized; internal details are no longer exposed
+      expect(result.error!.message).toContain("Policy evaluation error");
     });
 
-    it("store.get throws during idempotency check -> error propagates to caller (not silently swallowed)", async () => {
+    it("store.get throws during idempotency check -> proceeds with fresh execution (HIGH-15: non-fatal)", async () => {
       const store = new MemoryStore();
-      // store.get is called for the idempotency check at the top of executeInternal().
-      // That call is NOT wrapped in try/catch, so the error propagates out of execute().
+      // HIGH-15 fix: store.get failure during idempotency check is now caught and
+      // execution proceeds normally. This is safe because the idempotency check is
+      // an optimization — skipping it just means we re-execute the transaction.
       const originalGet = store.get.bind(store);
       vi.spyOn(store, "get").mockImplementation(async (key: string) => {
         if (key.startsWith("idempotency:")) {
@@ -174,13 +178,10 @@ describe("Fail-Closed Behavior Verification", () => {
       const policy = new PolicyEngine([allowAllRule], store);
       const wallet = createWallet({ policy, store });
 
-      // The idempotency store.get is NOT in a try/catch, so it propagates.
-      // execute() only has a finally (for lock release), no catch.
-      // This means the caller sees a rejected promise -- the wallet does NOT
-      // silently proceed with an unauthorized transaction. This is fail-safe behavior.
-      await expect(
-        wallet.execute(createTransferIntent({ id: "idem-store-fail" })),
-      ).rejects.toThrow("Store read failed");
+      // HIGH-15 fix: The idempotency store.get IS now wrapped in try/catch.
+      // Store failure is non-fatal — transaction proceeds with fresh execution.
+      const result = await wallet.execute(createTransferIntent({ id: "idem-store-fail" }));
+      expect(result.status).toBe("confirmed");
     });
 
     it("store.set throws during cache write -> transaction still succeeds (cache failure non-fatal)", async () => {
@@ -371,7 +372,7 @@ describe("Fail-Closed Behavior Verification", () => {
   // 5. Policy evaluation errors
   // ================================================================
   describe("Policy evaluation error", () => {
-    it("single rule throws -> DENY with 'Rule evaluation error' message", async () => {
+    it("single rule throws -> DENY with sanitized 'Policy evaluation error' message", async () => {
       const throwingRule: PolicyRule = {
         name: "crashy-rule",
         evaluate: async () => { throw new Error("Unexpected NPE in rule"); },
@@ -384,9 +385,10 @@ describe("Fail-Closed Behavior Verification", () => {
 
       expect(result.status).toBe("denied");
       expect(result.error!.code).toBe("POLICY_DENIED");
-      expect(result.error!.message).toContain("Rule evaluation error");
-      expect(result.error!.message).toContain("Unexpected NPE in rule");
-      expect(result.error!.policyRule).toBe("crashy-rule");
+      // H-33 fix: error messages are sanitized; internal details are no longer exposed
+      expect(result.error!.message).toContain("Policy evaluation error");
+      // H-05 fix: policyRule is no longer exposed in error responses
+      expect(result.error!.policyRule).toBeUndefined();
     });
 
     it("first of two rules throws -> DENY, second rule not evaluated", async () => {
@@ -408,8 +410,10 @@ describe("Fail-Closed Behavior Verification", () => {
       const result = await wallet.execute(createTransferIntent());
 
       expect(result.status).toBe("denied");
-      expect(result.error!.message).toContain("Rule evaluation error");
-      expect(result.error!.policyRule).toBe("first-rule");
+      // H-33 fix: error messages are sanitized
+      expect(result.error!.message).toContain("Policy evaluation error");
+      // H-05 fix: policyRule is no longer exposed in error responses
+      expect(result.error!.policyRule).toBeUndefined();
       // Second rule should NOT have been called
       expect(secondRuleSpy).not.toHaveBeenCalled();
     });
@@ -427,10 +431,11 @@ describe("Fail-Closed Behavior Verification", () => {
 
       expect(result.status).toBe("denied");
       expect(result.error!.code).toBe("POLICY_DENIED");
-      expect(result.error!.message).toContain("plain string error");
+      // H-33 fix: error messages are sanitized; internal details are no longer exposed
+      expect(result.error!.message).toContain("Policy evaluation error");
     });
 
-    it("rule throws null -> DENY with 'null' message", async () => {
+    it("rule throws null -> DENY with sanitized message", async () => {
       const nullThrowRule: PolicyRule = {
         name: "null-throw-rule",
         evaluate: async () => { throw null; },
@@ -443,7 +448,8 @@ describe("Fail-Closed Behavior Verification", () => {
 
       expect(result.status).toBe("denied");
       expect(result.error!.code).toBe("POLICY_DENIED");
-      expect(result.error!.message).toContain("null");
+      // H-33 fix: error messages are sanitized; internal details are no longer exposed
+      expect(result.error!.message).toContain("Policy evaluation error");
     });
 
     it("rule throws after another rule allows -> DENY (fail-closed)", async () => {
@@ -465,8 +471,10 @@ describe("Fail-Closed Behavior Verification", () => {
       // Even though the first rule ALLOWed, the second rule's error -> DENY
       expect(result.status).toBe("denied");
       expect(result.error!.code).toBe("POLICY_DENIED");
-      expect(result.error!.policyRule).toBe("throws-second");
-      expect(result.error!.message).toContain("Rule evaluation error");
+      // H-05 fix: policyRule is no longer exposed in error responses
+      expect(result.error!.policyRule).toBeUndefined();
+      // H-33 fix: error messages are sanitized
+      expect(result.error!.message).toContain("Policy evaluation error");
     });
   });
 
@@ -684,7 +692,7 @@ describe("Fail-Closed Behavior Verification", () => {
       expect(result.status).toBe("failed");
       expect(result.error!.code).toBe("VALIDATION_FAILED");
       expect(result.error!.message).toContain("Invalid intent type");
-      expect(result.error!.message).toContain("delete_everything");
+      // LOW-01 fix: error messages no longer echo raw input values
       // Policy engine should NOT have been called
       expect(evaluateSpy).not.toHaveBeenCalled();
     });
@@ -705,7 +713,7 @@ describe("Fail-Closed Behavior Verification", () => {
       expect(result.status).toBe("failed");
       expect(result.error!.code).toBe("VALIDATION_FAILED");
       expect(result.error!.message).toContain("Invalid chain");
-      expect(result.error!.message).toContain("dogecoin");
+      // LOW-01 fix: error messages no longer echo raw input values
       // Policy engine should NOT have been called
       expect(evaluateSpy).not.toHaveBeenCalled();
     });
@@ -748,7 +756,8 @@ describe("Fail-Closed Behavior Verification", () => {
       expect(result.status).toBe("denied");
       expect(result.error).toBeDefined();
       expect(result.error!.code).toBe("POLICY_DENIED");
-      expect(result.error!.message).toContain("Rule evaluation error");
+      // H-33 fix: error messages are sanitized
+      expect(result.error!.message).toContain("Policy evaluation error");
     });
 
     it("chain failure after policy ALLOW -> 'failed' (not 'denied')", async () => {

@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [18, 20, 22]
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      # LOW-T5-06 fix: Verify lockfile integrity before installing dependencies.
+      # npm ci already checks that package-lock.json matches package.json, but
+      # --ignore-scripts ensures no lifecycle scripts run during verification.
+      - name: Verify lockfile integrity
+        run: npm ci --ignore-scripts
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      # LOW-T5-04 fix: Run tests with coverage reporting and enforce minimum threshold
+      - name: Run tests with coverage
+        run: npx vitest run --coverage --coverage.thresholds.lines=70 --coverage.thresholds.functions=70 --coverage.thresholds.branches=70 --coverage.thresholds.statements=70
+
+      - name: Build
+        run: npm run build
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Use Node.js 20
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 20
+          cache: npm
+
+      # LOW-T5-06 fix: Verify lockfile integrity in security job as well
+      - name: Verify lockfile integrity
+        run: npm ci --ignore-scripts
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Audit dependencies
+        run: npm audit --omit=dev
+
+      - name: Verify package signatures
+        run: npm audit signatures
+
+      - name: Check for pinned dependencies
+        run: |
+          node -e "
+            const pkg = require('./package.json');
+            const deps = pkg.dependencies || {};
+            const unpinned = Object.entries(deps).filter(([,v]) => /^[\^~>]/.test(v));
+            if (unpinned.length > 0) {
+              console.error('Unpinned production dependencies found:');
+              unpinned.forEach(([k,v]) => console.error('  ' + k + ': ' + v));
+              process.exit(1);
+            }
+            console.log('All production dependencies are pinned.');
+          "

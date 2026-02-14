@@ -37,6 +37,12 @@ export interface PolicyContext {
   approval?: ApprovalChannel;
   /** Current timestamp (injectable for testing) */
   now: number;
+  /**
+   * CRIT-03 fix: Optional function to get the USD value of a token amount.
+   * Provided by the wallet from the chain adapter's getValueInUSD().
+   * Enables USD-normalized spending limits that prevent cross-token evasion.
+   */
+  getValueInUSD?: (token: string, amount: string) => Promise<number>;
 }
 
 /** A single policy rule that can evaluate a transaction intent */
@@ -53,18 +59,47 @@ export interface TokenAmount {
   token: string;
 }
 
+/** USD-denominated spending limit (token-agnostic) */
+export interface UsdSpendingLimit {
+  /** Maximum USD value (e.g., "100" for $100) */
+  amount: string;
+}
+
 /** Spending limit configuration */
 export interface SpendingLimitConfig {
   perTransaction?: TokenAmount;
   daily?: TokenAmount;
   weekly?: TokenAmount;
   monthly?: TokenAmount;
+  /**
+   * MED-T4-01 fix: Optional key prefix for scoping spending limit counters.
+   * When multiple wallets or agents share the same store, set this to a unique
+   * identifier (e.g., wallet address or agent ID) to prevent counter collisions.
+   * Defaults to "spending:" for backward compatibility.
+   */
+  keyPrefix?: string;
+  /**
+   * CRIT-03 fix: USD-denominated limits that apply across ALL tokens.
+   * Prevents cross-token evasion (e.g., swapping SOL to USDC to bypass SOL limits).
+   * Requires `getValueInUSD` in PolicyContext to function.
+   */
+  perTransactionUSD?: UsdSpendingLimit;
+  dailyUSD?: UsdSpendingLimit;
+  weeklyUSD?: UsdSpendingLimit;
+  monthlyUSD?: UsdSpendingLimit;
 }
 
 /** Rate limit configuration */
 export interface RateLimitConfig {
   maxTransactionsPerMinute?: number;
   maxTransactionsPerHour?: number;
+  /**
+   * POLICY-007 fix: Optional key prefix for scoping rate limit counters.
+   * When multiple wallets or agents share the same store, set this to a unique
+   * identifier (e.g., wallet address or agent ID) to prevent counter collisions.
+   * Defaults to empty string for backwards compatibility.
+   */
+  keyPrefix?: string;
 }
 
 /** Time window for active hours */
@@ -78,12 +113,27 @@ export interface TimeWindow {
 export interface ActiveHoursConfig {
   timezone: string;
   windows: TimeWindow[];
+  /**
+   * LOW-T4-01 fix: Policy behavior outside active hours. Both options currently
+   * return DENY from TimeWindowRule — "require_approval" does NOT actually gate
+   * through the approval system. It only changes the denial reason string.
+   *
+   * @deprecated "require_approval" behaves identically to "deny". It may be
+   * changed in a future version to actually gate through the approval system.
+   * For real approval-gated behavior, pair TimeWindowRule with ApprovalGateRule.
+   */
   outsideHoursPolicy?: "deny" | "require_approval";
 }
 
 /** Approval gate configuration */
 export interface ApprovalGateConfig {
   above: TokenAmount;
+  /**
+   * HIGH-04 fix: USD-denominated approval threshold that applies regardless of token.
+   * If set, any transaction exceeding this USD value requires approval,
+   * preventing bypass via token mismatch (e.g., using USDC when gate is configured for SOL).
+   */
+  aboveUSD?: UsdSpendingLimit;
   channel?: "telegram" | "slack" | "custom";
   /** Timeout in milliseconds. Defaults to 300_000 (5 min) */
   timeout?: number;

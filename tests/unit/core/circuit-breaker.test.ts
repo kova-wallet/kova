@@ -26,7 +26,7 @@ const denyRule: PolicyRule = {
   }),
 };
 
-function createMockSigner(address = "MockAddress1234567890abcdef12345678"): Signer {
+function createMockSigner(address = "7v91N7iZ9mNicL8WfG6cgSCKyRXydQjLh6UYBWwm6y1Q"): Signer {
   return {
     getAddress: async () => address,
     sign: async (tx: UnsignedTransaction): Promise<SignedTransaction> => ({
@@ -35,6 +35,8 @@ function createMockSigner(address = "MockAddress1234567890abcdef12345678"): Sign
       signature: new Uint8Array(64).fill(1),
     }),
     healthCheck: async () => true,
+    destroy: async () => {},
+    toJSON: () => ({ address }),
   };
 }
 
@@ -53,6 +55,7 @@ function createMockChain(): ChainAdapter {
       data: new TextEncoder().encode(JSON.stringify({ type: intent.type, mock: true })),
       description: `Mock ${intent.type}`,
     }),
+    simulateTransaction: vi.fn().mockResolvedValue({ success: true }),
     broadcast: async () => "mock_tx_abc123",
     getTransactionStatus: async (txId: string) => ({
       status: "confirmed" as const,
@@ -66,7 +69,7 @@ function createTransferIntent(overrides?: Partial<TransactionIntent>): Transacti
   return {
     type: "transfer",
     chain: "solana",
-    params: { to: "RecipientAddr1234567890abcdef1234", amount: "1.0", token: "SOL" },
+    params: { to: "GsbwXfJraMomNxBcjYLcG3mxkBUiyWXAB32fGbSQQRre", amount: "1.0", token: "SOL" },
     ...overrides,
   };
 }
@@ -147,7 +150,7 @@ describe("CircuitBreaker", () => {
     });
 
     it("should return a reason string during cooldown period", async () => {
-      const now = 1_000_000;
+      const now = Date.now();
       const cb = new CircuitBreaker(store, { threshold: 2, cooldownMs: 60_000 });
 
       // Trigger cooldown by recording 2 consecutive denials
@@ -163,7 +166,7 @@ describe("CircuitBreaker", () => {
     });
 
     it("should return null after cooldown expires (using injectable now)", async () => {
-      const now = 1_000_000;
+      const now = Date.now();
       const cooldownMs = 60_000;
       const cb = new CircuitBreaker(store, { threshold: 2, cooldownMs });
 
@@ -177,7 +180,7 @@ describe("CircuitBreaker", () => {
     });
 
     it("should auto-reset counter and cooldown after cooldown expiry", async () => {
-      const now = 1_000_000;
+      const now = Date.now();
       const cooldownMs = 60_000;
       const cb = new CircuitBreaker(store, { threshold: 2, cooldownMs });
 
@@ -223,7 +226,7 @@ describe("CircuitBreaker", () => {
     });
 
     it("should increment counter on DENY", async () => {
-      const now = 1_000_000;
+      const now = Date.now();
       const cb = new CircuitBreaker(store, { threshold: 3, cooldownMs: 60_000 });
 
       await cb.recordOutcome("DENY", now);
@@ -238,7 +241,7 @@ describe("CircuitBreaker", () => {
     });
 
     it("should treat PENDING as a no-op (counter does not change)", async () => {
-      const now = 1_000_000;
+      const now = Date.now();
       const cb = new CircuitBreaker(store, { threshold: 3, cooldownMs: 60_000 });
 
       // Record 2 denials (one below threshold)
@@ -259,7 +262,7 @@ describe("CircuitBreaker", () => {
     });
 
     it("should trigger cooldown when N denials reach the threshold", async () => {
-      const now = 1_000_000;
+      const now = Date.now();
       const cb = new CircuitBreaker(store, { threshold: 3, cooldownMs: 120_000 });
 
       await cb.recordOutcome("DENY", now);
@@ -274,7 +277,7 @@ describe("CircuitBreaker", () => {
     });
 
     it("should reset counter when ALLOW comes after N-1 denials", async () => {
-      const now = 1_000_000;
+      const now = Date.now();
       const cb = new CircuitBreaker(store, { threshold: 5, cooldownMs: 60_000 });
 
       // 4 denials (one below threshold)
@@ -295,7 +298,7 @@ describe("CircuitBreaker", () => {
     });
 
     it("should reset counter when ALLOW follows multiple consecutive DENYs", async () => {
-      const now = 1_000_000;
+      const now = Date.now();
       const cb = new CircuitBreaker(store, { threshold: 10, cooldownMs: 60_000 });
 
       // 8 consecutive denials
@@ -319,12 +322,13 @@ describe("CircuitBreaker", () => {
     });
   });
 
-  // ── reset() method ────────────────────────────────────────────────
+  // ── reset via cooldown expiry (CRIT-04: reset() is now private) ──
 
-  describe("reset()", () => {
-    it("should clear counter and cooldown", async () => {
-      const now = 1_000_000;
-      const cb = new CircuitBreaker(store, { threshold: 2, cooldownMs: 60_000 });
+  describe("auto-reset via cooldown expiry", () => {
+    it("should clear counter and cooldown after cooldown expires", async () => {
+      const now = Date.now();
+      const cooldownMs = 60_000;
+      const cb = new CircuitBreaker(store, { threshold: 2, cooldownMs });
 
       // Trigger cooldown
       await cb.recordOutcome("DENY", now);
@@ -333,27 +337,25 @@ describe("CircuitBreaker", () => {
       // Verify circuit is open
       expect(await cb.check(now + 100)).not.toBeNull();
 
-      // Reset
-      await cb.reset();
-
-      // Circuit should be closed after reset
-      expect(await cb.check(now + 100)).toBeNull();
+      // Auto-reset via cooldown expiry
+      expect(await cb.check(now + cooldownMs + 1)).toBeNull();
     });
 
-    it("should make check() return null after reset", async () => {
-      const now = 1_000_000;
-      const cb = new CircuitBreaker(store, { threshold: 1, cooldownMs: 300_000 });
+    it("should allow fresh denials to re-trigger after cooldown expiry", async () => {
+      const now = Date.now();
+      const cooldownMs = 10_000;
+      const cb = new CircuitBreaker(store, { threshold: 1, cooldownMs });
 
       // Single denial triggers cooldown (threshold=1)
       await cb.recordOutcome("DENY", now);
       expect(await cb.check(now + 1)).not.toBeNull();
 
-      await cb.reset();
-      expect(await cb.check(now + 1)).toBeNull();
+      // After cooldown, circuit should be closed
+      expect(await cb.check(now + cooldownMs + 1)).toBeNull();
 
-      // After reset, need fresh denials to re-trigger
-      await cb.recordOutcome("DENY", now + 2);
-      expect(await cb.check(now + 3)).not.toBeNull();
+      // After auto-reset, need fresh denials to re-trigger
+      await cb.recordOutcome("DENY", now + cooldownMs + 2);
+      expect(await cb.check(now + cooldownMs + 3)).not.toBeNull();
     });
   });
 
@@ -492,8 +494,9 @@ describe("CircuitBreaker — Wallet integration", () => {
 
     const policySummary = await wallet.getPolicy();
     expect(policySummary.circuitBreaker).toBeDefined();
-    expect(policySummary.circuitBreaker!.threshold).toBe(7);
-    expect(policySummary.circuitBreaker!.cooldownMs).toBe(120_000);
+    // HIGH-T3-01: circuitBreaker threshold and cooldown are now redacted in getPolicy()
+    expect(policySummary.circuitBreaker!.threshold).toBe("[redacted]" as unknown as number);
+    expect(policySummary.circuitBreaker!.cooldownMs).toBe("[redacted]" as unknown as number);
     expect(policySummary.circuitBreaker!.isOpen).toBe(false);
   });
 

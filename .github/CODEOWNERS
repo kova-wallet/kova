@@ -1,0 +1,14 @@
+# Security-critical code requires security team review
+/src/signers/ @security-team
+/src/policy/ @security-team
+/src/core/wallet.ts @security-team
+/src/chains/ @security-team
+/src/stores/sqlite.ts @security-team
+/.github/workflows/ @security-team
+# LOW-T5-05 fix: Cover additional security-critical files
+/src/stores/memory.ts @security-team
+/src/stores/prefixed.ts @security-team
+/src/logging/audit.ts @security-team
+/src/core/circuit-breaker.ts @security-team
+/.npmrc @security-team
+/package.json @security-team

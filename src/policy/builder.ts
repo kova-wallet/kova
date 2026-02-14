@@ -25,10 +25,20 @@ export class Policy {
     return new PolicyBuilder(name);
   }
 
-  /** Load a policy from a JSON configuration. Validates the config before constructing. */
+  /**
+   * Load a policy from a JSON configuration. Validates the config before constructing.
+   *
+   * M-08 fix: Sanitize input by stripping prototype pollution vectors (__proto__,
+   * constructor) before validation. JSON.parse(JSON.stringify()) produces a clean
+   * object, then we explicitly delete dangerous keys to prevent prototype pollution
+   * attacks when deserializing untrusted policy JSON.
+   */
   static fromJSON(json: PolicyConfig): Policy {
-    PolicyBuilder.validateConfig(json);
-    return new Policy(structuredClone(json));
+    const sanitized = JSON.parse(JSON.stringify(json));
+    // Strip prototype pollution vectors recursively
+    stripDangerousKeys(sanitized);
+    PolicyBuilder.validateConfig(sanitized);
+    return new Policy(structuredClone(sanitized));
   }
 
   /** Extend an existing policy with overrides */
@@ -132,6 +142,55 @@ export class PolicyBuilder {
       throw new Error("Policy name is required");
     }
 
+    // POLICY-012 fix: Require at least one rule to be configured. A policy with
+    // no rules would silently allow all transactions, violating deny-by-default.
+    const hasAnyRule =
+      config.rateLimit !== undefined ||
+      config.spendingLimit !== undefined ||
+      (config.allowAddresses !== undefined && config.allowAddresses.length > 0) ||
+      (config.denyAddresses !== undefined && config.denyAddresses.length > 0) ||
+      (config.allowPrograms !== undefined && config.allowPrograms.length > 0) ||
+      (config.denyPrograms !== undefined && config.denyPrograms.length > 0) ||
+      config.activeHours !== undefined ||
+      config.approvalGate !== undefined ||
+      config.cooldown !== undefined;
+    if (!hasAnyRule) {
+      throw new Error("Policy must configure at least one rule");
+    }
+
+    // M-10 fix: Validate array elements in address and program lists.
+    // Ensure each element is a non-empty string to prevent undefined, null, numeric,
+    // or empty string entries from silently passing through and causing unexpected
+    // behavior in allowlist/denylist rule evaluation.
+    if (config.allowAddresses) {
+      for (const addr of config.allowAddresses) {
+        if (typeof addr !== "string" || addr.trim().length === 0) {
+          throw new Error("allowAddresses must contain non-empty strings");
+        }
+      }
+    }
+    if (config.denyAddresses) {
+      for (const addr of config.denyAddresses) {
+        if (typeof addr !== "string" || addr.trim().length === 0) {
+          throw new Error("denyAddresses must contain non-empty strings");
+        }
+      }
+    }
+    if (config.allowPrograms) {
+      for (const prog of config.allowPrograms) {
+        if (typeof prog !== "string" || prog.trim().length === 0) {
+          throw new Error("allowPrograms must contain non-empty strings");
+        }
+      }
+    }
+    if (config.denyPrograms) {
+      for (const prog of config.denyPrograms) {
+        if (typeof prog !== "string" || prog.trim().length === 0) {
+          throw new Error("denyPrograms must contain non-empty strings");
+        }
+      }
+    }
+
     if (config.spendingLimit) {
       PolicyBuilder.validateSpendingLimit(config.spendingLimit);
     }
@@ -152,16 +211,28 @@ export class PolicyBuilder {
       PolicyBuilder.validateCooldown(config.cooldown);
     }
 
-    // Validate no overlap between allow and deny lists
+    // Validate no overlap between allow and deny lists.
+    //
+    // M-04 fix: Use exact (case-sensitive) comparison by default. Solana addresses
+    // are base58-encoded and case-sensitive — lowercasing would conflate distinct
+    // addresses (e.g., "ABC" and "abc" are different Solana addresses). EVM addresses
+    // (hex, 0x-prefixed) are case-insensitive per EIP-55 checksum, but exact comparison
+    // is still safe for overlap detection: if an operator uses different casings for the
+    // same EVM address in allow vs deny lists, the overlap will not be detected, but
+    // the stricter behavior (deny wins in AllowlistRule) is the safe default. For
+    // EVM-specific deployments requiring case-insensitive overlap detection, normalize
+    // addresses to lowercase before passing them to the policy builder.
     if (config.allowAddresses && config.denyAddresses) {
-      const overlap = config.allowAddresses.filter((a) => config.denyAddresses!.includes(a));
+      const denySet = new Set(config.denyAddresses);
+      const overlap = config.allowAddresses.filter((a) => denySet.has(a));
       if (overlap.length > 0) {
         throw new Error(`Address appears in both allow and deny lists: ${overlap[0]}`);
       }
     }
 
     if (config.allowPrograms && config.denyPrograms) {
-      const overlap = config.allowPrograms.filter((p) => config.denyPrograms!.includes(p));
+      const denyProgramSet = new Set(config.denyPrograms);
+      const overlap = config.allowPrograms.filter((p) => denyProgramSet.has(p));
       if (overlap.length > 0) {
         throw new Error(`Program appears in both allow and deny lists: ${overlap[0]}`);
       }
@@ -169,6 +240,13 @@ export class PolicyBuilder {
   }
 
   private static validateTokenAmount(amount: TokenAmount, label: string): void {
+    // M-14 fix: Reject scientific notation in amount strings. Scientific notation
+    // (e.g., "1e18", "5E-3") can represent extremely large or small values that
+    // bypass practical limits. Require explicit decimal notation for clarity and
+    // to prevent accidental misconfiguration of spending limits.
+    if (/[eE]/.test(amount.amount)) {
+      throw new Error(`${label} amount must not use scientific notation: ${amount.amount}`);
+    }
     const parsed = parseFloat(amount.amount);
     if (isNaN(parsed) || parsed <= 0) {
       throw new Error(`Invalid ${label} amount: ${amount.amount}`);
@@ -183,6 +261,25 @@ export class PolicyBuilder {
     for (const field of fields) {
       if (field) {
         PolicyBuilder.validateTokenAmount(field, "Spending limit");
+      }
+    }
+
+    // MED-06 fix: Validate USD-denominated limit fields. Their amount strings must
+    // parse to valid positive finite numbers to prevent silently disabled limits.
+    const usdFields: Array<{ value: { amount: string } | undefined; label: string }> = [
+      { value: limit.perTransactionUSD, label: "perTransactionUSD" },
+      { value: limit.dailyUSD, label: "dailyUSD" },
+      { value: limit.weeklyUSD, label: "weeklyUSD" },
+      { value: limit.monthlyUSD, label: "monthlyUSD" },
+    ];
+    for (const { value, label } of usdFields) {
+      if (value) {
+        const parsed = parseFloat(value.amount);
+        if (!Number.isFinite(parsed) || parsed <= 0) {
+          throw new Error(
+            `Invalid spending limit ${label} amount: "${value.amount}" — must be a valid positive finite number`,
+          );
+        }
       }
     }
   }
@@ -213,8 +310,10 @@ export class PolicyBuilder {
     if (isNaN(amount) || amount <= 0) {
       throw new Error(`Invalid approval gate amount: ${config.above.amount}`);
     }
-    if (config.timeout !== undefined && config.timeout <= 0) {
-      throw new Error("Approval gate timeout must be positive");
+    // POLICY-021 fix: Validate timeout is a positive finite number. Previously only
+    // rejected <= 0, but NaN/Infinity would pass through. Now consistent with rule behavior.
+    if (config.timeout !== undefined && (typeof config.timeout !== "number" || !Number.isFinite(config.timeout) || config.timeout <= 0)) {
+      throw new Error("Approval gate timeout must be a positive finite number (milliseconds)");
     }
   }
 
@@ -237,6 +336,46 @@ export class PolicyBuilder {
     PolicyBuilder.validateTokenAmount(config.afterTransactionAbove, "Cooldown threshold");
     if (config.waitMinutes <= 0) {
       throw new Error("Cooldown waitMinutes must be positive");
+    }
+  }
+}
+
+/**
+ * M-08 fix: Recursively strip dangerous keys (__proto__, constructor, prototype)
+ * from an object to prevent prototype pollution attacks during deserialization.
+ * These keys can be injected into JSON payloads to modify Object.prototype,
+ * potentially compromising all objects in the runtime.
+ *
+ * MED-T4-07 NOTE: This function is intentional defense-in-depth, not redundancy.
+ * While the JSON.parse(JSON.stringify()) round-trip in fromJSON() already strips
+ * non-serializable properties (functions, symbols, undefined, circular refs) and
+ * produces a clean POJO, it does NOT remove __proto__ keys from JSON payloads.
+ * JSON.parse('{"__proto__": {"polluted": true}}') creates an object with an own
+ * property named "__proto__" that can be exploited during property enumeration or
+ * Object.assign/spread operations. This explicit stripping ensures that even if
+ * the JSON round-trip behavior changes in a future engine, or if the sanitized
+ * object is later passed to a library that is vulnerable to prototype pollution,
+ * the dangerous keys are definitively removed. Defense-in-depth: both layers must
+ * fail for prototype pollution to succeed.
+ */
+function stripDangerousKeys(obj: unknown): void {
+  if (obj === null || typeof obj !== "object") return;
+
+  if (Array.isArray(obj)) {
+    for (const item of obj) {
+      stripDangerousKeys(item);
+    }
+    return;
+  }
+
+  const record = obj as Record<string, unknown>;
+  delete record["__proto__"];
+  delete record["constructor"];
+  delete record["prototype"];
+
+  for (const key of Object.keys(record)) {
+    if (typeof record[key] === "object" && record[key] !== null) {
+      stripDangerousKeys(record[key]);
     }
   }
 }

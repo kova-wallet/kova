@@ -27,6 +27,14 @@ export interface ApprovalRequest {
   };
   /** When this request expires */
   expiresAt: number;
+  /**
+   * HIGH-05 fix: SHA-256 hash of the transaction parameters.
+   * Cryptographically binds the approval to the specific transaction, preventing
+   * TOCTOU attacks where the intent could theoretically be modified after approval
+   * but before execution. The hash is included in the approval message so the
+   * approver can verify it matches.
+   */
+  intentHash?: string;
 }
 
 export type ApprovalDecision = "approved" | "rejected" | "timeout";
@@ -36,6 +44,12 @@ export interface ApprovalResult {
   decision: ApprovalDecision;
   decidedBy?: string;
   decidedAt: number;
+  /**
+   * HIGH-12 fix: Echo back the intent hash that was approved.
+   * The approval gate verifies this matches the original intent to prevent
+   * TOCTOU attacks where the intent is modified between approval and execution.
+   */
+  intentHash?: string;
 }
 
 export interface ApprovalChannel {

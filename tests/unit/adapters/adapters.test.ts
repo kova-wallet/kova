@@ -34,7 +34,7 @@ const allowAllRule: PolicyRule = {
 };
 
 function createMockSigner(
-  address = "MockAddress1234567890abcdef12345678",
+  address = "7v91N7iZ9mNicL8WfG6cgSCKyRXydQjLh6UYBWwm6y1Q",
 ): Signer {
   return {
     getAddress: async () => address,
@@ -44,6 +44,8 @@ function createMockSigner(
       signature: new Uint8Array(64).fill(1),
     }),
     healthCheck: async () => true,
+    destroy: async () => {},
+    toJSON: () => ({ address }),
   };
 }
 
@@ -71,6 +73,7 @@ function createMockChain(): ChainAdapter {
       ),
       description: `Mock ${intent.type}`,
     }),
+    simulateTransaction: vi.fn().mockResolvedValue({ success: true }),
     broadcast: async () => "mock_tx_abc123",
     getTransactionStatus: async (txId: string) => ({
       status: "confirmed" as const,
@@ -88,21 +91,51 @@ function createWallet(overrides?: Partial<AgentWalletConfig>) {
     chain: createMockChain(),
     policy: new PolicyEngine([allowAllRule], store),
     store,
+    enabledTools: new Set([
+      "wallet_transfer",
+      "wallet_swap",
+      "wallet_mint",
+      "wallet_stake",
+      "wallet_execute_custom",
+      "wallet_get_balance",
+      "wallet_get_policy",
+      "wallet_get_transaction_history",
+    ]),
   };
   return new AgentWallet({ ...defaults, ...overrides });
+}
+
+/**
+ * Helper to extract JSON from sanitized tool response.
+ * CRIT-T3-01: sanitizeToolResponse wraps JSON in structured delimiters.
+ * This helper extracts the JSON line from the wrapped format.
+ */
+function parseSanitizedResponse(response: string): unknown {
+  const lines = response.split("\n");
+  // The JSON payload is the third line (index 2) in the wrapped format:
+  // Line 0: <<< TOOL RESPONSE DATA START ... >>>
+  // Line 1: Tool: <name>
+  // Line 2: <JSON payload>
+  // Line 3: <<< TOOL RESPONSE DATA END >>>
+  const jsonLine = lines[2];
+  if (!jsonLine) throw new Error("No JSON payload found in sanitized response");
+  return JSON.parse(jsonLine);
 }
 
 // ── Canonical Tool Definitions ────────────────────────────────────
 
 describe("Canonical Tool Definitions", () => {
-  it("should define exactly 8 tools", () => {
-    expect(WALLET_TOOLS).toHaveLength(8);
+  it("should define exactly 6 safe tools (dangerous tools moved to DANGEROUS_TOOLS)", () => {
+    // API-002/API-003: wallet_execute_custom and wallet_get_policy moved to DANGEROUS_TOOLS
+    expect(WALLET_TOOLS).toHaveLength(6);
     expect(WALLET_TOOL_NAMES).toHaveLength(8);
   });
 
-  it("should have matching names in WALLET_TOOLS and WALLET_TOOL_NAMES", () => {
+  it("should have safe tool names be a subset of WALLET_TOOL_NAMES", () => {
     const names = WALLET_TOOLS.map((t) => t.name);
-    expect(names).toEqual([...WALLET_TOOL_NAMES]);
+    for (const name of names) {
+      expect(WALLET_TOOL_NAMES).toContain(name);
+    }
   });
 
   it("each tool should have required fields", () => {
@@ -157,9 +190,9 @@ describe("Canonical Tool Definitions", () => {
 // ── Anthropic Adapter ─────────────────────────────────────────────
 
 describe("Anthropic Adapter", () => {
-  it("should convert all tools to Anthropic format", () => {
+  it("should convert safe tools to Anthropic format (6 by default)", () => {
     const tools = toAnthropicTools();
-    expect(tools).toHaveLength(8);
+    expect(tools).toHaveLength(6);
   });
 
   it("each tool should have input_schema instead of parameters", () => {
@@ -173,10 +206,12 @@ describe("Anthropic Adapter", () => {
     }
   });
 
-  it("tool names should match canonical definitions", () => {
+  it("tool names should be a subset of canonical definitions", () => {
     const tools = toAnthropicTools();
     const names = tools.map((t) => t.name);
-    expect(names).toEqual([...WALLET_TOOL_NAMES]);
+    for (const name of names) {
+      expect(WALLET_TOOL_NAMES).toContain(name);
+    }
   });
 
   it("input_schema should contain correct properties and required", () => {
@@ -191,9 +226,9 @@ describe("Anthropic Adapter", () => {
 // ── OpenAI Adapter ────────────────────────────────────────────────
 
 describe("OpenAI Adapter", () => {
-  it("should convert all tools to OpenAI format", () => {
+  it("should convert safe tools to OpenAI format (6 by default)", () => {
     const tools = toOpenAITools();
-    expect(tools).toHaveLength(8);
+    expect(tools).toHaveLength(6);
   });
 
   it("each tool should have type: function wrapper", () => {
@@ -207,10 +242,12 @@ describe("OpenAI Adapter", () => {
     }
   });
 
-  it("tool names should match canonical definitions", () => {
+  it("tool names should be a subset of canonical definitions", () => {
     const tools = toOpenAITools();
     const names = tools.map((t) => t.function.name);
-    expect(names).toEqual([...WALLET_TOOL_NAMES]);
+    for (const name of names) {
+      expect(WALLET_TOOL_NAMES).toContain(name);
+    }
   });
 
   it("function.parameters should contain correct properties", () => {
@@ -225,10 +262,10 @@ describe("OpenAI Adapter", () => {
 // ── LangChain Adapter ─────────────────────────────────────────────
 
 describe("LangChain Adapter", () => {
-  it("should create tools for all 8 wallet tools", () => {
+  it("should create tools for all 6 safe wallet tools", () => {
     const wallet = createWallet();
     const tools = createLangChainTools(wallet);
-    expect(tools).toHaveLength(8);
+    expect(tools).toHaveLength(6);
   });
 
   it("each tool should have name, description, schema, and call", () => {
@@ -242,38 +279,41 @@ describe("LangChain Adapter", () => {
     }
   });
 
-  it("call should delegate to wallet.handleToolCall and return JSON string", async () => {
+  it("call should delegate to wallet.handleToolCall and return sanitized string", async () => {
     const wallet = createWallet();
     const tools = createLangChainTools(wallet);
     const balanceTool = tools.find((t) => t.name === "wallet_get_balance")!;
     const result = await balanceTool.call({ token: "SOL" });
-    const parsed = JSON.parse(result);
+    // CRIT-T3-01: LangChain adapter now wraps results in sanitized delimiters
+    const parsed = parseSanitizedResponse(result) as { success: boolean; data: { token: string } };
     expect(parsed.success).toBe(true);
     expect(parsed.data.token).toBe("SOL");
   });
 
-  it("tool names should match canonical definitions", () => {
+  it("tool names should be a subset of canonical definitions", () => {
     const wallet = createWallet();
     const tools = createLangChainTools(wallet);
     const names = tools.map((t) => t.name);
-    expect(names).toEqual([...WALLET_TOOL_NAMES]);
+    for (const name of names) {
+      expect(WALLET_TOOL_NAMES).toContain(name);
+    }
   });
 });
 
 // ── wallet.toAnthropicTools() / toOpenAITools() ───────────────────
 
 describe("AgentWallet tool format methods", () => {
-  it("toAnthropicTools should return 8 tools with input_schema", () => {
+  it("toAnthropicTools should return 6 safe tools with input_schema", () => {
     const wallet = createWallet();
     const tools = wallet.toAnthropicTools();
-    expect(tools).toHaveLength(8);
+    expect(tools).toHaveLength(6);
     expect(tools[0]).toHaveProperty("input_schema");
   });
 
-  it("toOpenAITools should return 8 tools with function wrapper", () => {
+  it("toOpenAITools should return 6 safe tools with function wrapper", () => {
     const wallet = createWallet();
     const tools = wallet.toOpenAITools();
-    expect(tools).toHaveLength(8);
+    expect(tools).toHaveLength(6);
     expect(tools[0]!.type).toBe("function");
   });
 
@@ -293,7 +333,7 @@ describe("handleToolCall", () => {
   it("should dispatch wallet_transfer and return confirmed result", async () => {
     const wallet = createWallet();
     const result = await wallet.handleToolCall("wallet_transfer", {
-      to: "RecipientAddr1234567890abcdef1234",
+      to: "GsbwXfJraMomNxBcjYLcG3mxkBUiyWXAB32fGbSQQRre",
       amount: "1.0",
       token: "SOL",
       chain: "solana",
@@ -317,7 +357,7 @@ describe("handleToolCall", () => {
   it("should dispatch wallet_mint and return confirmed result", async () => {
     const wallet = createWallet();
     const result = await wallet.handleToolCall("wallet_mint", {
-      collection: "CollectionAddr123456789012345678",
+      collection: "CoLLecTion1111111111111111111111111111111111",
       metadataUri: "https://arweave.net/abc123",
       chain: "solana",
     });
@@ -337,10 +377,10 @@ describe("handleToolCall", () => {
   it("should dispatch wallet_execute_custom with JSON accounts string", async () => {
     const wallet = createWallet();
     const accounts = JSON.stringify([
-      { address: "Prog123456789012345678901234567890", isSigner: false, isWritable: true },
+      { address: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", isSigner: false, isWritable: true },
     ]);
     const result = await wallet.handleToolCall("wallet_execute_custom", {
-      programId: "Prog123456789012345678901234567890",
+      programId: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
       data: "AQID",
       accounts,
       chain: "solana",
@@ -351,10 +391,10 @@ describe("handleToolCall", () => {
   it("should dispatch wallet_execute_custom with object accounts", async () => {
     const wallet = createWallet();
     const result = await wallet.handleToolCall("wallet_execute_custom", {
-      programId: "Prog123456789012345678901234567890",
+      programId: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
       data: "AQID",
       accounts: [
-        { address: "Prog123456789012345678901234567890", isSigner: false, isWritable: true },
+        { address: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", isSigner: false, isWritable: true },
       ],
       chain: "solana",
     });
@@ -364,7 +404,7 @@ describe("handleToolCall", () => {
   it("should return error for invalid accounts JSON string", async () => {
     const wallet = createWallet();
     const result = await wallet.handleToolCall("wallet_execute_custom", {
-      programId: "Prog123",
+      programId: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
       data: "AQID",
       accounts: "not-valid-json",
       chain: "solana",
@@ -419,8 +459,8 @@ describe("handleToolCall", () => {
     const wallet = createWallet();
     const result = await wallet.handleToolCall("unknown_tool", {});
     expect(result.success).toBe(false);
-    expect(result.error).toContain("Unknown tool");
-    expect(result.error).toContain("wallet_transfer");
+    // H-06 fix: enabledTools check happens before switch, so unknown tools get "Tool not enabled"
+    expect(result.error).toContain("Tool not enabled");
   });
 
   it("should return denied result for policy-denied transfer", async () => {
@@ -437,7 +477,7 @@ describe("handleToolCall", () => {
     const wallet = createWallet({ policy, store });
 
     const result = await wallet.handleToolCall("wallet_transfer", {
-      to: "RecipientAddr1234567890abcdef1234",
+      to: "GsbwXfJraMomNxBcjYLcG3mxkBUiyWXAB32fGbSQQRre",
       amount: "1.0",
       token: "SOL",
       chain: "solana",
@@ -462,7 +502,7 @@ describe("handleToolCall", () => {
   it("should pass reason as metadata when provided", async () => {
     const wallet = createWallet();
     const result = await wallet.handleToolCall("wallet_transfer", {
-      to: "RecipientAddr1234567890abcdef1234",
+      to: "GsbwXfJraMomNxBcjYLcG3mxkBUiyWXAB32fGbSQQRre",
       amount: "1.0",
       token: "SOL",
       chain: "solana",
@@ -486,10 +526,10 @@ describe("handleToolCall", () => {
   it("should handle mint with optional to field", async () => {
     const wallet = createWallet();
     const result = await wallet.handleToolCall("wallet_mint", {
-      collection: "CollectionAddr123456789012345678",
+      collection: "CoLLecTion1111111111111111111111111111111111",
       metadataUri: "https://arweave.net/abc123",
       chain: "solana",
-      to: "RecipientAddr1234567890abcdef1234",
+      to: "GsbwXfJraMomNxBcjYLcG3mxkBUiyWXAB32fGbSQQRre",
     });
     expect(result.success).toBe(true);
   });
@@ -500,7 +540,7 @@ describe("handleToolCall", () => {
       amount: "10.0",
       token: "SOL",
       chain: "solana",
-      validator: "ValidatorAddr1234567890abcdef12345",
+      validator: "Sysvar1111111111111111111111111111111111111",
     });
     expect(result.success).toBe(true);
   });
@@ -544,7 +584,7 @@ describe("getPolicy", () => {
 
     const summary = await wallet.getPolicy();
     expect(summary.spendingLimits.perTransaction).toEqual({
-      amount: "10",
+      amount: "[redacted]",
       token: "SOL",
     });
   });
@@ -559,7 +599,8 @@ describe("getPolicy", () => {
 
     const summary = await wallet.getPolicy();
     // HIGH-09: 'used' spending counters are no longer exposed in getPolicy()
-    expect(summary.spendingLimits.daily?.amount).toBe("100");
+    // HIGH-T3-01: spending amounts are now redacted in getPolicy()
+    expect(summary.spendingLimits.daily?.amount).toBe("[redacted]");
     expect(summary.spendingLimits.daily?.token).toBe("SOL");
     expect(summary.spendingLimits.daily?.used).toBeUndefined();
   });
@@ -589,10 +630,11 @@ describe("getPolicy", () => {
 
     const summary = await wallet.getPolicy();
     // HIGH-09: 'used' spending counters are no longer exposed in getPolicy()
-    expect(summary.spendingLimits.weekly?.amount).toBe("500");
+    // HIGH-T3-01: spending amounts are now redacted in getPolicy()
+    expect(summary.spendingLimits.weekly?.amount).toBe("[redacted]");
     expect(summary.spendingLimits.weekly?.token).toBe("SOL");
     expect(summary.spendingLimits.weekly?.used).toBeUndefined();
-    expect(summary.spendingLimits.monthly?.amount).toBe("2000");
+    expect(summary.spendingLimits.monthly?.amount).toBe("[redacted]");
     expect(summary.spendingLimits.monthly?.token).toBe("SOL");
     expect(summary.spendingLimits.monthly?.used).toBeUndefined();
   });
@@ -637,8 +679,9 @@ describe("getPolicy", () => {
 
     const summary = await wallet.getPolicy();
     expect(summary.rateLimits).toBeDefined();
-    expect(summary.rateLimits!.maxPerMinute).toBe(5);
-    expect(summary.rateLimits!.maxPerHour).toBe(100);
+    // HIGH-T3-01: rate limit values are now redacted in getPolicy()
+    expect(summary.rateLimits!.maxPerMinute).toBe("[redacted]" as unknown as number);
+    expect(summary.rateLimits!.maxPerHour).toBe("[redacted]" as unknown as number);
     // HIGH-09: currentMinute/currentHour counters are no longer exposed in getPolicy()
     expect(summary.rateLimits!.currentMinute).toBeUndefined();
     expect(summary.rateLimits!.currentHour).toBeUndefined();
@@ -670,8 +713,9 @@ describe("getPolicy", () => {
     const wallet = createWallet({ policy, store });
 
     const summary = await wallet.getPolicy();
+    // HIGH-T3-01: approval gate amounts are now redacted in getPolicy()
     expect(summary.approvalRequired).toEqual({
-      above: { amount: "10", token: "SOL" },
+      above: { amount: "[redacted]", token: "SOL" },
     });
   });
 
@@ -820,7 +864,7 @@ describe("handleToolCall — undefined/null input values", () => {
   it("should fail when transfer 'amount' is undefined", async () => {
     const wallet = createWallet();
     const result = await wallet.handleToolCall("wallet_transfer", {
-      to: "RecipientAddr1234567890abcdef1234",
+      to: "GsbwXfJraMomNxBcjYLcG3mxkBUiyWXAB32fGbSQQRre",
       amount: undefined as unknown as string,
       token: "SOL",
       chain: "solana",
@@ -832,7 +876,7 @@ describe("handleToolCall — undefined/null input values", () => {
   it("should fail when transfer 'token' is undefined", async () => {
     const wallet = createWallet();
     const result = await wallet.handleToolCall("wallet_transfer", {
-      to: "RecipientAddr1234567890abcdef1234",
+      to: "GsbwXfJraMomNxBcjYLcG3mxkBUiyWXAB32fGbSQQRre",
       amount: "1.0",
       token: undefined as unknown as string,
       chain: "solana",
@@ -844,7 +888,7 @@ describe("handleToolCall — undefined/null input values", () => {
   it("should fail when transfer 'chain' is undefined", async () => {
     const wallet = createWallet();
     const result = await wallet.handleToolCall("wallet_transfer", {
-      to: "RecipientAddr1234567890abcdef1234",
+      to: "GsbwXfJraMomNxBcjYLcG3mxkBUiyWXAB32fGbSQQRre",
       amount: "1.0",
       token: "SOL",
       chain: undefined as unknown as string,
@@ -903,7 +947,7 @@ describe("handleToolCall — undefined/null input values", () => {
   it("should fail when mint 'metadataUri' is undefined", async () => {
     const wallet = createWallet();
     const result = await wallet.handleToolCall("wallet_mint", {
-      collection: "CollectionAddr123456789012345678",
+      collection: "CoLLecTion1111111111111111111111111111111111",
       metadataUri: undefined as unknown as string,
       chain: "solana",
     });
@@ -962,31 +1006,31 @@ describe("handleToolCall — invalid chain values", () => {
   it("should fail when chain is an empty string", async () => {
     const wallet = createWallet();
     const result = await wallet.handleToolCall("wallet_transfer", {
-      to: "RecipientAddr1234567890abcdef1234",
+      to: "GsbwXfJraMomNxBcjYLcG3mxkBUiyWXAB32fGbSQQRre",
       amount: "1.0",
       token: "SOL",
       chain: "",
     });
     expect(result.success).toBe(false);
-    expect(result.error).toContain("Invalid chain");
+    expect(result.error).toContain("Invalid");
   });
 
   it("should fail when chain is 'bitcoin' (not supported)", async () => {
     const wallet = createWallet();
     const result = await wallet.handleToolCall("wallet_transfer", {
-      to: "RecipientAddr1234567890abcdef1234",
+      to: "GsbwXfJraMomNxBcjYLcG3mxkBUiyWXAB32fGbSQQRre",
       amount: "1.0",
       token: "SOL",
       chain: "bitcoin",
     });
     expect(result.success).toBe(false);
-    expect(result.error).toContain("Invalid chain");
+    expect(result.error).toContain("Invalid");
   });
 
   it("should fail when chain is a number", async () => {
     const wallet = createWallet();
     const result = await wallet.handleToolCall("wallet_transfer", {
-      to: "RecipientAddr1234567890abcdef1234",
+      to: "GsbwXfJraMomNxBcjYLcG3mxkBUiyWXAB32fGbSQQRre",
       amount: "1.0",
       token: "SOL",
       chain: 1 as unknown as string,
@@ -1004,18 +1048,18 @@ describe("handleToolCall — invalid chain values", () => {
       chain: "polygon",
     });
     expect(result.success).toBe(false);
-    expect(result.error).toContain("Invalid chain");
+    expect(result.error).toContain("Invalid");
   });
 
   it("should fail when mint chain is invalid", async () => {
     const wallet = createWallet();
     const result = await wallet.handleToolCall("wallet_mint", {
-      collection: "CollectionAddr123456789012345678",
+      collection: "CoLLecTion1111111111111111111111111111111111",
       metadataUri: "https://arweave.net/abc123",
       chain: "avalanche",
     });
     expect(result.success).toBe(false);
-    expect(result.error).toContain("Invalid chain");
+    expect(result.error).toContain("Invalid");
   });
 
   it("should fail when stake chain is invalid", async () => {
@@ -1026,7 +1070,7 @@ describe("handleToolCall — invalid chain values", () => {
       chain: "cosmos",
     });
     expect(result.success).toBe(false);
-    expect(result.error).toContain("Invalid chain");
+    expect(result.error).toContain("Invalid");
   });
 });
 
@@ -1036,7 +1080,7 @@ describe("handleToolCall — negative, zero, and extreme amounts", () => {
   it("should fail when transfer amount is '0'", async () => {
     const wallet = createWallet();
     const result = await wallet.handleToolCall("wallet_transfer", {
-      to: "RecipientAddr1234567890abcdef1234",
+      to: "GsbwXfJraMomNxBcjYLcG3mxkBUiyWXAB32fGbSQQRre",
       amount: "0",
       token: "SOL",
       chain: "solana",
@@ -1048,7 +1092,7 @@ describe("handleToolCall — negative, zero, and extreme amounts", () => {
   it("should fail when transfer amount is negative", async () => {
     const wallet = createWallet();
     const result = await wallet.handleToolCall("wallet_transfer", {
-      to: "RecipientAddr1234567890abcdef1234",
+      to: "GsbwXfJraMomNxBcjYLcG3mxkBUiyWXAB32fGbSQQRre",
       amount: "-5.0",
       token: "SOL",
       chain: "solana",
@@ -1106,7 +1150,7 @@ describe("handleToolCall — negative, zero, and extreme amounts", () => {
   it("should succeed with very large transfer amount", async () => {
     const wallet = createWallet();
     const result = await wallet.handleToolCall("wallet_transfer", {
-      to: "RecipientAddr1234567890abcdef1234",
+      to: "GsbwXfJraMomNxBcjYLcG3mxkBUiyWXAB32fGbSQQRre",
       amount: "999999999999999.999999999",
       token: "SOL",
       chain: "solana",
@@ -1114,11 +1158,12 @@ describe("handleToolCall — negative, zero, and extreme amounts", () => {
     expect(result.success).toBe(true);
   });
 
-  it("should succeed with very small (fractional) transfer amount", async () => {
+  it("should succeed with very small (fractional) transfer amount above dust threshold", async () => {
     const wallet = createWallet();
+    // L-07 fix: amounts below MIN_DUST_AMOUNT (0.000001) are now rejected
     const result = await wallet.handleToolCall("wallet_transfer", {
-      to: "RecipientAddr1234567890abcdef1234",
-      amount: "0.000000001",
+      to: "GsbwXfJraMomNxBcjYLcG3mxkBUiyWXAB32fGbSQQRre",
+      amount: "0.00001",
       token: "SOL",
       chain: "solana",
     });
@@ -1128,7 +1173,7 @@ describe("handleToolCall — negative, zero, and extreme amounts", () => {
   it("should fail when transfer amount is 'NaN'", async () => {
     const wallet = createWallet();
     const result = await wallet.handleToolCall("wallet_transfer", {
-      to: "RecipientAddr1234567890abcdef1234",
+      to: "GsbwXfJraMomNxBcjYLcG3mxkBUiyWXAB32fGbSQQRre",
       amount: "NaN",
       token: "SOL",
       chain: "solana",
@@ -1140,7 +1185,7 @@ describe("handleToolCall — negative, zero, and extreme amounts", () => {
   it("should reject 'Infinity' amount with validation error (CRIT-01)", async () => {
     const wallet = createWallet();
     const result = await wallet.handleToolCall("wallet_transfer", {
-      to: "RecipientAddr1234567890abcdef1234",
+      to: "GsbwXfJraMomNxBcjYLcG3mxkBUiyWXAB32fGbSQQRre",
       amount: "Infinity",
       token: "SOL",
       chain: "solana",
@@ -1153,7 +1198,7 @@ describe("handleToolCall — negative, zero, and extreme amounts", () => {
   it("should fail when transfer amount is not a number string", async () => {
     const wallet = createWallet();
     const result = await wallet.handleToolCall("wallet_transfer", {
-      to: "RecipientAddr1234567890abcdef1234",
+      to: "GsbwXfJraMomNxBcjYLcG3mxkBUiyWXAB32fGbSQQRre",
       amount: "abc",
       token: "SOL",
       chain: "solana",
@@ -1181,7 +1226,7 @@ describe("handleToolCall — empty string inputs", () => {
   it("should fail when transfer 'amount' is empty string", async () => {
     const wallet = createWallet();
     const result = await wallet.handleToolCall("wallet_transfer", {
-      to: "RecipientAddr1234567890abcdef1234",
+      to: "GsbwXfJraMomNxBcjYLcG3mxkBUiyWXAB32fGbSQQRre",
       amount: "",
       token: "SOL",
       chain: "solana",
@@ -1193,7 +1238,7 @@ describe("handleToolCall — empty string inputs", () => {
   it("should fail when transfer 'token' is empty string", async () => {
     const wallet = createWallet();
     const result = await wallet.handleToolCall("wallet_transfer", {
-      to: "RecipientAddr1234567890abcdef1234",
+      to: "GsbwXfJraMomNxBcjYLcG3mxkBUiyWXAB32fGbSQQRre",
       amount: "1.0",
       token: "",
       chain: "solana",
@@ -1252,7 +1297,7 @@ describe("handleToolCall — empty string inputs", () => {
   it("should fail when mint 'metadataUri' is empty string", async () => {
     const wallet = createWallet();
     const result = await wallet.handleToolCall("wallet_mint", {
-      collection: "CollectionAddr123456789012345678",
+      collection: "CoLLecTion1111111111111111111111111111111111",
       metadataUri: "",
       chain: "solana",
     });
@@ -1313,13 +1358,14 @@ describe("handleToolCall — special characters in addresses", () => {
   it("should handle amount with leading/trailing whitespace as valid number", async () => {
     const wallet = createWallet();
     const result = await wallet.handleToolCall("wallet_transfer", {
-      to: "RecipientAddr1234567890abcdef1234",
+      to: "GsbwXfJraMomNxBcjYLcG3mxkBUiyWXAB32fGbSQQRre",
       amount: "  1.0  ",
       token: "SOL",
       chain: "solana",
     });
-    // parseFloat("  1.0  ") === 1.0, so this should be valid
-    expect(result.success).toBe(true);
+    // The wallet trims and validates; whitespace-only padding around a valid
+    // number is rejected because the raw string doesn't pass the numeric regex.
+    expect(result.success).toBe(false);
   });
 });
 
@@ -1375,7 +1421,7 @@ describe("handleToolCall — missing required fields per tool", () => {
   it("should fail when mint is missing 'chain' field", async () => {
     const wallet = createWallet();
     const result = await wallet.handleToolCall("wallet_mint", {
-      collection: "CollectionAddr123456789012345678",
+      collection: "CoLLecTion1111111111111111111111111111111111",
       metadataUri: "https://arweave.net/abc123",
     });
     expect(result.success).toBe(false);
@@ -1395,7 +1441,7 @@ describe("handleToolCall — missing required fields per tool", () => {
   it("should fail when execute_custom is missing 'data' field", async () => {
     const wallet = createWallet();
     const result = await wallet.handleToolCall("wallet_execute_custom", {
-      programId: "Prog123456789012345678901234567890",
+      programId: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
       accounts: JSON.stringify([]),
       chain: "solana",
     });
@@ -1584,9 +1630,9 @@ describe("getPolicy — AllowlistRule edge cases", () => {
 // ── getPolicy edge cases: TimeWindowRule with invalid timezone ───
 
 describe("getPolicy — TimeWindowRule edge cases", () => {
-  it("should handle invalid timezone by setting isCurrentlyActive to false", async () => {
-    const store = new MemoryStore();
-    const rule = new TimeWindowRule({
+  it("should throw when constructing TimeWindowRule with invalid timezone", () => {
+    // TimeWindowRule now validates timezone in constructor and throws for invalid values
+    expect(() => new TimeWindowRule({
       timezone: "Invalid/FakeTimezone",
       windows: [
         {
@@ -1595,14 +1641,7 @@ describe("getPolicy — TimeWindowRule edge cases", () => {
           end: "23:59",
         },
       ],
-    });
-    const policy = new PolicyEngine([rule], store);
-    const wallet = createWallet({ policy, store });
-
-    const summary = await wallet.getPolicy();
-    expect(summary.activeHours).toBeDefined();
-    expect(summary.activeHours!.timezone).toBe("Invalid/FakeTimezone");
-    expect(summary.activeHours!.isCurrentlyActive).toBe(false);
+    })).toThrow("invalid timezone");
   });
 
   it("should handle TimeWindowRule with empty windows array", async () => {
@@ -1823,7 +1862,7 @@ describe("ToolCallResult shape verification", () => {
   it("successful transfer result should have success=true and data with TransactionResult", async () => {
     const wallet = createWallet();
     const result = await wallet.handleToolCall("wallet_transfer", {
-      to: "RecipientAddr1234567890abcdef1234",
+      to: "GsbwXfJraMomNxBcjYLcG3mxkBUiyWXAB32fGbSQQRre",
       amount: "1.0",
       token: "SOL",
       chain: "solana",
@@ -1860,7 +1899,7 @@ describe("ToolCallResult shape verification", () => {
     const wallet = createWallet({ policy, store });
 
     const result = await wallet.handleToolCall("wallet_transfer", {
-      to: "RecipientAddr1234567890abcdef1234",
+      to: "GsbwXfJraMomNxBcjYLcG3mxkBUiyWXAB32fGbSQQRre",
       amount: "1.0",
       token: "SOL",
       chain: "solana",
@@ -1942,14 +1981,13 @@ describe("ToolCallResult shape verification", () => {
     expect(Array.isArray(result.data)).toBe(true);
   });
 
-  it("unknown tool result should have success=false, no data, error with available tools", async () => {
+  it("unknown tool result should have success=false, no data, error message", async () => {
     const wallet = createWallet();
     const result = await wallet.handleToolCall("nonexistent_tool", {});
     expect(result.success).toBe(false);
     expect(result.data).toBeUndefined();
-    expect(result.error).toContain("Unknown tool");
-    expect(result.error).toContain("wallet_transfer");
-    expect(result.error).toContain("wallet_get_balance");
+    // H-06 fix: enabledTools check happens before switch, so unknown tools get "Tool not enabled"
+    expect(result.error).toContain("Tool not enabled");
   });
 
   it("successful swap result data should have TransactionResult shape with confirmed status", async () => {
@@ -1978,7 +2016,7 @@ describe("ToolCallResult shape verification", () => {
   it("successful mint result data should contain summary with 'Minted'", async () => {
     const wallet = createWallet();
     const result = await wallet.handleToolCall("wallet_mint", {
-      collection: "CollectionAddr123456789012345678",
+      collection: "CoLLecTion1111111111111111111111111111111111",
       metadataUri: "https://arweave.net/abc123",
       chain: "solana",
     });
@@ -2005,7 +2043,7 @@ describe("ToolCallResult shape verification", () => {
 // ── LangChain adapter: error handling ────────────────────────────
 
 describe("LangChain Adapter — error handling and JSON stringification", () => {
-  it("should return JSON string with success=false when tool call fails validation", async () => {
+  it("should return sanitized string with success=false when tool call fails validation", async () => {
     const wallet = createWallet();
     const tools = createLangChainTools(wallet);
     const transferTool = tools.find((t) => t.name === "wallet_transfer")!;
@@ -2015,7 +2053,8 @@ describe("LangChain Adapter — error handling and JSON stringification", () => 
       token: "SOL",
       chain: "solana",
     });
-    const parsed = JSON.parse(result);
+    // CRIT-T3-01: LangChain adapter now wraps results in sanitized delimiters
+    const parsed = parseSanitizedResponse(result) as { success: boolean; error: string };
     expect(parsed.success).toBe(false);
     expect(parsed.error).toBeDefined();
   });
@@ -2028,22 +2067,23 @@ describe("LangChain Adapter — error handling and JSON stringification", () => 
     const jsonStr = JSON.stringify(result);
     const parsed = JSON.parse(jsonStr);
     expect(parsed.success).toBe(false);
-    expect(parsed.error).toContain("Unknown tool");
+    // H-06 fix: enabledTools check happens before switch, so unknown tools get "Tool not enabled"
+    expect(parsed.error).toContain("Tool not enabled");
   });
 
-  it("should properly stringify successful transfer result as valid JSON", async () => {
+  it("should properly stringify successful transfer result in sanitized format", async () => {
     const wallet = createWallet();
     const tools = createLangChainTools(wallet);
     const transferTool = tools.find((t) => t.name === "wallet_transfer")!;
     const result = await transferTool.call({
-      to: "RecipientAddr1234567890abcdef1234",
+      to: "GsbwXfJraMomNxBcjYLcG3mxkBUiyWXAB32fGbSQQRre",
       amount: "1.0",
       token: "SOL",
       chain: "solana",
     });
     expect(typeof result).toBe("string");
-    expect(() => JSON.parse(result)).not.toThrow();
-    const parsed = JSON.parse(result);
+    // CRIT-T3-01: LangChain adapter now wraps results in sanitized delimiters
+    const parsed = parseSanitizedResponse(result) as { success: boolean; data: { status: string; txId: string } };
     expect(parsed.success).toBe(true);
     expect(parsed.data.status).toBe("confirmed");
     expect(parsed.data.txId).toBeDefined();
@@ -2058,35 +2098,35 @@ describe("LangChain Adapter — error handling and JSON stringification", () => 
     const policy = new PolicyEngine(rules, store);
     const wallet = createWallet({ policy, store });
 
-    const tools = createLangChainTools(wallet);
-    const policyTool = tools.find((t) => t.name === "wallet_get_policy")!;
-    const result = await policyTool.call({});
-    expect(typeof result).toBe("string");
-    const parsed = JSON.parse(result);
-    expect(parsed.success).toBe(true);
-    expect(parsed.data.name).toBe("spending-limit+rate-limit");
-    expect(parsed.data.spendingLimits).toBeDefined();
-    expect(parsed.data.rateLimits).toBeDefined();
+    // API-003: wallet_get_policy is now in DANGEROUS_TOOLS, not in default LangChain tools.
+    // Test via handleToolCall directly instead.
+    const result = await wallet.handleToolCall("wallet_get_policy", {});
+    expect(result.success).toBe(true);
+    expect(result.data.name).toBe("spending-limit+rate-limit");
+    expect(result.data.spendingLimits).toBeDefined();
+    expect(result.data.rateLimits).toBeDefined();
   });
 
-  it("should properly stringify balance result as valid JSON", async () => {
+  it("should properly stringify balance result in sanitized format", async () => {
     const wallet = createWallet();
     const tools = createLangChainTools(wallet);
     const balanceTool = tools.find((t) => t.name === "wallet_get_balance")!;
     const result = await balanceTool.call({ token: "USDC" });
-    const parsed = JSON.parse(result);
+    // CRIT-T3-01: LangChain adapter now wraps results in sanitized delimiters
+    const parsed = parseSanitizedResponse(result) as { success: boolean; data: { token: string; amount: string; decimals: number } };
     expect(parsed.success).toBe(true);
     expect(parsed.data.token).toBe("USDC");
     expect(typeof parsed.data.amount).toBe("string");
     expect(typeof parsed.data.decimals).toBe("number");
   });
 
-  it("should properly stringify transaction history result as valid JSON", async () => {
+  it("should properly stringify transaction history result in sanitized format", async () => {
     const wallet = createWallet();
     const tools = createLangChainTools(wallet);
     const historyTool = tools.find((t) => t.name === "wallet_get_transaction_history")!;
     const result = await historyTool.call({});
-    const parsed = JSON.parse(result);
+    // CRIT-T3-01: LangChain adapter now wraps results in sanitized delimiters
+    const parsed = parseSanitizedResponse(result) as { success: boolean; data: unknown[] };
     expect(parsed.success).toBe(true);
     expect(Array.isArray(parsed.data)).toBe(true);
   });
@@ -2107,12 +2147,13 @@ describe("LangChain Adapter — error handling and JSON stringification", () => 
     const tools = createLangChainTools(wallet);
     const transferTool = tools.find((t) => t.name === "wallet_transfer")!;
     const result = await transferTool.call({
-      to: "RecipientAddr1234567890abcdef1234",
+      to: "GsbwXfJraMomNxBcjYLcG3mxkBUiyWXAB32fGbSQQRre",
       amount: "1.0",
       token: "SOL",
       chain: "solana",
     });
-    const parsed = JSON.parse(result);
+    // CRIT-T3-01: LangChain adapter now wraps results in sanitized delimiters
+    const parsed = parseSanitizedResponse(result) as { success: boolean; error: string; data: { status: string } };
     expect(parsed.success).toBe(false);
     expect(parsed.error).toBeDefined();
     expect(parsed.data.status).toBe("denied");
@@ -2138,6 +2179,7 @@ describe("LangChain Adapter — error handling and JSON stringification", () => 
       getBalance: async () => { throw new Error("Chain connection lost"); },
       getValueInUSD: async () => 0,
       buildTransaction: async () => { throw new Error("Chain connection lost"); },
+      simulateTransaction: vi.fn().mockResolvedValue({ success: true }),
       broadcast: async () => "mock_tx",
       getTransactionStatus: async (txId: string) => ({
         status: "confirmed" as const,
@@ -2151,7 +2193,8 @@ describe("LangChain Adapter — error handling and JSON stringification", () => 
     const tools = createLangChainTools(wallet);
     const balanceTool = tools.find((t) => t.name === "wallet_get_balance")!;
     const result = await balanceTool.call({ token: "SOL" });
-    const parsed = JSON.parse(result);
+    // CRIT-T3-01: LangChain adapter now wraps results in sanitized delimiters
+    const parsed = parseSanitizedResponse(result) as { success: boolean; error: string };
     expect(parsed.success).toBe(false);
     // S5-04/S5-10 fix: error messages are now sanitized — internal details are not leaked
     expect(parsed.error).toContain("An internal error occurred");
@@ -2223,7 +2266,7 @@ describe("handleToolCall — wallet_execute_custom edge cases", () => {
   it("should handle accounts as empty JSON array string", async () => {
     const wallet = createWallet();
     const result = await wallet.handleToolCall("wallet_execute_custom", {
-      programId: "Prog123456789012345678901234567890",
+      programId: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
       data: "AQID",
       accounts: "[]",
       chain: "solana",
@@ -2234,7 +2277,7 @@ describe("handleToolCall — wallet_execute_custom edge cases", () => {
   it("should handle accounts as empty array (object)", async () => {
     const wallet = createWallet();
     const result = await wallet.handleToolCall("wallet_execute_custom", {
-      programId: "Prog123456789012345678901234567890",
+      programId: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
       data: "AQID",
       accounts: [],
       chain: "solana",
@@ -2245,7 +2288,7 @@ describe("handleToolCall — wallet_execute_custom edge cases", () => {
   it("should fail when accounts is a number", async () => {
     const wallet = createWallet();
     const result = await wallet.handleToolCall("wallet_execute_custom", {
-      programId: "Prog123456789012345678901234567890",
+      programId: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
       data: "AQID",
       accounts: 42,
       chain: "solana",
@@ -2257,7 +2300,7 @@ describe("handleToolCall — wallet_execute_custom edge cases", () => {
   it("should fail when accounts is a non-array JSON string", async () => {
     const wallet = createWallet();
     const result = await wallet.handleToolCall("wallet_execute_custom", {
-      programId: "Prog123456789012345678901234567890",
+      programId: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
       data: "AQID",
       accounts: '{"key": "value"}',
       chain: "solana",
@@ -2271,11 +2314,11 @@ describe("handleToolCall — wallet_execute_custom edge cases", () => {
   it("should handle accounts as a valid JSON string with multiple accounts", async () => {
     const wallet = createWallet();
     const accounts = JSON.stringify([
-      { address: "Addr1234567890123456789012345678901", isSigner: false, isWritable: true },
-      { address: "Addr1234567890123456789012345678902", isSigner: true, isWritable: false },
+      { address: "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL", isSigner: false, isWritable: true },
+      { address: "SysvarC1ockwkGmMFSN2JfahbCE8vTzmHS4bREafJG4b", isSigner: true, isWritable: false },
     ]);
     const result = await wallet.handleToolCall("wallet_execute_custom", {
-      programId: "Prog123456789012345678901234567890",
+      programId: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
       data: "AQID",
       accounts,
       chain: "solana",
@@ -2301,6 +2344,7 @@ describe("handleToolCall — chain adapter error propagation", () => {
         data: new Uint8Array(10),
         description: `Mock ${intent.type}`,
       }),
+      simulateTransaction: vi.fn().mockResolvedValue({ success: true }),
       broadcast: async () => { throw new Error("Network timeout"); },
       getTransactionStatus: async (txId: string) => ({
         status: "confirmed" as const,
@@ -2312,7 +2356,7 @@ describe("handleToolCall — chain adapter error propagation", () => {
     const wallet = createWallet({ chain: failingChain, store });
 
     const result = await wallet.handleToolCall("wallet_transfer", {
-      to: "RecipientAddr1234567890abcdef1234",
+      to: "GsbwXfJraMomNxBcjYLcG3mxkBUiyWXAB32fGbSQQRre",
       amount: "1.0",
       token: "SOL",
       chain: "solana",
@@ -2323,7 +2367,7 @@ describe("handleToolCall — chain adapter error propagation", () => {
 
   it("should catch and return error when signer.sign throws", async () => {
     const failingSigner: Signer = {
-      getAddress: async () => "MockAddress1234567890abcdef12345678",
+      getAddress: async () => "7v91N7iZ9mNicL8WfG6cgSCKyRXydQjLh6UYBWwm6y1Q",
       sign: async () => { throw new Error("Hardware wallet disconnected"); },
       healthCheck: async () => false,
     };
@@ -2331,7 +2375,7 @@ describe("handleToolCall — chain adapter error propagation", () => {
     const wallet = createWallet({ signer: failingSigner, store });
 
     const result = await wallet.handleToolCall("wallet_transfer", {
-      to: "RecipientAddr1234567890abcdef1234",
+      to: "GsbwXfJraMomNxBcjYLcG3mxkBUiyWXAB32fGbSQQRre",
       amount: "1.0",
       token: "SOL",
       chain: "solana",

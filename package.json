@@ -91,8 +91,13 @@
     "vitest": "^4.0.18"
   },
   "dependencies": {
-    "@solana/spl-token": "^0.4.14",
-    "@solana/web3.js": "^1.98.4",
-    "better-sqlite3": "^12.6.2"
+    "@noble/curves": "1.9.7",
+    "@noble/hashes": "1.8.0",
+    "@solana/spl-token": "^0.4.19",
+    "@solana/web3.js": "1.98.4",
+    "better-sqlite3": "12.6.2"
+  },
+  "overrides": {
+    "bigint-buffer": "npm:@aspect-build/bigint-buffer@>=1.1.5"
   }
 }
