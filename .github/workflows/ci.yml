@@ -25,9 +25,12 @@ jobs:
           node-version: ${{ matrix.node-version }}
           cache: npm
 
-      # npm ci validates lockfile integrity and installs native addons
       - name: Install dependencies
         run: npm ci
+
+      # Rebuild native addons for the current Node version (better-sqlite3)
+      - name: Rebuild native modules
+        run: npm rebuild better-sqlite3
 
       - name: Type check
         run: npm run typecheck
