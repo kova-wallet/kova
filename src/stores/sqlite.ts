@@ -7,6 +7,7 @@
  *
  * TTL expiration is lazy (checked on read), matching MemoryStore behavior.
  *
+ * CONC-19 cross-reference: See security_audit_team9 CONC-19 for event loop blocking analysis.
  * STORE-015: CONCURRENT ACCESS — better-sqlite3 is a synchronous, in-process SQLite
  * binding. It does NOT support concurrent access from multiple processes. If multiple
  * Node.js processes share the same database file, WAL mode provides basic read
@@ -66,8 +67,18 @@ function secureAuxFiles(dbPath: string): void {
   for (const suffix of ["-wal", "-shm"]) {
     try {
       fs.chmodSync(dbPath + suffix, 0o600);
-    } catch {
-      // Best-effort — file may not exist yet or chmod may not be supported
+    } catch (err: unknown) {
+      // T6-F13 fix: Log a warning when chmod fails on non-Windows systems instead
+      // of silently ignoring. WAL/SHM files contain database content and should have
+      // the same restrictive permissions as the main database file.
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code !== "ENOENT" && typeof process !== "undefined" && process.platform !== "win32") {
+        process.emitWarning(
+          `SqliteStore: Failed to set permissions on ${dbPath}${suffix} (${code ?? "unknown error"}). ` +
+          "This file may be readable by other users on the system.",
+          "SecurityWarning",
+        );
+      }
     }
   }
 }
@@ -142,7 +153,9 @@ export class SqliteStore implements Store {
    * directly modify database rows (e.g., via SQL injection in another component
    * or direct file access) cannot forge valid counter values without this key.
    */
-  private readonly hmacKey: string;
+  // T1-F5 fix: Mutable Buffer (not readonly string) so destroy() can zero the key material
+  // in-place via Buffer.fill(0). Strings are immutable in V8 and cannot be reliably zeroed.
+  private hmacKey: Buffer;
 
   /**
    * Create a new SqliteStore. Opens (or creates) the database at the given path.
@@ -363,9 +376,11 @@ export class SqliteStore implements Store {
           "Generate one with: crypto.randomBytes(32).toString('hex')",
         );
       }
-      this.hmacKey = config.hmacKey;
+      // T1-F5 fix: Store as Buffer for reliable zeroization via Buffer.fill(0)
+      this.hmacKey = Buffer.from(config.hmacKey, "hex");
     } else {
-      this.hmacKey = crypto.randomBytes(32).toString("hex");
+      // T1-F5 fix: Store raw bytes instead of hex string
+      this.hmacKey = crypto.randomBytes(32);
       if (config.path !== ":memory:") {
         process.emitWarning(
           "SqliteStore: no hmacKey provided. Counter HMAC keys will be ephemeral and " +
@@ -405,6 +420,19 @@ export class SqliteStore implements Store {
         );
         CREATE INDEX IF NOT EXISTS idx_lists_key_id ON lists(key, id DESC);
       `);
+
+      // T6-F16 fix: Track schema version for future migrations.
+      // Without version tracking, schema changes would require users to manually
+      // delete and recreate databases, losing all audit history and counters.
+      const CURRENT_SCHEMA_VERSION = "1";
+      const existingVersion = this.db
+        .prepare("SELECT value FROM kv WHERE key = ?")
+        .get("__schema_version__") as { value: string } | undefined;
+      if (!existingVersion) {
+        this.db
+          .prepare("INSERT OR IGNORE INTO kv (key, value) VALUES (?, ?)")
+          .run("__schema_version__", CURRENT_SCHEMA_VERSION);
+      }
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       if (message.includes("database disk image is malformed") || message.includes("corrupt")) {
@@ -516,6 +544,7 @@ export class SqliteStore implements Store {
    * enabled. Always parse and validate the returned string (e.g., JSON.parse with
    * schema validation) rather than trusting it blindly.
    *
+   * ARCH-09 cross-reference: See security_audit_team10 ARCH-09 for full analysis.
    * M-35 WARNING: TTL enforcement relies on system clock integrity (Date.now()).
    * An attacker with clock manipulation access (e.g., NTP spoofing or direct
    * clock adjustment) can bypass TTL-based spending and rate limits by setting
@@ -834,6 +863,21 @@ export class SqliteStore implements Store {
 
   /** Close the database connection */
   close(): void {
+    this.db.close();
+  }
+
+  /**
+   * T1-F5 fix: Destroy the SqliteStore by zeroing the HMAC key material and closing
+   * the database connection. After calling destroy(), the store should not be used
+   * for counter operations (HMAC verification will fail).
+   */
+  destroy(): void {
+    // T1-F5 fix: Zero the HMAC key material using Buffer.fill(0) for reliable in-place
+    // zeroization. Unlike strings, Buffer.fill(0) overwrites the underlying ArrayBuffer
+    // bytes directly, preventing recovery from heap dumps or core dumps.
+    if (this.hmacKey) {
+      this.hmacKey.fill(0);
+    }
     this.db.close();
   }
 

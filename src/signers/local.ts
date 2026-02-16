@@ -8,6 +8,7 @@
  * This signer holds private key material in plaintext V8 heap memory. Two fundamental
  * limitations make it unsuitable for production use:
  *
+ * ARCH-14 cross-reference: See security_audit_team10 ARCH-14 for full analysis.
  * 1. V8 GC defeats key zeroization (CRIT-T1-01):
  *    destroy() zeroes the primary TypedArray buffer, but V8's garbage collector may
  *    have created copies of the key material during:
@@ -77,7 +78,13 @@ export class LocalSigner implements Signer {
     // CRIT-T1-04 fix: Block LocalSigner in production unless explicitly opted in.
     // Mirrors the MemoryStore pattern. LocalSigner holds private keys in plaintext
     // process memory which is unsafe for production use with real funds.
-    if (typeof process !== "undefined" && process.env.NODE_ENV !== "test") {
+    // T6-F4 fix: Use dedicated KOVA_ALLOW_LOCAL_SIGNER env var instead of relying solely
+    // on NODE_ENV=test. Previously, setting NODE_ENV=test in production would bypass this
+    // guard entirely. A dedicated env var is harder to accidentally set.
+    const allowedByEnv = typeof process !== "undefined" && (
+      process.env.NODE_ENV === "test" || process.env.KOVA_ALLOW_LOCAL_SIGNER === "1"
+    );
+    if (typeof process !== "undefined" && !allowedByEnv) {
       if (!config?.dangerouslyAllowInProduction) {
         throw new Error(
           "LocalSigner is not safe for production use (private key in plaintext memory). " +
@@ -121,7 +128,7 @@ export class LocalSigner implements Signer {
     // CRYPTO-010 fix: Verify that the reconstructed keypair has the same public key.
     // Detects corruption in the clone/reconstruction process.
     if (this.keypair.publicKey.toBase58() !== keypair.publicKey.toBase58()) {
-      this.keypair = null as any;
+      this.keypair = null;
       this.destroyed = true;
       throw new Error("LocalSigner: reconstructed keypair has different public key (possible corruption)");
     }

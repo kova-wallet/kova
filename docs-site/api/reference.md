@@ -110,7 +110,7 @@ const result = await wallet.handleToolCall("wallet_get_balance", { token: "SOL" 
 Return tool definitions in Anthropic Messages API format.
 
 ```typescript
-// Convert kova's 8 wallet tools to Anthropic's format (uses input_schema).
+// Convert kova's wallet tools to Anthropic's format (uses input_schema).
 // Pass the result directly to anthropic.messages.create({ tools }).
 const tools = wallet.toAnthropicTools();
 // Pass directly to anthropic.messages.create({ tools })
@@ -121,7 +121,7 @@ const tools = wallet.toAnthropicTools();
 Return tool definitions in OpenAI function calling format.
 
 ```typescript
-// Convert kova's 8 wallet tools to OpenAI's format (uses { type: "function", function: {...} }).
+// Convert kova's wallet tools to OpenAI's format (uses { type: "function", function: {...} }).
 // Pass the result directly to openai.chat.completions.create({ tools }).
 const tools = wallet.toOpenAITools();
 // Pass directly to openai.chat.completions.create({ tools })
@@ -1139,7 +1139,7 @@ interface ToolCallResult {
 Array of all built-in wallet tool definitions.
 
 ```typescript
-// Import the complete array of all 8 wallet tool definitions.
+// Import the complete array of all wallet tool definitions (6 safe by default, 2 dangerous opt-in).
 // Use these to build custom AI integrations for providers not natively supported.
 import { WALLET_TOOLS } from "kova";
 // ToolDefinition[]

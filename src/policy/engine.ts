@@ -6,6 +6,7 @@
  * S6 enhancement: Returns PolicyEvaluationResult with per-rule audit data.
  * S6 enhancement: Wraps each rule.evaluate() in try/catch for fail-closed behavior.
  *
+ * CONC-13 cross-reference: See security_audit_team9 CONC-13 for full analysis.
  * M-53 NOTE — STORE OPERATION TIMEOUTS:
  * Store operations (get, set, increment) in the critical evaluation path could block
  * indefinitely if the underlying store implementation hangs (e.g., SQLite lock contention,
@@ -16,6 +17,7 @@
  * will then correctly DENY the transaction rather than hanging forever. Alternatively,
  * wrap the entire evaluate() call in a Promise.race() with a timeout at the wallet level.
  *
+ * ARCH-17 cross-reference: See security_audit_team10 ARCH-17 for full analysis.
  * M-57 NOTE — TIMING SIDE-CHANNEL IN POLICY EVALUATION:
  * The number of rules evaluated can be inferred from timing differences in the evaluate()
  * response time. An attacker observing evaluation latency could determine how many rules
@@ -52,6 +54,7 @@ export class PolicyEngine {
    * CRIT-03 fix: Optional function to convert token amounts to USD.
    * Injected by the wallet from the chain adapter, enabling USD-normalized spending limits.
    *
+   * ARCH-04 cross-reference: See security_audit_team10 ARCH-04 for full analysis.
    * POLICY-013 WARNING: This function depends on an external price oracle (e.g., Jupiter
    * Price API, CoinGecko, Pyth). Price oracle manipulation is a known risk vector:
    * - An attacker who controls or manipulates the price feed could report artificially low
@@ -80,7 +83,10 @@ export class PolicyEngine {
       );
     }
     // MED-06 fix: Freeze a defensive copy to prevent external mutation of the rules array
-    this.rules = Object.freeze([...rules]) as PolicyRule[];
+    // MED-T3-08 fix: Deep-freeze individual rule objects to prevent mutation by code
+    // retaining references. Object.freeze() on the array is shallow — individual rule
+    // objects could still be mutated without this.
+    this.rules = Object.freeze([...rules].map((rule) => Object.freeze(rule))) as PolicyRule[];
     this.store = store;
     this.approval = approval;
     this.getValueInUSD = getValueInUSD;
@@ -280,6 +286,11 @@ export class PolicyEngine {
       }
     }
 
+    // CRIT-T3-01 fix: All rules passed — flush buffered appends to the real store.
+    // This ensures sliding window log entries are only persisted when the entire
+    // policy evaluation succeeds, preventing phantom entries from denied transactions.
+    await trackingStore.commitAppends();
+
     const totalMs = performance.now() - totalStart;
     return {
       decision: { decision: "ALLOW" },
@@ -310,6 +321,7 @@ export class PolicyEngine {
  * counter values (current real values + dry-run increments) but no state is modified
  * in the real store. If any rule denies, the overlay is simply discarded.
  *
+ * CONC-06 cross-reference: See security_audit_team9 CONC-06 for full analysis.
  * MED-T4-08 LIMITATION — TTL NOT PRESERVED FROM REAL STORE:
  * When DryRunStore reads a value from the real store, it does not capture or respect
  * the TTL (time-to-live) associated with that value. If a counter in the real store
@@ -393,6 +405,14 @@ class DryRunStore implements Store {
     const realEntries = await this.real.getRecent(key, count);
     const overlayEntries = this.listOverlay.get(key) ?? [];
     const combined = [...realEntries, ...overlayEntries];
+    // MED-T3-05 fix: Sort combined entries by timestamp in chronological order before
+    // applying the count limit. Real store and overlay entries may not be in chronological
+    // order when combined, which could cause incorrect sliding window totals during dry-run.
+    combined.sort((a, b) => {
+      const tsA = parseInt(a.slice(0, a.indexOf(":")), 10) || 0;
+      const tsB = parseInt(b.slice(0, b.indexOf(":")), 10) || 0;
+      return tsA - tsB;
+    });
     // MED-T4-05 fix: Return in reverse chronological order (newest first) to match
     // MemoryStore.getRecent() which uses .slice(-count).reverse(). Without this,
     // the ordering mismatch between DryRunStore and MemoryStore could cause
@@ -420,6 +440,18 @@ class Phase2TrackingStore implements Store {
   private readonly real: Store;
   /** Track increments for rollback: key -> total amount incremented */
   private readonly incrementedKeys: Map<string, number> = new Map();
+  /**
+   * CRIT-T3-01 fix: Buffer append() operations during Phase 2 instead of writing
+   * directly to the real store. Appends are only flushed to the real store after
+   * all rules pass (via commitAppends()). If a later rule denies during Phase 2,
+   * the buffered appends are simply discarded — no phantom entries are persisted.
+   *
+   * This prevents DoS via phantom sliding window log entries: previously, an attacker
+   * could craft intents that pass SpendingLimitRule (which appends to the sliding window
+   * log) but fail on a later rule, gradually inflating windowTotal until legitimate
+   * transactions are blocked.
+   */
+  private readonly pendingAppends: Array<{ key: string; value: string }> = [];
 
   constructor(real: Store) {
     this.real = real;
@@ -446,19 +478,44 @@ class Phase2TrackingStore implements Store {
   }
 
   async append(key: string, value: string): Promise<void> {
-    return this.real.append(key, value);
+    // CRIT-T3-01 fix: Buffer appends instead of writing to the real store.
+    // This ensures phantom sliding window entries are never persisted when
+    // a later rule denies during Phase 2.
+    this.pendingAppends.push({ key, value });
   }
 
   async getRecent(key: string, count: number): Promise<string[]> {
-    return this.real.getRecent(key, count);
+    // CRIT-T3-01 fix: Include buffered (pending) appends in getRecent results
+    // so that rules evaluated later in Phase 2 see entries from earlier rules.
+    const realEntries = await this.real.getRecent(key, count);
+    const pendingForKey = this.pendingAppends
+      .filter((p) => p.key === key)
+      .map((p) => p.value);
+    const combined = [...realEntries, ...pendingForKey];
+    return combined.slice(-count);
+  }
+
+  /**
+   * CRIT-T3-01 fix: Flush all buffered appends to the real store.
+   * Called only after all rules have passed in Phase 2.
+   */
+  async commitAppends(): Promise<void> {
+    for (const { key, value } of this.pendingAppends) {
+      await this.real.append(key, value);
+    }
+    this.pendingAppends.length = 0;
   }
 
   /**
    * Roll back all increments that were persisted during Phase 2.
+   * CRIT-T3-01 fix: Also discards all buffered appends (no flush needed on denial).
    * Best-effort: individual rollback failures are swallowed (safe direction:
    * counters remain inflated, which means under-counting remaining budget).
    */
   async rollbackAll(): Promise<void> {
+    // Discard buffered appends — they were never written to the real store
+    this.pendingAppends.length = 0;
+
     for (const [key, amount] of this.incrementedKeys) {
       try {
         const newValue = await this.real.increment(key, -amount);

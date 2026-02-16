@@ -45,7 +45,17 @@ export interface PolicyContext {
   getValueInUSD?: (token: string, amount: string) => Promise<number>;
 }
 
-/** A single policy rule that can evaluate a transaction intent */
+/**
+ * A single policy rule that can evaluate a transaction intent.
+ *
+ * CONC-20 NOTE — DOUBLE INVOCATION:
+ * The PolicyEngine uses two-phase evaluation (H-09/M-01 fix). For ALLOWED
+ * transactions, evaluate() is called TWICE per intent: once in Phase 1 (dry-run
+ * with DryRunStore) and once in Phase 2 (commit with real store). Custom rule
+ * implementations with external side effects (API calls, logging, notifications)
+ * should be idempotent or check whether the store is a DryRunStore to avoid
+ * duplicate side effects. See security_audit_team9 CONC-20.
+ */
 export interface PolicyRule {
   /** Unique name for this rule (used in audit logs and error messages) */
   name: string;

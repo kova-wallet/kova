@@ -19,7 +19,9 @@
  * Run: npx tsx examples/telegram-approval/index.ts
  */
 
-import { Keypair } from "@solana/web3.js";
+import { Connection, Keypair } from "@solana/web3.js";
+import { loadOrCreateKeypair, ensureDevnetSol } from "../utils.js";
+import type { PolicyRule } from "../../src/index.js";
 import {
   AgentWallet,
   Policy,
@@ -61,7 +63,11 @@ if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
 // ── Configuration ───────────────────────────────────────────────────────────
 
 const RPC_URL = process.env.SOLANA_RPC_URL ?? "https://api.devnet.solana.com";
-const RECIPIENT = process.env.RECIPIENT_ADDRESS ?? "11111111111111111111111111111111";
+// NET-06 fix: Generate a random keypair address instead of using the Solana System Program
+// address as default. The System Program address (111...1) is a dangerous default because
+// funds sent to it would be permanently lost. Using a random address is safer — the transfer
+// will fail with a "recipient not found" error rather than burning funds.
+const RECIPIENT = process.env.RECIPIENT_ADDRESS ?? Keypair.generate().publicKey.toBase58();
 
 // ── Main ────────────────────────────────────────────────────────────────────
 
@@ -76,9 +82,12 @@ async function main() {
   });
   console.log("Telegram approval bot configured.");
 
-  // 2. Create a keypair
-  const keypair = Keypair.generate();
+  // 2. Load persistent keypair and airdrop devnet SOL
+  const keypair = loadOrCreateKeypair();
   console.log(`Wallet address: ${keypair.publicKey.toBase58()}`);
+
+  const connection = new Connection(RPC_URL, "confirmed");
+  await ensureDevnetSol(connection, keypair);
 
   // 3. Build a policy with an approval gate
   //    - Transactions above 0.3 SOL require Telegram approval
@@ -97,9 +106,11 @@ async function main() {
     .build();
 
   // 4. Build the PolicyEngine with the approval channel
-  const store = new MemoryStore();
+  // T6-F5 fix: Pass dangerouslyAllowInProduction to allow MemoryStore usage in examples.
+  // Production deployments should use SqliteStore with encryption instead.
+  const store = new MemoryStore({ dangerouslyAllowInProduction: true });
   const config = policy.toJSON();
-  const rules = [];
+  const rules: PolicyRule[] = [];
 
   if (config.spendingLimit) {
     rules.push(new SpendingLimitRule(config.spendingLimit));
@@ -116,7 +127,9 @@ async function main() {
 
   // 5. Create the wallet
   const wallet = new AgentWallet({
-    signer: new LocalSigner(keypair),
+    // T6-F5 fix: Pass dangerouslyAllowInProduction to allow LocalSigner usage in examples.
+    // Production deployments should use MpcSigner with a hardware-backed provider instead.
+    signer: new LocalSigner(keypair, { dangerouslyAllowInProduction: true }),
     chain: new SolanaAdapter({ rpcUrl: RPC_URL }),
     policy: engine,
     store,

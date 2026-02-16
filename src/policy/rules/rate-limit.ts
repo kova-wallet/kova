@@ -117,10 +117,13 @@ export class RateLimitRule implements PolicyRule {
 
         if (newCount > this.config.maxTransactionsPerMinute) {
           await this.rollbackIncrements(context, incrementedKeys);
+          // MED-T3-07 fix: Use generic denial message consistent with SpendingLimitRule's
+          // M-61 pattern. Previously leaked exact counter values and configured limits
+          // (e.g., "6/5 transactions per minute"), revealing configuration details.
           return {
             decision: "DENY",
             rule: this.name,
-            reason: `Rate limit exceeded: ${newCount}/${this.config.maxTransactionsPerMinute} transactions per minute`,
+            reason: "Rate limit exceeded",
           };
         }
       }
@@ -134,10 +137,11 @@ export class RateLimitRule implements PolicyRule {
 
         if (newCount > this.config.maxTransactionsPerHour) {
           await this.rollbackIncrements(context, incrementedKeys);
+          // MED-T3-07 fix: Generic denial message (see above)
           return {
             decision: "DENY",
             rule: this.name,
-            reason: `Rate limit exceeded: ${newCount}/${this.config.maxTransactionsPerHour} transactions per hour`,
+            reason: "Rate limit exceeded",
           };
         }
       }

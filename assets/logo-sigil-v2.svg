@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <!--
+    KOVA Logo — "Sigil Refined"
+    Team 4 (round 2): Designer Lena Jørgensen × Branding Specialist Kai Okonkwo
+
+    Evolution: The original Sigil was bold and heavy — thick 42px strokes
+    with round caps on a dark rounded square. This refinement is more
+    ELEGANT and OPEN.
+
+    Key changes:
+    1. Circular container — feels more like a mark/seal than an app icon
+    2. Thinner strokes (30px) — more refined, more whitespace, breathes
+    3. The center diamond is now FILLED with a gradient, making it the
+       hero element instead of a faint hint. It's the jewel at the center.
+    4. Glowing endpoint dots give it a "constellation" quality
+    5. A faint ring connects the endpoints, suggesting an orbital system
+
+    Where the original was a bold code stamp, this is a precision
+    instrument — a seal of quality for discerning developers.
+
+    Audience signal: Refined, premium SDK, design-conscious developers.
+    Best for: Landing page hero, social avatar, letterhead, stickers.
+  -->
+  <defs>
+    <linearGradient id="sr-left" x1="310" y1="122" x2="166" y2="256" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#a5b4fc"/>
+      <stop offset="1" stop-color="#6366f1"/>
+    </linearGradient>
+    <linearGradient id="sr-right" x1="202" y1="122" x2="346" y2="256" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#67e8f9"/>
+      <stop offset="1" stop-color="#06b6d4"/>
+    </linearGradient>
+    <linearGradient id="sr-diamond" x1="166" y1="256" x2="346" y2="256" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#6366f1"/>
+      <stop offset="0.5" stop-color="#818cf8"/>
+      <stop offset="1" stop-color="#22d3ee"/>
+    </linearGradient>
+    <filter id="sr-glow">
+      <feGaussianBlur stdDeviation="5" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Circular background -->
+  <circle cx="256" cy="256" r="248" fill="#0c0a20"/>
+  <circle cx="256" cy="256" r="246" fill="none" stroke="#4f46e5" stroke-width="1.5" opacity="0.1"/>
+
+  <!-- Faint orbital ring connecting the 4 endpoints -->
+  <!-- Endpoints: (310,122), (202,122), (310,390), (202,390) -->
+  <!-- These sit on an ellipse centered at (256,256) -->
+  <ellipse cx="256" cy="256" rx="148" ry="168" fill="none" stroke="#4f46e5" stroke-width="1" opacity="0.06" stroke-dasharray="4 8"/>
+
+  <!-- Left bracket < (indigo) — thinner, sharper -->
+  <path d="M310,122 L166,256 L310,390"
+        stroke="url(#sr-left)" stroke-width="30"
+        stroke-linecap="round" stroke-linejoin="miter"/>
+
+  <!-- Right bracket > (cyan) — thinner, sharper -->
+  <path d="M202,122 L346,256 L202,390"
+        stroke="url(#sr-right)" stroke-width="30"
+        stroke-linecap="round" stroke-linejoin="miter"/>
+
+  <!-- Center diamond — FILLED, the hero element -->
+  <!-- Crossings at (256,172) and (256,340); tips at (166,256) and (346,256) -->
+  <polygon points="166,256 256,172 346,256 256,340" fill="url(#sr-diamond)" opacity="0.18"/>
+  <polygon points="166,256 256,172 346,256 256,340" fill="none" stroke="white" stroke-width="1" opacity="0.12"/>
+
+  <!-- Inner diamond (brighter core) -->
+  <polygon points="200,256 256,208 312,256 256,304" fill="white" opacity="0.06"/>
+
+  <!-- Endpoint constellation dots -->
+  <g filter="url(#sr-glow)">
+    <circle cx="310" cy="122" r="5" fill="#a5b4fc"/>
+    <circle cx="310" cy="390" r="5" fill="#818cf8"/>
+    <circle cx="202" cy="122" r="5" fill="#67e8f9"/>
+    <circle cx="202" cy="390" r="5" fill="#06b6d4"/>
+  </g>
+
+  <!-- Center keystone dot -->
+  <circle cx="256" cy="256" r="7" fill="white" opacity="0.95"/>
+</svg>

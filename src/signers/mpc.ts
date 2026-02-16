@@ -42,8 +42,10 @@ export interface MpcSigningProvider {
   /**
    * Sign raw transaction bytes using MPC.
    * Must return both the fully-assembled signed transaction and the raw signature.
+   * NET-11 fix: Accepts an optional AbortSignal for cooperative cancellation on timeout.
+   * Providers should check signal.aborted and abort in-flight HTTP requests when signalled.
    */
-  signTransaction(transactionData: Uint8Array): Promise<MpcSignResult>;
+  signTransaction(transactionData: Uint8Array, signal?: AbortSignal): Promise<MpcSignResult>;
 
   /** Check if the provider is reachable and the signing key is available */
   healthCheck(): Promise<boolean>;
@@ -386,9 +388,12 @@ export class MpcSigner implements Signer {
     // CRYPTO-001 fix: Defensive copy of transaction data before passing to provider
     // to prevent the provider from mutating the original buffer (TOCTOU prevention).
     const dataCopy = new Uint8Array(transaction.data);
-    const result = await this.withRetry(() =>
-      this.withTimeout(this.provider.signTransaction(dataCopy)),
-    );
+    // NET-11 fix: Each retry attempt gets a fresh AbortController so the provider
+    // can be signalled to cancel in-flight HTTP requests on timeout.
+    const result = await this.withRetry(() => {
+      const ctrl = new AbortController();
+      return this.withTimeout(this.provider.signTransaction(dataCopy, ctrl.signal), ctrl);
+    });
 
     // HIGH-T1-05 fix: Re-check destroyed state after the async signing call.
     // Between the initial check and the provider response, another caller may
@@ -853,20 +858,19 @@ export class MpcSigner implements Signer {
    * CRYPTO-008 fix: Use .finally() to guarantee the timer is always cleared,
    * preventing timer and promise reference leaks regardless of resolution path.
    *
-   * HIGH-T1-02: TIMEOUT CANCELLATION LIMITATION — When this timeout fires, the
-   * Promise.race resolves with the timeout error, but the underlying HTTP request
-   * to the MPC provider continues executing in the background. The provider's
-   * signTransaction() call is NOT cancelled — it may still complete, consume
-   * resources, or hold open connections. To fully cancel the provider call,
-   * MpcSigningProvider.signTransaction() should accept an AbortSignal parameter,
-   * and this method should create and abort an AbortController on timeout.
-   * TODO: Add AbortController-based cancellation in a future version.
+   * NET-11 fix: Accepts an optional AbortController. When the timeout fires,
+   * controller.abort() is called to signal cooperative cancellation to the
+   * underlying provider call (e.g., aborting in-flight HTTP requests). Providers
+   * that accept an AbortSignal in signTransaction() can use it to cancel work
+   * and release resources immediately instead of running to completion in the background.
    */
-  private withTimeout<T>(promise: Promise<T>): Promise<T> {
+  private withTimeout<T>(promise: Promise<T>, abortController?: AbortController): Promise<T> {
     let timer: ReturnType<typeof setTimeout> | undefined;
 
     const timeoutPromise = new Promise<never>((_resolve, reject) => {
       timer = setTimeout(() => {
+        // NET-11 fix: Signal the provider to abort in-flight work on timeout
+        abortController?.abort();
         reject(
           new MpcSignerError(
             "TIMEOUT",

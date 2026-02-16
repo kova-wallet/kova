@@ -13,6 +13,19 @@
  * should sanitize metadata before logging to avoid leaking sensitive information
  * (e.g., private keys, full transaction payloads, recipient addresses) to stderr.
  * This is tracked as STORE-009 and should be addressed in wallet.ts.
+ *
+ * ARCH-05 KNOWN LIMITATION — HASH CHAIN RESILIENCE:
+ * The audit hash chain is a LINEAR chain where each entry includes the hash of the
+ * previous entry. If any single entry is corrupted or deleted, the entire chain from
+ * that point forward becomes unverifiable. There is no redundancy, checkpointing, or
+ * ability to verify entries independently. Additionally, HMAC key rotation creates a
+ * discontinuity — the old chain must be verified with the old key and the new chain
+ * has no linkage to the old one (see L-16 NOTE in AuditLoggerConfig.hmacKey).
+ * For higher resilience, consider:
+ *   1. Periodic Merkle tree checkpoints (every N entries) for sub-chain verification
+ *   2. Redundant external hash log (e.g., write hashes to a separate append-only store)
+ *   3. Overlapping HMAC key rotation with dual-signing during transition
+ * See security_audit_team10 ARCH-05 for full analysis.
  */
 
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
@@ -58,6 +71,14 @@ export interface AuditLoggerConfig {
    * works without a token for backwards compatibility.
    */
   resetToken?: string;
+  /**
+   * MED-T3-09 fix: Separate token required for the destructive clear() operation.
+   * When set, clear() must be called with this token. This prevents the operational
+   * resetToken (used for routine resetFailureCount()) from also granting the
+   * higher-privilege ability to destroy the entire audit log. If not set, clear()
+   * falls back to using resetToken for backwards compatibility.
+   */
+  clearToken?: string;
   /**
    * STORE-010 fix: Callback invoked when the hash chain is reset (previous hash
    * missing or corrupted). Allows callers to implement custom alerting or logging
@@ -195,6 +216,8 @@ export class AuditLogger {
   private logLock: Promise<void> = Promise.resolve();
   /** STORE-007 fix: Optional token for authenticated circuit breaker reset */
   private readonly resetToken?: string;
+  /** MED-T3-09 fix: Separate higher-privilege token for destructive clear() operation */
+  private readonly clearToken?: string;
   /** STORE-010 fix: Optional callback for hash chain reset events */
   private readonly onHashChainReset?: (reason: string) => void;
   /** M-42 fix: Flag to prevent use after destroy() — avoids silent HMAC-to-SHA256 degradation */
@@ -259,6 +282,8 @@ export class AuditLogger {
       }
       // STORE-007 fix: Store reset token if provided
       this.resetToken = config.resetToken;
+      // MED-T3-09 fix: Store separate clear token if provided
+      this.clearToken = config.clearToken;
       // STORE-010 fix: Store hash chain reset callback if provided
       this.onHashChainReset = config.onHashChainReset;
     }
@@ -336,10 +361,31 @@ export class AuditLogger {
     }
 
     // MED-12 fix: Serialize log() calls to prevent concurrent writes corrupting the hash chain
+    // CONC-10 fix: Add a timeout to mutex acquisition. Without this, a hung store operation
+    // in logInternal() could hold the mutex indefinitely, cascading into total wallet
+    // paralysis (since execute() calls log() under the execute mutex). The 10-second timeout
+    // ensures the audit mutex releases before the wallet's 30-second execute mutex timeout,
+    // preventing asymmetric timeout cascades.
     let releaseLock: () => void;
     const previousLock = this.logLock;
     this.logLock = new Promise<void>((resolve) => { releaseLock = resolve; });
-    await previousLock;
+
+    const AUDIT_MUTEX_TIMEOUT_MS = 10_000;
+    const lockResult = await Promise.race([
+      previousLock.then(() => "acquired" as const),
+      new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), AUDIT_MUTEX_TIMEOUT_MS)),
+    ]);
+
+    if (lockResult === "timeout") {
+      releaseLock!();
+      // CONC-10 fix: Increment failure counter on timeout. This will eventually
+      // trigger the audit circuit breaker (AuditCircuitOpenError) if timeouts persist.
+      this.consecutiveFailures++;
+      throw new Error(
+        "AuditLogger: mutex acquisition timed out after 10 seconds. " +
+        "A previous log() call may be hung on a store operation.",
+      );
+    }
 
     try {
       return await this.logInternal(entry);
@@ -367,7 +413,16 @@ export class AuditLogger {
     return hash.digest("hex");
   }
 
-  /** Internal log implementation (called under mutex) */
+  /**
+   * Internal log implementation (called under mutex).
+   *
+   * CONC-17 NOTE: The append() + set(entryCountKey) sequence below is NOT atomic.
+   * If the process is killed between append() and set(), the entry count will be
+   * stale, and the hash chain's last_hash won't match the most recent entry's hash
+   * for the next append. verifyIntegrity() will detect this on next run. For
+   * production deployments, consider wrapping both operations in a store-level
+   * transaction (SqliteStore supports this internally). See security_audit_team9 CONC-17.
+   */
   private async logInternal(entry: AuditEntry): Promise<boolean> {
     try {
       // CRIT-04 fix: Ensure sequence state is initialized from persisted store
@@ -576,19 +631,23 @@ export class AuditLogger {
 
   /** MED-T5-02 fix: Internal clear implementation (called under mutex) */
   private async clearInternal(token?: string): Promise<void> {
-    // Require reset token if configured
-    if (this.resetToken) {
+    // MED-T3-09 fix: Use the separate clearToken if configured, otherwise fall back
+    // to resetToken for backwards compatibility. This separates the operational
+    // privilege (resetting the circuit breaker) from the admin privilege (destroying
+    // the audit log), preventing a routine reset token from being used to clear logs.
+    const requiredToken = this.clearToken ?? this.resetToken;
+    if (requiredToken) {
       if (!token) {
         throw new Error(
-          "AuditLogger.clear: reset token required. Clearing the audit log is a destructive " +
-          "operation that requires authentication via the configured resetToken.",
+          "AuditLogger.clear: clear token required. Clearing the audit log is a destructive " +
+          "operation that requires authentication via the configured clearToken (or resetToken).",
         );
       }
       const tokenBuffer = Buffer.from(token);
-      const expectedBuffer = Buffer.from(this.resetToken);
+      const expectedBuffer = Buffer.from(requiredToken);
       if (tokenBuffer.length !== expectedBuffer.length || !timingSafeEqual(tokenBuffer, expectedBuffer)) {
         throw new Error(
-          "AuditLogger.clear: invalid reset token. Audit log clear rejected.",
+          "AuditLogger.clear: invalid clear token. Audit log clear rejected.",
         );
       }
     }

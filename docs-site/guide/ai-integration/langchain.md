@@ -38,15 +38,15 @@ The `createLangChainTools(wallet)` function takes an `AgentWallet` instance and 
 
 ```typescript
 // Import the createLangChainTools function from kova.
-// This converts the 8 wallet tools into a format compatible with LangChain.
+// This converts the wallet tools (6 safe by default) into a format compatible with LangChain.
 import { createLangChainTools } from "kova";
 
 // Generate LangChain-compatible tool definitions from the wallet.
 // Each tool has a name, description, schema, and a call() method.
 const walletTools = createLangChainTools(wallet);
 
-// All 8 wallet tools are included.
-console.log(walletTools.length); // 8
+// 6 safe wallet tools are included by default (2 dangerous tools are opt-in).
+console.log(walletTools.length); // 6
 
 // Inspect the first tool to see the LangChain-compatible format.
 // Note: LangChain uses "schema" instead of "parameters" or "input_schema".
@@ -102,8 +102,11 @@ import {
 } from "kova";
 
 // Set up the wallet with a spending limit policy.
-const store = new MemoryStore();
-const signer = new LocalSigner({ privateKey: process.env.WALLET_PRIVATE_KEY! });
+import { Keypair } from "@solana/web3.js";
+import bs58 from "bs58";
+const store = new MemoryStore({ dangerouslyAllowInProduction: true });
+const keypair = Keypair.fromSecretKey(bs58.decode(process.env.WALLET_PRIVATE_KEY!));
+const signer = new LocalSigner(keypair, { dangerouslyAllowInProduction: true });
 const chain = new SolanaAdapter({ rpcUrl: process.env.SOLANA_RPC_URL! });
 
 // Define spending limits that the LangChain agent must respect.
@@ -177,8 +180,9 @@ import {
 } from "kova";
 
 // --- Wallet setup ---
-const store = new MemoryStore();
-const signer = new LocalSigner({ privateKey: process.env.WALLET_PRIVATE_KEY! });
+const store = new MemoryStore({ dangerouslyAllowInProduction: true });
+const keypair = Keypair.fromSecretKey(bs58.decode(process.env.WALLET_PRIVATE_KEY!));
+const signer = new LocalSigner(keypair, { dangerouslyAllowInProduction: true });
 const chain = new SolanaAdapter({ rpcUrl: process.env.SOLANA_RPC_URL! });
 
 // Define policy rules: spending limits + address allowlist.
@@ -317,7 +321,7 @@ import { ChatAnthropic } from "@langchain/anthropic";
 // Create a ChatAnthropic LLM instance.
 // Requires ANTHROPIC_API_KEY to be set in the environment.
 const llm = new ChatAnthropic({
-  model: "claude-sonnet-4-20250514", // Claude model that supports tool calling
+  model: "claude-sonnet-4-5-20250929", // Claude model that supports tool calling
   temperature: 0,                    // Deterministic output
 });
 

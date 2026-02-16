@@ -65,32 +65,44 @@ export class TimeWindowRule implements PolicyRule {
     }
 
     // Outside active hours
-    // LOW-04 note: When outsideHoursPolicy is "require_approval", this rule returns
-    // DENY (not PENDING) because the TimeWindowRule itself does not handle approval
-    // workflows. The approval flow is managed by the separate ApprovalGateRule which
-    // returns PENDING and interacts with the ApprovalChannel. The DENY here with
-    // a descriptive reason signals to the caller that approval is needed, and the
-    // caller (or a wrapping rule) should initiate the approval flow. This naming
-    // in the config ("require_approval") is potentially confusing since the rule
-    // actually denies — consider renaming to "deny_with_approval_hint" in v2.
-    //
-    // LOW-T4-01 fix: Documentation clarification — "require_approval" is misleading.
-    // Despite the name, this option behaves IDENTICALLY to "deny": both return a DENY
-    // decision. The only difference is the reason string ("requires approval" vs
-    // "denied"). TimeWindowRule has no integration with ApprovalChannel and cannot
-    // return PENDING or initiate an approval workflow. To actually gate transactions
-    // through human approval outside active hours, combine TimeWindowRule with a
-    // separate ApprovalGateRule in the policy rule chain.
-    //
-    // @deprecated The "require_approval" option behaves identically to "deny" and may
-    // be changed in a future version to actually gate through the approval system.
-    // Until then, use "deny" for clarity, or pair with ApprovalGateRule for real
-    // approval-gated behavior outside active hours.
+    // MED-T3-02 fix: When outsideHoursPolicy is "require_approval", actually request
+    // human approval through the approval channel if one is available. Previously,
+    // this option behaved identically to "deny", which was misleading. Now it properly
+    // integrates with the ApprovalChannel to gate transactions outside active hours.
     if (this.config.outsideHoursPolicy === "require_approval") {
+      if (context.approval) {
+        try {
+          const result = await context.approval.requestApproval({
+            id: crypto.randomUUID(),
+            summary: `${_intent.type} transaction outside active hours`,
+            amount: "N/A",
+            token: "N/A",
+            target: "N/A",
+            reason: "Transaction attempted outside active hours — requires manual approval",
+            expiresAt: context.now + 300_000, // 5 minute timeout
+          });
+          if (result.decision === "approved") {
+            return { decision: "ALLOW" };
+          }
+          return {
+            decision: "DENY",
+            rule: this.name,
+            reason: `Transaction outside active hours was ${result.decision === "timeout" ? "not approved in time" : "rejected by approver"}`,
+          };
+        } catch {
+          // Fail-closed on approval channel errors
+          return {
+            decision: "DENY",
+            rule: this.name,
+            reason: "Transaction outside active hours: approval channel error",
+          };
+        }
+      }
+      // No approval channel available — fall through to DENY
       return {
         decision: "DENY",
         rule: this.name,
-        reason: "Transaction requires approval outside active hours",
+        reason: "Transaction requires approval outside active hours, but no approval channel is configured",
       };
     }
 

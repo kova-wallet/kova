@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <!--
+    KOVA Logo — "Aegis Noir"
+    Team 1 (round 2): Designer Elina Voss × Branding Specialist Marcus Chen
+
+    Evolution: The original Aegis was institutional — filled shield, solid
+    white K, bright and confident. This inversion is its DARK TWIN.
+
+    The shield is hollow and near-black, outlined with a faint indigo edge.
+    The K is not a solid fill but a luminous WIREFRAME — a glowing outline
+    that feels like a holographic security scan or a HUD projection.
+    The junction pulses with a cyan glow instead of a checkmark.
+
+    Where the original says "We are a fortress," the Noir says
+    "We are watching. We see everything. Nothing gets through."
+
+    Audience signal: Cybersecurity, dark-mode native, premium dev tooling.
+    Best for: Dark UIs, terminal themes, security dashboards, hacker conferences.
+  -->
+  <defs>
+    <linearGradient id="an-shield-edge" x1="256" y1="28" x2="256" y2="490" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#6366f1"/>
+      <stop offset="1" stop-color="#312e81"/>
+    </linearGradient>
+    <linearGradient id="an-k-stroke" x1="180" y1="148" x2="352" y2="384" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#a5b4fc"/>
+      <stop offset="0.5" stop-color="#6366f1"/>
+      <stop offset="1" stop-color="#22d3ee"/>
+    </linearGradient>
+    <filter id="an-glow">
+      <feGaussianBlur stdDeviation="6" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="an-glow-strong">
+      <feGaussianBlur stdDeviation="10" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <radialGradient id="an-junction" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#22d3ee" stop-opacity="0.6"/>
+      <stop offset="100%" stop-color="#22d3ee" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- Dark shield body -->
+  <path d="M256 28 C186 28 76 66 62 110 L62 300 C62 406 152 460 256 490 C360 460 450 406 450 300 L450 110 C436 66 326 28 256 28Z" fill="#0a0820"/>
+
+  <!-- Shield border (subtle glow) -->
+  <path d="M256 28 C186 28 76 66 62 110 L62 300 C62 406 152 460 256 490 C360 460 450 406 450 300 L450 110 C436 66 326 28 256 28Z" fill="none" stroke="url(#an-shield-edge)" stroke-width="2.5" opacity="0.45"/>
+
+  <!-- Inner shield outline (second ring, fainter) -->
+  <path d="M256 52 C198 52 102 84 90 122 L90 294 C90 388 170 436 256 464 C342 436 422 388 422 294 L422 122 C410 84 314 52 256 52Z" fill="none" stroke="#4f46e5" stroke-width="1" opacity="0.12"/>
+
+  <!-- Scan lines (digital/HUD feel) -->
+  <g stroke="#6366f1" stroke-width="0.5" opacity="0.05">
+    <line x1="80" y1="180" x2="432" y2="180"/>
+    <line x1="76" y1="216" x2="436" y2="216"/>
+    <line x1="74" y1="252" x2="438" y2="252"/>
+    <line x1="76" y1="288" x2="436" y2="288"/>
+    <line x1="80" y1="324" x2="432" y2="324"/>
+    <line x1="86" y1="360" x2="426" y2="360"/>
+  </g>
+
+  <!-- K wireframe — blurred glow layer (behind) -->
+  <path d="M180 148 L220 148 L220 232 L316 148 L352 148 L240 262 L352 384 L316 384 L220 292 L220 384 L180 384Z"
+        fill="none" stroke="#6366f1" stroke-width="8" stroke-linejoin="round" opacity="0.25"
+        filter="url(#an-glow)"/>
+
+  <!-- K wireframe — sharp layer (on top) -->
+  <path d="M180 148 L220 148 L220 232 L316 148 L352 148 L240 262 L352 384 L316 384 L220 292 L220 384 L180 384Z"
+        fill="none" stroke="url(#an-k-stroke)" stroke-width="3.5" stroke-linejoin="round"
+        filter="url(#an-glow)"/>
+
+  <!-- Junction glow (radial) -->
+  <circle cx="240" cy="262" r="36" fill="url(#an-junction)"/>
+
+  <!-- Junction point -->
+  <circle cx="240" cy="262" r="8" fill="#22d3ee" filter="url(#an-glow-strong)"/>
+  <circle cx="240" cy="262" r="3.5" fill="white"/>
+</svg>

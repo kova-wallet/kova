@@ -140,6 +140,13 @@ interface DnsCacheEntry {
   family: 4 | 6;
   resolvedAt: number;
 }
+/**
+ * CONC-02 KNOWN LIMITATION: This DNS cache is module-level and shared across ALL
+ * SolanaAdapter instances within the same Node.js process. A compromised DNS
+ * response cached by one adapter affects all wallets' SSRF protection. This is
+ * acceptable for the primary single-wallet deployment model. For multi-wallet
+ * isolation, use separate processes or worker_threads.
+ */
 const dnsCache = new Map<string, DnsCacheEntry>();
 const DNS_CACHE_TTL_MS = 60_000; // 60 seconds
 /**
@@ -421,6 +428,17 @@ function createPinnedAgent(url: string, label: string): HttpsAgent | HttpAgent {
       // Keep connections alive for efficiency, but limit pool size
       keepAlive: true,
       maxSockets: 10,
+      // NET-04 fix: Explicitly enforce minimum TLS 1.2 to prevent downgrade attacks
+      // (BEAST, POODLE). While Node.js 18+ defaults to TLS 1.2, this could be
+      // overridden via NODE_OPTIONS or build flags. Explicit enforcement ensures
+      // strong TLS for this financial application regardless of runtime config.
+      minVersion: "TLSv1.2",
+      // NET-09 fix: Configure socket pool timeouts to prevent idle connection
+      // accumulation in long-running processes. Without this, keepalive connections
+      // persist indefinitely, pinned to potentially stale IPs.
+      // Note: freeSocketTimeout is not in the Node.js AgentOptions type but is
+      // supported at runtime. We use the standard `timeout` option instead.
+      timeout: 30_000,
     });
   }
 
@@ -429,6 +447,7 @@ function createPinnedAgent(url: string, label: string): HttpsAgent | HttpAgent {
     lookup: pinnedLookup as never,
     keepAlive: true,
     maxSockets: 10,
+    timeout: 30_000,
   });
 }
 
@@ -452,6 +471,15 @@ export class SolanaAdapter implements ChainAdapter {
    * periodically re-warm it to catch DNS changes proactively.
    */
   private dnsValidatedAt = 0;
+  /** NET-09 fix: Reference to the pinned agent for socket pool cleanup in destroy() */
+  private pinnedAgent: HttpsAgent | HttpAgent | undefined;
+  /**
+   * T2-2.2 fix: Track hostnames resolved by this adapter instance.
+   * Used by destroy() to clear only this instance's DNS cache entries instead
+   * of clearing the entire module-level cache, which would invalidate entries
+   * for other SolanaAdapter instances in multi-tenant environments.
+   */
+  private readonly instanceHostnames = new Set<string>();
   /** DNS revalidation interval (5 minutes) — eagerly re-warms the DNS cache */
   private static readonly DNS_REVALIDATION_TTL_MS = 300_000;
 
@@ -463,13 +491,25 @@ export class SolanaAdapter implements ChainAdapter {
 
     this.config = config;
 
+    // T2-2.2 fix: Track hostnames this adapter resolves so destroy() can
+    // clear only this instance's DNS cache entries, not the entire cache.
+    try { this.instanceHostnames.add(new URL(config.rpcUrl).hostname.toLowerCase()); } catch { /* ignore */ }
+    if (config.jupiterApiUrl) {
+      try { this.instanceHostnames.add(new URL(config.jupiterApiUrl).hostname.toLowerCase()); } catch { /* ignore */ }
+    }
+    if (config.jupiterPriceApiUrl) {
+      try { this.instanceHostnames.add(new URL(config.jupiterPriceApiUrl).hostname.toLowerCase()); } catch { /* ignore */ }
+    }
+
     // CHAIN-001 fix: Create Connection with an IP-pinning HTTP agent.
     // The agent's custom `lookup` function returns only pre-validated, cached IPs
     // from our DNS cache, ensuring @solana/web3.js Connection uses the exact same
     // IP that passed our SSRF validation. This eliminates the DNS rebinding TOCTOU
     // where an attacker could return a public IP for validation then a private IP
     // for the actual HTTP request.
-    const pinnedAgent = createPinnedAgent(config.rpcUrl, "RPC");
+    // NET-09 fix: Store reference for cleanup in destroy()
+    this.pinnedAgent = createPinnedAgent(config.rpcUrl, "RPC");
+    const pinnedAgent = this.pinnedAgent;
     this.connection = new Connection(config.rpcUrl, {
       commitment: config.commitment ?? "confirmed",
       httpAgent: pinnedAgent,
@@ -1307,11 +1347,22 @@ export class SolanaAdapter implements ChainAdapter {
    * when switching RPC endpoints, or when destroying a wallet instance).
    */
   destroy(): void {
-    // Clear all entries from the module-level DNS cache.
-    // This is a conservative approach that clears the entire cache rather than
-    // trying to identify which entries belong to this specific adapter instance,
-    // since the cache is shared across all instances in the same module.
-    dnsCache.clear();
+    // T2-2.2 fix: Clear only this instance's DNS cache entries instead of the
+    // entire module-level cache. Previously, destroying one adapter invalidated
+    // DNS entries for ALL adapter instances, causing unnecessary re-resolution
+    // and potential disruption in multi-tenant environments.
+    for (const hostname of this.instanceHostnames) {
+      dnsCache.delete(hostname);
+    }
+    this.instanceHostnames.clear();
+
+    // NET-09 fix: Destroy the pinned agent's socket pool to close all keepalive
+    // connections. Without this, idle connections persist indefinitely in long-running
+    // processes, pinned to potentially stale IPs after DNS changes.
+    if (this.pinnedAgent) {
+      this.pinnedAgent.destroy();
+      this.pinnedAgent = undefined;
+    }
 
     // Reset the DNS validation timestamp so a new adapter won't skip validation
     this.dnsValidatedAt = 0;

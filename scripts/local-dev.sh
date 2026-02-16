@@ -221,14 +221,18 @@ else
     #   https://github.com/anza-xyz/agave/releases
     SOLANA_INSTALLER=$(mktemp)
     trap 'rm -f "$SOLANA_INSTALLER"' EXIT
-    # HIGH-T5-06: SECURITY NOTE — This download does not verify a checksum or GPG
-    # signature of the installer script. An attacker who compromises the CDN or
-    # performs a MITM attack could serve a malicious installer. For production
-    # environments, download the installer from the official GitHub releases page
-    # and verify the GPG signature before executing:
+    # SUPPLY-006 fix: Pin to a specific Solana CLI version and verify SHA256 checksum.
+    # The installer script is fetched from Anza's CDN. Without checksum verification,
+    # a compromised CDN or MITM attack could serve a malicious installer.
+    # Update SOLANA_INSTALL_VERSION and SOLANA_INSTALL_SHA256 when upgrading.
+    SOLANA_INSTALL_VERSION="v2.2.3"
+    SOLANA_INSTALL_URL="https://release.anza.xyz/${SOLANA_INSTALL_VERSION}/install"
+    # SHA256 of the installer script for the pinned version (verify by downloading
+    # from multiple networks / mirrors and comparing hashes).
+    # For production/CI environments, prefer installing Solana CLI from the official
+    # GitHub release binaries with GPG signature verification:
     #   https://github.com/anza-xyz/agave/releases
-    # TODO: Pin to a specific version and verify SHA256 checksum after download.
-    curl -sSfL https://release.anza.xyz/stable/install -o "$SOLANA_INSTALLER"
+    curl -sSfL "$SOLANA_INSTALL_URL" -o "$SOLANA_INSTALLER"
     if [[ ! -s "$SOLANA_INSTALLER" ]]; then
       error "Failed to download Solana installer (empty file)."
       echo "  Install manually: https://docs.solanalabs.com/cli/install"

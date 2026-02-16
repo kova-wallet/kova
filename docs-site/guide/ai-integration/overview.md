@@ -1,8 +1,8 @@
 # AI Integration Overview
 
-> **What you'll learn:** How kova exposes wallet functionality to AI agents through 8 standardized tools, how the `handleToolCall()` dispatch mechanism works, what data flows between your server and the AI model, and how errors are sanitized to prevent information leakage.
+> **What you'll learn:** How kova exposes wallet functionality to AI agents through standardized tools, how the `handleToolCall()` dispatch mechanism works, what data flows between your server and the AI model, and how errors are sanitized to prevent information leakage.
 
-kova exposes **8 tools** that AI agents can call to interact with the blockchain. These tools are framework-agnostic at their core and can be adapted to work with any AI provider -- Anthropic Claude, OpenAI, LangChain, or custom integrations.
+kova exposes **6 safe tools** by default that AI agents can call to interact with the blockchain, plus **2 dangerous tools** (`wallet_execute_custom` and `wallet_get_policy`) that must be explicitly opted into. These tools are framework-agnostic at their core and can be adapted to work with any AI provider -- Anthropic Claude, OpenAI, LangChain, or custom integrations.
 
 ::: tip New to AI tool calling?
 Modern AI models like Claude and GPT-4 can do more than generate text -- they can also call **tools** (sometimes called "functions"). A tool is a structured action the AI can request, like "check wallet balance" or "send tokens." The AI does not execute the tool itself; instead, it produces a JSON object describing which tool to call and with what parameters, and your server executes it. Think of it like a restaurant: the AI is the customer placing an order (tool call), and your server is the kitchen fulfilling it.
@@ -23,9 +23,24 @@ Modern AI models like Claude and GPT-4 can do more than generate text -- they ca
 
 The first five tools are **write operations** that go through the full policy engine pipeline (validate, policy evaluation, build, sign, broadcast, audit log). The last three are **read operations** that return data without modifying on-chain state.
 
+::: warning Dangerous Tools
+`wallet_execute_custom` and `wallet_get_policy` are classified as **dangerous tools** and are NOT included by default in `toAnthropicTools()` / `toOpenAITools()`. They must be explicitly enabled via the `enabledTools` option. `wallet_execute_custom` allows arbitrary program interactions, and `wallet_get_policy` reveals security constraints that could help an adversarial agent craft bypass attempts.
+:::
+
 ## The `handleToolCall()` Dispatch Mechanism
 
 Every tool call from an AI agent is routed through a single entry point: `wallet.handleToolCall(name, input)`. This method dispatches to the appropriate internal handler based on the tool name.
+
+::: tip Recommended: Use `safeHandleToolCall()`
+For production use, prefer `safeHandleToolCall(wallet, name, input)` over `wallet.handleToolCall(name, input)`. The safe wrapper adds:
+- **Input validation** via `validateToolInput()` — checks required fields, types, and strips unknown properties
+- **Write rate limiting** — enforces a floor of 30 write operations per minute to prevent runaway agents
+
+```typescript
+import { safeHandleToolCall } from "kova";
+const result = await safeHandleToolCall(wallet, toolName, toolInput);
+```
+:::
 
 ```typescript
 // Import the AgentWallet class, which is the main entry point for AI integrations.
@@ -47,7 +62,7 @@ const toolInput = {
 };
 
 // Dispatch the tool call to the appropriate handler inside the wallet.
-// This single method handles all 8 tools. Internally it:
+// This single method handles all wallet tools. Internally it:
 // 1. Validates the input parameters
 // 2. Builds a TransactionIntent (for write operations)
 // 3. Runs the full policy -> build -> sign -> broadcast pipeline
@@ -62,7 +77,7 @@ if (result.success) {
 }
 ```
 
-The dispatch works as a switch over all 8 tool names. If the agent calls an unknown tool name, `handleToolCall` returns an error listing the available tools:
+The dispatch works as a switch over all tool names. If the agent calls an unknown tool name, `handleToolCall` returns an error listing the available tools:
 
 ```typescript
 // Calling an unrecognized tool name returns an error with a helpful message.
@@ -171,7 +186,7 @@ To understand the data flow, it helps to see the actual JSON that gets sent to a
 **Step 1: Your server sends tool schemas to the AI model.** This is done once at the start of the conversation. The AI model uses these schemas to understand what tools are available and how to call them.
 
 ```json
-// This is one of the 8 tool schemas sent to the AI model.
+// This is one of the tool schemas sent to the AI model.
 // The model reads the "description" and "properties" to understand
 // what the tool does and what parameters it needs.
 {
@@ -274,7 +289,7 @@ You can access the raw canonical definitions directly:
 // Import the tool definition constants from kova.
 import { WALLET_TOOLS, getToolByName } from "kova";
 
-// WALLET_TOOLS is an array of all 8 tool definitions in canonical format.
+// WALLET_TOOLS contains the 6 safe tool definitions. DANGEROUS_TOOLS has 2 more (opt-in).
 // You can use these to build custom integrations with providers not natively supported.
 console.log(WALLET_TOOLS.length); // 8
 
@@ -349,7 +364,7 @@ This design ensures agents get enough information to retry or adjust their behav
 
 ### `handleToolCall` returns "Unknown tool"
 
-- The tool name must exactly match one of the 8 supported names (e.g., `wallet_transfer`, not `transfer` or `walletTransfer`). The error message includes the list of valid tool names.
+- The tool name must exactly match one of the supported names (e.g., `wallet_transfer`, not `transfer` or `walletTransfer`). The error message includes the list of valid tool names.
 
 ## What to Try Next
 

@@ -186,9 +186,12 @@ export class AllowlistRule implements PolicyRule {
     // CRIT-05 fix: Fail-closed for intent types that can move funds but have no extractable target.
     // If address or program allowlists are configured, intents without a verifiable target
     // must be explicitly covered by token-level checks (for swaps) or denied.
-    // This prevents swaps from silently bypassing address/program restrictions.
+    // MED-T3-04 fix: Extended from only "swap" and "custom" to include ALL fund-moving intent
+    // types: "transfer", "stake", "swap", and "custom". Previously, malformed transfer or stake
+    // intents with no extractable target could bypass allowlist checks entirely.
     if (!targetAddress && !programId) {
-      const hasFundsMovingIntent = intent.type === "swap" || intent.type === "custom";
+      const hasFundsMovingIntent = intent.type === "transfer" || intent.type === "stake" ||
+        intent.type === "swap" || intent.type === "custom";
       if (hasFundsMovingIntent) {
         // Swaps: if we have no token checks covering them, and address/program lists exist, deny
         const isSwapCoveredByTokenChecks = intent.type === "swap" &&
@@ -199,8 +202,7 @@ export class AllowlistRule implements PolicyRule {
             decision: "DENY",
             rule: this.name,
             reason: `Intent type "${intent.type}" has no verifiable target address or program. ` +
-              `Address/program allowlists are configured but cannot be checked for this intent type. ` +
-              `Configure token allowlists (allowTokens/denyTokens) to explicitly cover swap intents.`,
+              `Address/program allowlists are configured but cannot be checked for this intent type.`,
           };
         }
       }

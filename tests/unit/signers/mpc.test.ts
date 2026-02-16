@@ -327,7 +327,12 @@ describe("MpcSigner", () => {
       expect(result.data).toBeInstanceOf(Uint8Array);
       expect(result.signature).toBeInstanceOf(Uint8Array);
       expect(result.signature.length).toBe(64);
-      expect(provider.signTransaction).toHaveBeenCalledWith(txData);
+      // NET-11 fix: signTransaction now receives a defensive copy of the data
+      // and an AbortSignal for cooperative cancellation on timeout.
+      expect(provider.signTransaction).toHaveBeenCalledWith(
+        expect.any(Uint8Array),
+        expect.any(AbortSignal),
+      );
     });
 
     it("should reject chain mismatch without calling provider", async () => {

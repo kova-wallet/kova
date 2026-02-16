@@ -95,7 +95,15 @@ import { MemoryStore } from "kova";
 // Create an in-memory store instance. All data lives in JavaScript objects/maps
 // within the current Node.js process. Fast and simple, but nothing survives a restart.
 const store = new MemoryStore();
+
+// IMPORTANT: If NODE_ENV=production, MemoryStore will throw unless you
+// explicitly opt in with dangerouslyAllowInProduction:
+const prodStore = new MemoryStore({ dangerouslyAllowInProduction: true });
 ```
+
+::: warning Production Safety
+`MemoryStore` is designed for development and testing. When `NODE_ENV=production`, it will throw an error unless `{ dangerouslyAllowInProduction: true }` is passed. For production deployments, use `SqliteStore` with encryption instead, which provides persistence and crash recovery.
+:::
 
 ### Characteristics
 
