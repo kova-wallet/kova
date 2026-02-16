@@ -11,10 +11,10 @@
 
 Before installing `kova`, ensure you have the following:
 
-| Requirement | Version |
-|-------------|---------|
-| Node.js     | 18.0 or later |
-| npm          | 9.0 or later (ships with Node 18+) |
+| Requirement | Version | Why |
+|-------------|---------|-----|
+| Node.js     | 18.0 or later | kova uses ES2022 features (top-level await, Object.hasOwn) that require Node 18+ |
+| npm          | 9.0 or later (ships with Node 18+) | Required for package installation and dependency resolution |
 
 ::: tip
 You can check your current versions by running `node -v` and `npm -v` in your terminal. If you don't have Node.js installed, download it from [nodejs.org](https://nodejs.org).
@@ -26,8 +26,9 @@ Install `kova` from npm:
 
 ```bash
 # Install the kova SDK from the npm registry.
-# This is the core package that provides AgentWallet, PolicyEngine, signers,
-# chain adapters, and all built-in policy rules for Solana agent wallets.
+# This single package provides everything you need: AgentWallet, PolicyEngine,
+# signers, chain adapters, AI framework adapters, and all built-in policy rules.
+# No additional peer dependencies are required for basic usage.
 npm install kova
 ```
 
@@ -38,9 +39,10 @@ This is the only required package. It includes everything you need to create wal
 Create a simple test file to verify the SDK is installed correctly:
 
 ```typescript
-// verify.ts
-// Import all core kova components to verify they are available.
-// If any import fails, kova is not installed correctly.
+// verify.ts -- A quick smoke test to confirm kova is installed and all
+// core exports are accessible. Run this after `npm install kova` to
+// verify that your environment is set up correctly.
+
 import {
   AgentWallet,          // The main wallet class that orchestrates signers, policies, and chain adapters
   Policy,               // Fluent builder for creating policy configurations declaratively
@@ -54,13 +56,13 @@ import {
 // Each console.log checks that the imported symbol is a constructor function ("function"),
 // confirming the SDK is properly installed and all exports are accessible.
 console.log("kova installed successfully!");
-console.log("AgentWallet:", typeof AgentWallet);
-console.log("Policy:", typeof Policy);
-console.log("PolicyEngine:", typeof PolicyEngine);
-console.log("MemoryStore:", typeof MemoryStore);
-console.log("LocalSigner:", typeof LocalSigner);
-console.log("SolanaAdapter:", typeof SolanaAdapter);
-console.log("SpendingLimitRule:", typeof SpendingLimitRule);
+console.log("AgentWallet:", typeof AgentWallet);       // Expected: "function"
+console.log("Policy:", typeof Policy);                 // Expected: "function"
+console.log("PolicyEngine:", typeof PolicyEngine);     // Expected: "function"
+console.log("MemoryStore:", typeof MemoryStore);       // Expected: "function"
+console.log("LocalSigner:", typeof LocalSigner);       // Expected: "function"
+console.log("SolanaAdapter:", typeof SolanaAdapter);   // Expected: "function"
+console.log("SpendingLimitRule:", typeof SpendingLimitRule);  // Expected: "function"
 ```
 
 Run it with:
@@ -97,7 +99,7 @@ The `@solana/web3.js` library is bundled with `kova` -- you do not need to insta
 
 ### Persistent Storage (Recommended for Production)
 
-By default, Kova uses an in-memory store that loses all state when the process exits. This means spending limits, rate limits, and the circuit breaker reset on every restart -- which is fine for development but defeats the purpose of having guardrails in production.
+By default, kova uses an in-memory store that loses all state when the process exits. This means spending limits, rate limits, and the circuit breaker reset on every restart -- which is fine for development but defeats the purpose of having guardrails in production.
 
 ::: warning Why this matters
 Imagine setting a daily spending limit of 5 SOL. Without persistent storage, restarting your server resets the counter to zero -- the agent could spend another 5 SOL immediately. In production, you need `SqliteStore` so limits survive restarts.

@@ -1,5 +1,13 @@
 # Audit Logging
 
+::: info What you'll learn
+- How the SHA-256 hash chain creates a tamper-evident audit trail
+- The `AuditEntry` structure and what gets recorded for every transaction
+- How to verify audit log integrity with `verifyIntegrity()`
+- The audit circuit breaker that blocks transactions when logging fails
+- Security hardening: domain separators, timing-safe comparison, write serialization
+:::
+
 kova records every policy decision and transaction result in a tamper-evident audit log. The log uses a SHA-256 hash chain so that any modification or deletion of entries can be detected after the fact.
 
 ## AuditLogger Constructor

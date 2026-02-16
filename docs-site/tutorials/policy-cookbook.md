@@ -1,6 +1,12 @@
 # Policy Configuration Cookbook
 
-> **What you'll learn:** How to configure six real-world policy patterns for agent wallets -- from ultra-restrictive read-only agents to liberal high-frequency traders. You will also learn how to serialize policies to JSON for version control and how to extend existing policies to create stricter variants without starting from scratch.
+::: info What you'll learn
+- How to configure six real-world policy patterns — from ultra-restrictive read-only agents to liberal high-frequency traders
+- How each built-in rule (spending limit, rate limit, time window, allowlist, approval gate) works in practice
+- How to combine multiple rules into a single policy for layered defense
+- How to serialize policies to JSON for version control and reproducible deployments
+- How to extend existing policies to create stricter variants without starting from scratch
+:::
 
 ## Prerequisites
 

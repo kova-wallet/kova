@@ -1,5 +1,13 @@
 # Signers
 
+::: info What you'll learn
+- How signing works and why every transaction needs a cryptographic signature
+- The 3-method Signer interface that all key-management backends implement
+- When to use `LocalSigner` (dev) vs `MpcSigner` (production)
+- How to implement a custom Signer for Fireblocks, AWS KMS, or other services
+- Security best practices for key management in production
+:::
+
 A Signer holds your agent's private key and uses it to authorize transactions -- like the signature on a check that proves you approved the payment.
 
 Signers are responsible for holding private keys and signing transactions. The `Signer` interface is minimal -- all signing backends implement three methods.
@@ -529,6 +537,17 @@ const wallet = new AgentWallet({
   store: new SqliteStore({ path: "./wallet.db" }), // Persistent store for SDK state (counters, audit logs)
 });
 ```
+
+## Common Mistakes
+
+**1. Using `LocalSigner` in production.**
+`LocalSigner` holds the private key in process memory as a plain `Keypair`. The key can be extracted via heap dumps, core dumps, or memory inspection tools. Always use `MpcSigner` or a custom hardware-backed signer for production deployments with real funds.
+
+**2. Hardcoding private keys in source code.**
+Never include private keys in your code, even for testing. Use environment variables, a secrets manager (AWS Secrets Manager, HashiCorp Vault), or an MPC provider. If a key leaks in your Git history, any funds in that wallet are at risk.
+
+**3. Forgetting to call `destroy()` on `LocalSigner`.**
+For long-running processes, call `destroy()` when you are done with the signer to zero out the secret key from memory. This minimizes the window during which the key could be extracted.
 
 ## See Also
 

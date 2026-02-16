@@ -1,6 +1,12 @@
 # Production Deployment
 
-> **What you'll learn:** How to harden your agent wallet for production use with real money. This guide covers switching from in-memory storage to persistent SQLite, configuring circuit breakers to halt runaway agents, setting up audit log monitoring and alerting, managing secrets securely, and deploying with Docker or PM2.
+::: info What you'll learn
+- How to switch from in-memory storage to persistent SQLite so wallet state survives restarts
+- How to configure circuit breakers to automatically halt runaway agents after consecutive denials
+- How to set up audit log monitoring, alerting, and tamper detection
+- How to manage secrets securely using environment variables and secret managers
+- How to deploy your agent wallet with Docker or PM2 for production reliability
+:::
 
 This guide covers hardening your agent wallet for production use. You will learn how to switch from in-memory storage to persistent SQLite, configure <Term id="circuit-breaker">circuit breakers</Term>, set up monitoring and alerting, and follow security best practices.
 

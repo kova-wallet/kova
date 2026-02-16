@@ -1,5 +1,13 @@
 # AllowlistRule
 
+::: info What you'll learn
+- How to restrict which addresses and programs your agent can interact with
+- The evaluation precedence: deny lists always take priority over allow lists
+- How EVM address normalization prevents case-based bypasses
+- How to combine allow and deny lists for layered security
+- How different intent types extract their target addresses
+:::
+
 `AllowlistRule` controls who your AI agent can send money to -- like a contacts list on a bank account that blocks transfers to anyone not on the list.
 
 The `AllowlistRule` restricts which addresses and programs the agent can interact with. It supports both allowlists (whitelist) and denylists (blacklist) for addresses and program IDs.

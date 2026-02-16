@@ -1,6 +1,13 @@
 # OpenAI Integration
 
-> **What you'll learn:** How to connect a kova wallet to OpenAI's GPT models using the function calling API, how to implement the tool-use loop that processes GPT's function calls, how to handle parallel tool calls for better performance, how to use structured outputs for programmatic responses, and how to handle errors from both the OpenAI API and the wallet.
+::: info What you'll learn
+- How to connect a kova wallet to OpenAI's GPT models using `toOpenAITools()`
+- How to implement the function calling loop that processes GPT's `tool_calls` and `finish_reason`
+- How to handle parallel tool calls for better performance
+- How to use structured outputs (`response_format`) for programmatic responses
+- How to handle errors from both the OpenAI API and the wallet
+- Key differences from the Claude integration (JSON string arguments, `role: "tool"` messages)
+:::
 
 This guide shows how to connect a kova wallet to OpenAI's GPT models using the function calling (tool use) API. The agent can autonomously manage transactions, check balances, and operate within policy constraints.
 

@@ -2,7 +2,7 @@
 
 ::: info What you'll learn
 - How to create a fully working policy-constrained wallet from scratch
-- How to define spending limits, allowlists, and rate limits
+- How to define spending limits, allowlists, and rate limits using the fluent Policy builder
 - How to execute a transaction and interpret the result
 - How to inspect transaction history and policy summaries
 :::
@@ -16,68 +16,101 @@ Every step below is explained in plain terms. You'll be writing TypeScript, not 
 ## Complete Working Example
 
 ```typescript
+// ── Imports ─────────────────────────────────────────────────────────────────
 // Import all kova components needed to create and run a policy-constrained wallet.
+// Each import is a composable building block with a single responsibility.
 import {
-  AgentWallet,        // Orchestrates the full execute() pipeline: validate → policy → sign → broadcast
-  Policy,             // Fluent builder for declaratively defining policy configurations
-  PolicyEngine,       // Evaluates an ordered list of rules against each transaction intent
-  MemoryStore,        // In-memory Store implementation for dev/testing (state lost on restart)
-  LocalSigner,        // Wraps a Solana Keypair and signs transactions locally
-  SolanaAdapter,      // Handles Solana-specific operations: build tx, broadcast, check balance
-  SpendingLimitRule,  // Enforces per-transaction and periodic (daily/weekly/monthly) spending caps
-  RateLimitRule,      // Enforces max transactions per minute and per hour using rolling windows
-  AllowlistRule,      // Restricts which destination addresses the agent can send funds to
+  AgentWallet,        // The main entry point: orchestrates the full execute() pipeline
+                      // (validate -> policy check -> sign -> broadcast -> audit log)
+  Policy,             // Fluent builder for declaratively defining policy configurations.
+                      // Produces a serializable PolicyConfig object.
+  PolicyEngine,       // Evaluates an ordered list of rules against each transaction intent.
+                      // Two-phase evaluation (dry-run then commit) prevents counter inflation.
+  MemoryStore,        // In-memory Store implementation for dev/testing.
+                      // All state (spending counters, rate limits, audit log) is lost on restart.
+  LocalSigner,        // Wraps a Solana Keypair and signs transactions locally.
+                      // Development only -- key is held in process memory (insecure).
+  SolanaAdapter,      // Handles Solana-specific operations: build unsigned transactions,
+                      // broadcast signed transactions, query balances, validate addresses.
+  SpendingLimitRule,  // Enforces per-transaction and periodic (daily/weekly/monthly) spending caps.
+                      // Uses sliding windows (not fixed TTL) to prevent boundary double-spend.
+  RateLimitRule,      // Enforces max transactions per minute and per hour using rolling windows.
+                      // Has a built-in floor of 30 writes/min to protect against runaway agents.
+  AllowlistRule,      // Restricts which destination addresses the agent can send funds to.
+                      // Deny entries take precedence over allow entries.
 } from "kova";
+
 // Keypair from Solana's web3.js library generates and holds a public/private key pair.
+// The public key is the wallet's "address" (visible to everyone, like a bank account number).
+// The private key authorizes spending (secret, like a PIN -- never share it).
 import { Keypair } from "@solana/web3.js";
 
 async function main() {
-  // ── 1. Create a keypair and signer ──────────────────────────────────
-  // Generate a random Solana keypair. In production, load an existing key
-  // from a secure store (e.g., environment variable or secrets manager).
+  // ── 1. Create a keypair and signer ──────────────────────────────────────
+  // Generate a random Solana keypair. In production, you would load an existing
+  // key from a secure store (environment variable, AWS Secrets Manager, etc.)
+  // or use MpcSigner instead of LocalSigner for hardware-backed key security.
   const keypair = Keypair.generate();
+
   // LocalSigner wraps the keypair so the wallet can sign transactions.
   // It implements the Signer interface: getAddress(), sign(), healthCheck().
+  // WARNING: LocalSigner holds the key in plain text in process memory.
+  // Use MpcSigner (Turnkey, Fireblocks, Lit Protocol) for real funds.
   const signer = new LocalSigner(keypair);
+
   // Print the wallet's public address (base58-encoded) for reference.
+  // This is the "account number" -- safe to share publicly.
   console.log("Wallet address:", await signer.getAddress());
 
-  // ── 2. Create a store for spending counters and audit logs ──────────
+  // ── 2. Create a store for spending counters and audit logs ──────────────
   // MemoryStore implements the Store interface with get/set/increment/append/getRecent.
   // It holds all policy state (spending counters, rate limit windows, audit entries)
   // in memory. Data is lost when the process exits -- use SqliteStore in production.
   const store = new MemoryStore();
 
-  // ── 3. Create a chain adapter for Solana ────────────────────────────
+  // ── 3. Create a chain adapter for Solana ────────────────────────────────
   // SolanaAdapter connects to a Solana RPC endpoint and handles all chain-specific
-  // operations: building unsigned transactions, broadcasting signed transactions,
-  // querying balances, and validating addresses.
+  // operations: building unsigned transactions from intents, broadcasting signed
+  // transactions, querying balances, resolving token addresses, and validating
+  // recipient addresses.
   const chain = new SolanaAdapter({
     rpcUrl: "https://api.devnet.solana.com",  // Solana devnet RPC endpoint (free, rate-limited)
     commitment: "confirmed",                   // Wait for supermajority confirmation (~400ms)
   });
 
-  // ── 4. Build a policy using the fluent builder ──────────────────────
-  // Policy.create() returns a builder. Each chained method adds a constraint.
-  // The result is a serializable PolicyConfig object describing what the agent can do.
+  // ── 4. Build a policy using the fluent builder ──────────────────────────
+  // Policy.create() returns a chainable builder. Each method adds a constraint.
+  // The result is a serializable PolicyConfig object that describes what the
+  // agent is allowed to do. This config can be stored in a database, loaded
+  // from a file, or passed to an admin dashboard for management.
   const policy = Policy.create("trading-agent")
     .spendingLimit({
-      perTransaction: { amount: "1", token: "SOL" },  // No single transaction can exceed 1 SOL
-      daily: { amount: "5", token: "SOL" },            // Total spending cannot exceed 5 SOL per day
+      // perTransaction: No single transaction can exceed 1 SOL.
+      // This catches accidental large amounts (e.g., agent sends 100 instead of 1).
+      perTransaction: { amount: "1", token: "SOL" },
+      // daily: Total spending cannot exceed 5 SOL in any rolling 24-hour window.
+      // Even many small transactions can't drain the wallet beyond this cap.
+      daily: { amount: "5", token: "SOL" },
     })
     .allowAddresses([
       // Only these two addresses can receive funds from this wallet.
-      // Any transfer to an address not on this list will be denied.
+      // Any transfer to an address NOT on this list will be immediately denied.
+      // This prevents the agent from sending funds to arbitrary addresses,
+      // even if tricked by a prompt injection attack.
       "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM",
       "HN7cABqLq46Es1jh92dQQisAq662SmxELLLsHHe4YWrH",
     ])
     .rateLimit({
-      maxTransactionsPerMinute: 3,  // Max 3 transactions in any rolling 60-second window
-      maxTransactionsPerHour: 20,   // Max 20 transactions in any rolling 60-minute window
+      // maxTransactionsPerMinute: At most 3 transactions in any rolling 60-second window.
+      // Prevents runaway loops where the agent retries the same operation endlessly.
+      maxTransactionsPerMinute: 3,
+      // maxTransactionsPerHour: At most 20 transactions in any rolling 60-minute window.
+      // Provides a broader cap for sustained activity.
+      maxTransactionsPerHour: 20,
     })
     .build();  // Finalize and return the immutable Policy object
 
-  // ── 5. Extract config and create individual rules ───────────────────
+  // ── 5. Extract config and create individual rules ───────────────────────
   // toJSON() serializes the policy to a plain object so we can extract
   // config for each rule type. This separation keeps policy definition
   // (declarative builder) separate from policy execution (rule instances).
@@ -85,73 +118,107 @@ async function main() {
 
   // Create concrete rule instances in evaluation order.
   // Rules are evaluated sequentially; the cheapest checks go first to
-  // short-circuit early and avoid unnecessary work.
+  // short-circuit early and avoid unnecessary work on denied transactions.
   const rules = [
-    new RateLimitRule(config.rateLimit!),        // Cheapest: simple counter check
-    new AllowlistRule({                           // Next: address lookup (fast hash check)
+    // RateLimitRule first: cheapest check (simple counter lookup).
+    // If the agent has exceeded its quota, we don't need to check anything else.
+    new RateLimitRule(config.rateLimit!),
+
+    // AllowlistRule second: fast address lookup (hash set membership check).
+    // If the recipient isn't on the allowlist, skip the spending calculation.
+    new AllowlistRule({
       allowAddresses: config.allowAddresses,
     }),
-    new SpendingLimitRule(config.spendingLimit!), // Last: requires amount parsing and aggregation
+
+    // SpendingLimitRule last: most expensive check (aggregates historical spending).
+    // Only runs if the rate limit and allowlist both passed.
+    new SpendingLimitRule(config.spendingLimit!),
   ];
 
-  // ── 6. Create the policy engine ─────────────────────────────────────
+  // ── 6. Create the policy engine ─────────────────────────────────────────
   // PolicyEngine takes the ordered rules and a store (for stateful rules like
-  // spending limits). It evaluates every intent against all rules sequentially.
-  // If any rule returns DENY, the engine stops and returns DENY immediately.
+  // spending limits and rate limits). It evaluates every intent against all
+  // rules sequentially. If ANY rule returns DENY, the engine stops immediately
+  // and returns DENY. The transaction only proceeds if ALL rules return ALLOW.
   const engine = new PolicyEngine(rules, store);
 
-  // ── 7. Create the wallet ────────────────────────────────────────────
+  // ── 7. Create the wallet ────────────────────────────────────────────────
   // AgentWallet wires together the signer, chain adapter, policy engine, and store
-  // into a single object that AI agents interact with. It exposes execute(),
-  // getBalance(), getAddress(), getPolicy(), and getTransactionHistory().
+  // into a single object. This is the only object that AI agents interact with.
+  // It exposes: execute(), getBalance(), getAddress(), getPolicy(), and
+  // getTransactionHistory().
   const wallet = new AgentWallet({
-    signer,         // Signs transactions before broadcast
-    chain,          // Builds and broadcasts transactions to Solana
+    signer,         // Signs transactions with the private key before broadcast
+    chain,          // Builds and broadcasts transactions to the Solana blockchain
     policy: engine, // Evaluates policy rules before allowing any transaction
     store,          // Shared store for spending counters, audit logs, idempotency cache
   });
 
-  // ── 8. Execute a transfer ───────────────────────────────────────────
-  // wallet.execute() runs the full 10-step pipeline: validate → normalize →
-  // idempotency check → audit circuit check → transaction circuit breaker →
-  // policy evaluation → build tx → sign → broadcast → audit log + return result.
+  // ── 8. Execute a transfer ───────────────────────────────────────────────
+  // wallet.execute() runs the full 10-step pipeline:
+  //   1. Validate intent structure and types
+  //   2. Normalize (assign UUID, timestamp)
+  //   3. Idempotency check (skip if already processed)
+  //   4. Audit circuit check (refuse if audit logging is broken)
+  //   5. Transaction circuit breaker (refuse if too many consecutive denials)
+  //   6. Policy evaluation (two-phase: dry-run then commit)
+  //   7. Build unsigned transaction via chain adapter
+  //   8. Sign transaction via signer
+  //   9. Broadcast to blockchain and wait for confirmation
+  //  10. Record audit log entry and return result
   const result = await wallet.execute({
-    type: "transfer",   // Intent type: a simple token transfer (other types: swap, mint, stake, custom)
+    type: "transfer",   // Intent type: a simple token transfer
     chain: "solana",    // Target blockchain (currently only "solana" is supported)
     params: {
-      to: "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM",  // Recipient address (must be on allowlist)
-      amount: "0.5",    // Amount in SOL (human-readable, not lamports)
-      token: "SOL",     // Token to transfer (native SOL in this case)
+      // to: Recipient address. Must be on the allowlist, or the AllowlistRule denies it.
+      to: "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM",
+      // amount: Human-readable amount in SOL. The SDK converts to lamports internally.
+      // (1 SOL = 1,000,000,000 lamports, but you never need to think about this.)
+      amount: "0.5",
+      // token: Which token to send. "SOL" for native Solana currency.
+      // For SPL tokens (e.g., USDC), use the token's mint address instead.
+      token: "SOL",
     },
     metadata: {
-      reason: "Payment for completed task",  // Optional: stored in audit log for context
-      agentId: "trading-bot-01",             // Optional: identifies which agent made the request
+      // reason: Stored in the audit log for context. Explains why this payment was made.
+      reason: "Payment for completed task",
+      // agentId: Identifies which agent initiated this request.
+      // Used for per-agent circuit breaker isolation and audit trail filtering.
+      agentId: "trading-bot-01",
     },
   });
 
-  // ── 9. Log the result ───────────────────────────────────────────────
-  // TransactionResult contains the outcome of the execute() pipeline.
+  // ── 9. Log the result ───────────────────────────────────────────────────
+  // TransactionResult is a discriminated union with four possible statuses:
+  //   "confirmed" -- transaction was broadcast and confirmed on-chain
+  //   "denied"    -- policy engine rejected the transaction (with reason)
+  //   "failed"    -- transaction failed during build, sign, or broadcast
+  //   "pending"   -- awaiting human approval (ApprovalGateRule triggered)
   console.log("Transaction result:", {
-    status: result.status,     // "confirmed" | "denied" | "failed" | "pending"
-    txId: result.txId,         // Solana transaction signature (only if submitted)
-    summary: result.summary,   // Human-readable summary of what happened
-    intentId: result.intentId, // Unique ID assigned to this intent (UUID)
+    status: result.status,     // The outcome of the pipeline
+    txId: result.txId,         // Solana transaction signature (only if broadcast succeeded)
+    summary: result.summary,   // Human-readable description of what happened
+    intentId: result.intentId, // Unique ID assigned to this intent (UUID v4)
   });
 
-  // ── 10. Check the wallet's policy summary ───────────────────────────
+  // ── 10. Check the wallet's policy summary ───────────────────────────────
   // getPolicy() returns a human-readable summary of the active policy,
-  // including spending limits, rate limits, allowlist, and other constraints.
+  // including all configured limits, allowlists, and thresholds.
+  // This is the same information exposed to the AI agent via wallet_get_policy.
   const policySummary = await wallet.getPolicy();
   console.log("Policy summary:", JSON.stringify(policySummary, null, 2));
 
-  // ── 11. View transaction history ────────────────────────────────────
+  // ── 11. View transaction history ────────────────────────────────────────
   // getTransactionHistory(n) retrieves the last n entries from the audit log.
-  // Each entry includes status, summary, timestamp, txId, and intentId.
+  // Each entry includes: status, summary, timestamp, txId, intentId, and
+  // the per-rule policy evaluation results.
   const history = await wallet.getTransactionHistory(5);
   console.log("Recent transactions:", history.length);
 }
 
 // Run the async main function and catch any unhandled errors.
+// In production, you'd integrate this into your Express/Fastify/Hono server
+// rather than running as a standalone script.
 main().catch(console.error);
 ```
 

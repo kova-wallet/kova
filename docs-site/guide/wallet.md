@@ -1,5 +1,13 @@
 # AgentWallet
 
+::: info What you'll learn
+- How the `AgentWallet` orchestrates the entire transaction lifecycle
+- How to construct a wallet with all required and optional components
+- The 10-step execute pipeline that every transaction passes through
+- How to handle the four possible transaction outcomes (confirmed, denied, pending, failed)
+- How to integrate with AI frameworks (Claude, OpenAI) via built-in tool definitions
+:::
+
 ## Overview
 
 The `AgentWallet` is the central hub of the Kova SDK -- think of it as **a bank account with built-in spending rules and a full audit trail**. Just like a corporate bank account has daily transfer limits, requires manager approval for large payments, and keeps a ledger of every transaction, the `AgentWallet` enforces policies, requests human approval when needed, and logs every action your AI agent takes.
@@ -221,7 +229,7 @@ Before deploying with real funds, make sure you:
 
 When you call `wallet.execute(intent)`, the following 10-step pipeline runs. Think of it like an HTTP request passing through a chain of middleware -- each step can approve the request, reject it, or transform it before passing it to the next step.
 
-The entire pipeline is serialized via a mutex (a lock that ensures only one transaction runs at a time) to prevent TOCTOU race conditions (where two transactions check the same limit simultaneously and both slip through).
+The entire pipeline is serialized via a mutex (a lock that ensures only one transaction runs at a time) to prevent TOCTOU race conditions. **TOCTOU** (Time-Of-Check-to-Time-Of-Use) is a class of bug where two transactions check the same limit simultaneously and both slip through -- for example, two concurrent $8 transfers could each see a $10 limit as not exceeded, resulting in $16 total spending. The mutex prevents this by processing transactions one at a time.
 
 | Step | Name | Description |
 |------|------|-------------|
@@ -576,6 +584,9 @@ Many developers only check for `confirmed` and ignore the rest. Always handle `d
 
 **3. Retrying denied transactions in a tight loop.**
 If a transaction is denied (e.g., spending limit exceeded), retrying immediately will hit the same limit and trigger the circuit breaker. Check the denial reason and wait for the limit to reset, or reduce the amount.
+
+**4. Sharing a wallet across multiple agents without `PrefixedStore`.**
+If multiple agents share the same `AgentWallet` instance and store, their spending counters and rate limits will be combined. Use `PrefixedStore` to isolate each agent's state, or create separate wallet instances for each agent.
 
 ## Quick Reference
 

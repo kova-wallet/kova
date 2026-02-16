@@ -1,6 +1,12 @@
 # Claude (Anthropic) Integration
 
-> **What you'll learn:** How to connect a kova wallet to Anthropic's Claude model using the tool-use API, how to implement the tool-use loop that processes Claude's tool calls, how to build a multi-turn payment agent, and how to write effective system prompts that guide Claude's behavior.
+::: info What you'll learn
+- How to connect a kova wallet to Anthropic's Claude using `toAnthropicTools()`
+- How to implement the tool-use loop that processes Claude's `tool_use` / `tool_result` blocks
+- How to build a multi-turn payment agent that checks policy and balance before transacting
+- How to write effective system prompts that guide Claude's behavior (and why they are not a security boundary)
+- The complete data flow between your server and Claude's API
+:::
 
 This guide shows how to connect a kova wallet to Anthropic's Claude model using the tool-use (function calling) API. Claude can autonomously check balances, review policy constraints, and execute transactions within the limits you define.
 

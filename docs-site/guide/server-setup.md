@@ -1,6 +1,12 @@
 # Server Setup
 
-> **What you'll learn:** Why you need a server between your AI agent and the blockchain, how to build a minimal Express server that exposes kova as an HTTP API, how to test it with curl, and how to adapt the pattern for your preferred HTTP framework.
+::: info What you'll learn
+- Why you need a server between your AI agent and the blockchain
+- How to build a minimal Express server that exposes kova as an HTTP API
+- The complete Claude tool-use loop from message to blockchain confirmation
+- How to test your server with curl and interpret the responses
+- How to adapt the pattern for Next.js, Fastify, Hono, or any HTTP framework
+:::
 
 kova is an SDK, not a hosted service. You need to run your own server that sits between the AI agent and the blockchain. This page explains why, and gives you a working server you can deploy.
 

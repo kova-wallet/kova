@@ -1,5 +1,13 @@
 # SpendingLimitRule
 
+::: info What you'll learn
+- How per-transaction, daily, weekly, and monthly spending caps work
+- How rolling time windows differ from calendar-based resets
+- How token matching ensures SOL limits don't affect USDC transactions
+- The atomic increment-then-check pattern that prevents race conditions
+- How to configure conservative vs. liberal spending limits
+:::
+
 `SpendingLimitRule` caps how much your AI agent can spend -- like setting a daily budget on a corporate credit card.
 
 The `SpendingLimitRule` enforces per-transaction, daily, weekly, and monthly spending caps. It uses store counters with TTL-based expiration for time-window tracking.

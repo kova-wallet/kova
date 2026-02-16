@@ -1,5 +1,13 @@
 # Transaction Intents
 
+::: info What you'll learn
+- How intents let agents describe _what_ they want without knowing blockchain details
+- The five intent types: transfer, swap, mint, stake, and custom
+- How to attach metadata for audit logging and approval workflows
+- How idempotency prevents duplicate transactions on retries
+- How to use TypeScript type guards for safe parameter access
+:::
+
 ## Overview
 
 A Transaction Intent is **like a purchase order -- it describes what you want to buy, not how the payment is processed**. When you tell the SDK "send 2.5 SOL to this address," you are creating an intent. You do not need to know how to construct low-level blockchain instructions, manage nonces, or format binary data. The SDK translates your high-level request into the exact chain-specific operations needed to make it happen.

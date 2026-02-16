@@ -1,5 +1,13 @@
 # Security Model
 
+::: info What you'll learn
+- The fail-closed principle: how every component defaults to deny when uncertain
+- Mutex serialization that prevents TOCTOU race conditions on spending limits
+- Idempotency deduplication that prevents duplicate payments on retries
+- Error sanitization that keeps internal details away from AI agents
+- The full production security checklist for deploying with real funds
+:::
+
 `kova` is designed with a **fail-closed, defense-in-depth** security model. Every component defaults to denying transactions when uncertain, and multiple layers of protection prevent a single failure from compromising funds.
 
 ## Fail-Closed Design

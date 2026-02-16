@@ -1,6 +1,12 @@
 # Human-in-the-Loop with Telegram
 
-> **What you'll learn:** How to set up a Telegram bot that acts as a human approval gate for your agent wallet. By the end of this tutorial, you will have a working system where high-value transactions trigger a Telegram message with Approve/Reject buttons, and the agent pauses and waits for your decision before proceeding.
+::: info What you'll learn
+- How to create a Telegram bot with BotFather and connect it to your agent wallet
+- How the `ApprovalGateRule` pauses transaction execution and waits for a human decision
+- How to build inline Approve/Reject buttons that resolve pending approvals
+- How to wire the full flow: agent submits transaction → Telegram notification → human decides → agent resumes
+- How to test the complete human-in-the-loop approval cycle end to end
+:::
 
 This tutorial walks you through setting up a Telegram-based <Term id="human-in-the-loop" /> approval system for your agent wallet. High-value transactions will trigger a message to your Telegram chat with Approve and Reject buttons. The agent pauses and waits for your decision before proceeding.
 
