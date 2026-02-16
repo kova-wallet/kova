@@ -39,12 +39,16 @@ import {
   SpendingLimitRule, LocalSigner, MemoryStore, SolanaAdapter,
 } from "kova";
 
-// Components
+// 1. Create a signer — holds the private key, signs transactions
 const signer = new LocalSigner(Keypair.generate());
-const store  = new MemoryStore();
-const chain  = new SolanaAdapter({ rpcUrl: "https://api.devnet.solana.com" });
 
-// Policy — max 1 SOL per tx, 5 SOL daily
+// 2. Create a store — tracks spending totals, rate-limit counters, and audit entries
+const store = new MemoryStore();
+
+// 3. Create a chain adapter — connects to Solana and broadcasts transactions
+const chain = new SolanaAdapter({ rpcUrl: "https://api.devnet.solana.com" });
+
+// 4. Define a policy — max 1 SOL per transaction, 5 SOL daily limit
 const policy = Policy.create("demo")
   .spendingLimit({
     perTransaction: { amount: "1", token: "SOL" },
@@ -52,22 +56,28 @@ const policy = Policy.create("demo")
   })
   .build();
 
+// 5. Build the policy engine from the serialized policy config
 const config = policy.toJSON();
 const engine = new PolicyEngine(
   [new SpendingLimitRule(config.spendingLimit!)],
   store,
 );
 
-// Wallet
+// 6. Assemble the wallet — combines signer, chain, policy, and store
 const wallet = new AgentWallet({ signer, chain, policy: engine, store });
 
-// Execute
+// 7. Execute a transfer intent — policy is evaluated before the transaction is sent
 const result = await wallet.execute({
-  type: "transfer",
-  chain: "solana",
-  params: { to: "GsbwXfJraMomNxBcjYLcG3mxkBUiyWXAB32fGbSQQRre", amount: "0.5", token: "SOL" },
+  type: "transfer",       // intent type: "transfer" | "swap" | "custom"
+  chain: "solana",        // target chain
+  params: {
+    to: "GsbwXfJraMomNxBcjYLcG3mxkBUiyWXAB32fGbSQQRre",  // recipient address
+    amount: "0.5",        // amount in SOL
+    token: "SOL",         // token to send
+  },
 });
 
+// 8. Check the result
 console.log(result.status);  // "confirmed" | "denied" | "pending" | "failed"
 console.log(result.summary); // "Sent 0.5 SOL to Gsbw...QRre"
 ```
@@ -89,14 +99,17 @@ kova exposes wallet operations as tool definitions that agents can call directly
 ### Claude
 
 ```typescript
+// Send a message to Claude with kova wallet tools attached
 const response = await anthropic.messages.create({
   model: "claude-sonnet-4-20250514",
-  tools: wallet.toAnthropicTools(),
+  tools: wallet.toAnthropicTools(),   // converts wallet operations to Anthropic tool format
   messages: [{ role: "user", content: "Send 0.1 SOL to GsbwXf...QRre" }],
 });
 
+// Process Claude's response — execute any tool calls it makes
 for (const block of response.content) {
   if (block.type === "tool_use") {
+    // handleToolCall routes the tool name + input through the policy engine
     const result = await wallet.handleToolCall(block.name, block.input);
   }
 }
@@ -105,14 +118,17 @@ for (const block of response.content) {
 ### OpenAI
 
 ```typescript
+// Send a message to OpenAI with kova wallet tools attached
 const response = await openai.chat.completions.create({
   model: "gpt-4o",
-  tools: wallet.toOpenAITools(),
+  tools: wallet.toOpenAITools(),    // converts wallet operations to OpenAI function-calling format
   messages: [{ role: "user", content: "Check my SOL balance" }],
 });
 
+// Extract the first tool call from the response
 const toolCall = response.choices[0]?.message.tool_calls?.[0];
 if (toolCall) {
+  // Parse the function arguments and route through the policy engine
   const result = await wallet.handleToolCall(
     toolCall.function.name,
     JSON.parse(toolCall.function.arguments),
@@ -125,8 +141,9 @@ if (toolCall) {
 ```typescript
 import { createLangChainTools } from "kova";
 
+// Convert kova wallet operations into LangChain-compatible tool objects
 const tools = createLangChainTools(wallet);
-// Pass to your LangChain agent
+// Pass these tools to any LangChain agent — policy enforcement is handled automatically
 ```
 
 ## Policy Rules
@@ -135,16 +152,21 @@ Compose rules to match your risk profile. Rules are evaluated in order — put t
 
 ```typescript
 const policy = Policy.create("production")
+  // Cap spending: 10 SOL per tx, 50 SOL per day
   .spendingLimit({
     perTransaction: { amount: "10", token: "SOL" },
     daily: { amount: "50", token: "SOL" },
   })
+  // Only allow transfers to these approved addresses
   .allowAddresses(["addr1", "addr2"])
+  // Limit to 5 transactions per minute to prevent rapid-fire abuse
   .rateLimit({ maxTransactionsPerMinute: 5 })
+  // Restrict to weekday business hours (Eastern time)
   .activeHours({
     timezone: "America/New_York",
     windows: [{ days: ["mon", "tue", "wed", "thu", "fri"], start: "09:00", end: "17:00" }],
   })
+  // Require human approval via Telegram for transactions above 25 SOL
   .requireApproval({ above: { amount: "25", token: "SOL" } })
   .build();
 ```
@@ -160,8 +182,13 @@ const policy = Policy.create("production")
 Policies are serializable — save as JSON, load later, or extend existing policies:
 
 ```typescript
+// Serialize a policy to JSON for storage or transport
 const json = policy.toJSON();
+
+// Reconstruct a policy from saved JSON
 const loaded = Policy.fromJSON(json);
+
+// Extend an existing policy with tighter rules (inherits all parent rules)
 const stricter = Policy.extend(policy, "strict").spendingLimit({ ... }).build();
 ```
 
@@ -184,8 +211,8 @@ const stricter = Policy.extend(policy, "strict").spendingLimit({ ... }).build();
 Run any example:
 
 ```bash
-cp .env.example .env    # fill in your values
-npx tsx examples/basic-transfer/index.ts
+cp .env.example .env    # copy the template and fill in your RPC URL, keys, etc.
+npx tsx examples/basic-transfer/index.ts   # run any example with tsx
 ```
 
 ## Security
