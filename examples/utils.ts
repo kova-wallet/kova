@@ -9,8 +9,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const PROJECT_ROOT = resolve(__dirname, "..");
 
-// Load .env.devnet from project root (values won't override existing env vars)
-config({ path: resolve(PROJECT_ROOT, ".env.devnet") });
+// Load .env from project root (values won't override existing env vars)
+config({ path: resolve(PROJECT_ROOT, ".env") });
 
 const DEFAULT_KEYPAIR_PATH = resolve(PROJECT_ROOT, ".devnet-keypair.json");
 const AIRDROP_AMOUNT = 1 * LAMPORTS_PER_SOL;
