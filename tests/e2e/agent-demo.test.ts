@@ -8,7 +8,7 @@ import { SpendingLimitRule } from "../../src/policy/rules/spending-limit.js";
 import { AllowlistRule } from "../../src/policy/rules/allowlist.js";
 import { RateLimitRule } from "../../src/policy/rules/rate-limit.js";
 import { ApprovalGateRule } from "../../src/policy/rules/approval-gate.js";
-import type { PolicyRule, PolicyDecision } from "../../src/policy/types.js";
+import type { PolicyRule } from "../../src/policy/types.js";
 import type {
   Signer,
   UnsignedTransaction,

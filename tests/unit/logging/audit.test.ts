@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach } from "vitest";
 import { AuditLogger } from "../../../src/logging/audit.js";
 import { MemoryStore } from "../../../src/stores/memory.js";
 import type { AuditEntry } from "../../../src/logging/types.js";

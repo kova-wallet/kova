@@ -6,7 +6,7 @@ import { AuditLogger } from "../../../src/logging/audit.js";
 import { SpendingLimitRule } from "../../../src/policy/rules/spending-limit.js";
 import { RateLimitRule } from "../../../src/policy/rules/rate-limit.js";
 import type { AgentWalletConfig } from "../../../src/core/wallet.js";
-import type { PolicyRule, PolicyDecision } from "../../../src/policy/types.js";
+import type { PolicyRule } from "../../../src/policy/types.js";
 import type { Signer, UnsignedTransaction, SignedTransaction } from "../../../src/signers/interface.js";
 import type { ChainAdapter } from "../../../src/chains/interface.js";
 import type { TransactionIntent } from "../../../src/core/intent.js";

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { MemoryStore } from "../../../src/stores/memory.js";
 
 describe("MemoryStore", () => {

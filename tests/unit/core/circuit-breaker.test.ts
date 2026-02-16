@@ -1,10 +1,10 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { CircuitBreaker, type CircuitBreakerConfig } from "../../../src/core/circuit-breaker.js";
+import { CircuitBreaker } from "../../../src/core/circuit-breaker.js";
 import { AgentWallet } from "../../../src/core/wallet.js";
 import { PolicyEngine } from "../../../src/policy/engine.js";
 import { MemoryStore } from "../../../src/stores/memory.js";
 import type { AgentWalletConfig } from "../../../src/core/wallet.js";
-import type { PolicyRule, PolicyDecision } from "../../../src/policy/types.js";
+import type { PolicyRule } from "../../../src/policy/types.js";
 import type { Signer, UnsignedTransaction, SignedTransaction } from "../../../src/signers/interface.js";
 import type { ChainAdapter } from "../../../src/chains/interface.js";
 import type { TransactionIntent } from "../../../src/core/intent.js";

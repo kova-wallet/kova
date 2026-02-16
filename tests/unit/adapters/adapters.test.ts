@@ -1687,7 +1687,7 @@ describe("getPolicy — TimeWindowRule edge cases", () => {
 describe("Adapter format verification — tool schema completeness", () => {
   it("every tool property should have a type field", () => {
     for (const tool of WALLET_TOOLS) {
-      for (const [key, prop] of Object.entries(tool.parameters.properties)) {
+      for (const prop of Object.values(tool.parameters.properties)) {
         expect(prop.type).toBeTruthy();
         expect(typeof prop.type).toBe("string");
       }
@@ -1696,7 +1696,7 @@ describe("Adapter format verification — tool schema completeness", () => {
 
   it("every tool property should have a non-empty description", () => {
     for (const tool of WALLET_TOOLS) {
-      for (const [key, prop] of Object.entries(tool.parameters.properties)) {
+      for (const prop of Object.values(tool.parameters.properties)) {
         expect(prop.description).toBeTruthy();
         expect(prop.description.length).toBeGreaterThan(0);
       }
