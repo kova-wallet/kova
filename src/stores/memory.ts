@@ -90,7 +90,13 @@ export class MemoryStore implements Store {
    * directly modify the in-memory Map (e.g., via prototype pollution or memory
    * corruption) cannot forge valid counter values without knowing this key.
    */
-  private readonly hmacKey: string;
+  // TYPE-LOW-02 fix: Mutable (not readonly) so destroy() can zero the key material
+  // without resorting to `as any` casts that bypass TypeScript's type safety.
+  // T1-F4 fix: Use Buffer instead of string for HMAC key material. JavaScript strings
+  // are immutable — "overwriting" a string just creates a new string while the original
+  // remains in memory until GC. Buffer.fill(0) overwrites bytes in-place, providing
+  // reliable zeroization of key material on destroy().
+  private hmacKey: Buffer;
   /** L-29 fix: Default TTL for counter keys created via increment() on absent keys */
   private readonly defaultCounterTtlSeconds?: number;
 
@@ -99,12 +105,13 @@ export class MemoryStore implements Store {
     // HIGH-18/HIGH-19: MemoryStore loses all security state on restart — this must
     // be an error (not just a warning) to prevent accidental production use.
     // MED-T5-01 fix: Use dedicated KOVA_ALLOW_MEMORY_STORE env var instead of NODE_ENV=test.
-    // Previously, setting NODE_ENV=test in production would bypass this guard. A dedicated
-    // env var is harder to accidentally set and makes the opt-in explicit.
-    const allowMemoryStore = typeof process !== "undefined" && (
-      process.env.KOVA_ALLOW_MEMORY_STORE === "1" ||
-      process.env.NODE_ENV === "test"
-    );
+    // T8-F9 fix: Removed NODE_ENV === "test" fallback. Previously, setting NODE_ENV=test
+    // in a production deployment (common for debugging) would silently bypass the guard,
+    // allowing MemoryStore use without warnings and losing all spending limits, rate limits,
+    // and audit logs on restart. Only KOVA_ALLOW_MEMORY_STORE=1 or the constructor option
+    // can now bypass this guard.
+    const allowMemoryStore = typeof process !== "undefined" &&
+      process.env.KOVA_ALLOW_MEMORY_STORE === "1";
     if (typeof process !== "undefined" && !allowMemoryStore) {
       if (!config?.dangerouslyAllowInProduction) {
         throw new Error(
@@ -131,9 +138,11 @@ export class MemoryStore implements Store {
           "Generate one with: crypto.randomBytes(32).toString('hex')",
         );
       }
-      this.hmacKey = config.hmacKey;
+      // T1-F4 fix: Store as Buffer for reliable zeroization via Buffer.fill(0)
+      this.hmacKey = Buffer.from(config.hmacKey, "hex");
     } else {
-      this.hmacKey = crypto.randomBytes(32).toString("hex");
+      // T1-F4 fix: Store raw bytes instead of hex string
+      this.hmacKey = crypto.randomBytes(32);
     }
     // L-29 fix: Store the default counter TTL
     this.defaultCounterTtlSeconds = config?.defaultCounterTtlSeconds;
@@ -235,6 +244,7 @@ export class MemoryStore implements Store {
    * Atomically increment a numeric value by the given amount. Returns the new value.
    *
    * =========================================================================
+   * ARCH-08 cross-reference: See security_audit_team10 ARCH-08 for full analysis.
    * MED-24 / M-02 WARNING — FLOATING-POINT ACCUMULATION DRIFT
    * =========================================================================
    * Counter values are stored as IEEE 754 doubles (JavaScript numbers). Over
@@ -421,11 +431,11 @@ export class MemoryStore implements Store {
    * should not be used for counter operations (HMAC verification will fail).
    */
   destroy(): void {
-    // Zero the HMAC key material to prevent recovery from heap dumps
+    // T1-F4 fix: Zero the HMAC key material using Buffer.fill(0) for reliable in-place
+    // zeroization. Unlike strings (which are immutable in V8), Buffer.fill(0) overwrites
+    // the underlying ArrayBuffer bytes directly, preventing recovery from heap dumps.
     if (this.hmacKey) {
-      // Overwrite the string contents (best-effort in JS — V8 may retain copies)
-      (this as any).hmacKey = "0".repeat(this.hmacKey.length);
-      (this as any).hmacKey = "";
+      this.hmacKey.fill(0);
     }
     this.stopGc();
     this.data.clear();

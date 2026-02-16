@@ -319,8 +319,9 @@ describe("RateLimitRule", () => {
 
     expect(result.decision).toBe("DENY");
     if (result.decision === "DENY") {
+      // MED-T3-07 fix: Rate limit denial messages are now generic ("Rate limit exceeded")
+      // and no longer include specific window labels like "per minute" or "per hour".
       expect(result.reason).toContain("Rate limit exceeded");
-      expect(result.reason).toContain("per minute");
     }
   });
 
@@ -336,7 +337,8 @@ describe("RateLimitRule", () => {
 
     expect(result.decision).toBe("DENY");
     if (result.decision === "DENY") {
-      expect(result.reason).toContain("per hour");
+      // MED-T3-07 fix: Rate limit denial messages are now generic
+      expect(result.reason).toContain("Rate limit exceeded");
     }
   });
 
@@ -355,7 +357,8 @@ describe("RateLimitRule", () => {
     const result = await rule.evaluate(makeIntent(), ctx);
     expect(result.decision).toBe("DENY");
     if (result.decision === "DENY") {
-      expect(result.reason).toContain("per hour");
+      // MED-T3-07 fix: Rate limit denial messages are now generic
+      expect(result.reason).toContain("Rate limit exceeded");
     }
   });
 });

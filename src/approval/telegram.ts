@@ -4,6 +4,7 @@
  * Uses the raw Telegram Bot API via fetch (no external dependencies).
  * Flow: sendMessage with inline keyboard → poll getUpdates for callback_query → return decision.
  *
+ * ARCH-12 cross-reference: See security_audit_team10 ARCH-12 for full analysis.
  * API-010: POLLING ARCHITECTURE LIMITATION — This implementation uses getUpdates long-polling,
  * which is globally destructive (acknowledging an update_id discards all lower IDs server-side).
  * Only one process can poll a given bot token at a time. For multi-instance deployments,
@@ -13,6 +14,9 @@
  */
 
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { Agent as HttpsAgent, request as httpsRequest } from "node:https";
+import { lookup as dnsLookup } from "node:dns";
+import { promisify } from "node:util";
 import type {
   ApprovalChannel,
   ApprovalRequest,
@@ -69,8 +73,13 @@ const DEFAULT_TIMEOUT_MS = 300_000; // 5 minutes
 const DEFAULT_POLL_INTERVAL_MS = 2000;
 const TELEGRAM_LONG_POLL_TIMEOUT = 2; // seconds for getUpdates long poll
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
-/** HIGH-20 fix: Time-to-live for processed request entries (10 minutes) */
-const PROCESSED_REQUEST_TTL_MS = 600_000;
+/** HIGH-20 fix: Time-to-live for processed request entries.
+ * T8-F10 fix: Increased from 10 minutes to 24 hours to match idempotency cache TTL,
+ * closing the replay window where a stale callback could be re-processed after TTL expiry. */
+const PROCESSED_REQUEST_TTL_MS = 86_400_000; // 24 hours
+/** T8-F6 fix: Maximum failed HMAC verification attempts per request before auto-rejection.
+ * Provides defense-in-depth against brute-force attempts on the truncated 128-bit HMAC. */
+const MAX_HMAC_FAILURES = 10;
 
 export class TelegramApprovalBot implements ApprovalChannel {
   readonly name = "telegram";
@@ -96,6 +105,12 @@ export class TelegramApprovalBot implements ApprovalChannel {
    */
   private readonly processedRequests = new Map<string, number>();
   /**
+   * T8-F6 fix: Track failed HMAC verification attempts per request to provide
+   * defense-in-depth against brute-force attacks on the truncated 128-bit HMAC.
+   * After MAX_HMAC_FAILURES failed attempts, the request is auto-rejected.
+   */
+  private readonly hmacFailureCounts = new Map<string, number>();
+  /**
    * API-010: Persistent offset for getUpdates polling. Tracks the last processed update_id
    * across calls to avoid re-processing or consuming unrelated updates from previous sessions.
    */
@@ -112,6 +127,12 @@ export class TelegramApprovalBot implements ApprovalChannel {
    * with a domain-separation prefix to produce a proper HMAC key.
    */
   private hmacSecret: Buffer;
+  /**
+   * SSRF-MED-01 / NET-01 fix: DNS-pinned HTTPS agent for Telegram API calls.
+   * Prevents DNS rebinding attacks by resolving api.telegram.org once at construction
+   * and pinning the agent's lookup to return only the validated IP.
+   */
+  private pinnedAgent: HttpsAgent | undefined;
 
   constructor(config: TelegramApprovalBotConfig) {
     if (!config.token || typeof config.token !== "string" || config.token.trim() === "") {
@@ -175,6 +196,109 @@ export class TelegramApprovalBot implements ApprovalChannel {
   }
 
   /**
+   * SSRF-MED-01 / NET-01 fix: Lazily create a DNS-pinned HTTPS agent for Telegram API.
+   * Resolves api.telegram.org, validates it's not a private IP, and creates an agent
+   * with a pinned lookup that returns only the validated IP. This prevents DNS rebinding
+   * attacks where an attacker controlling DNS could redirect Telegram API calls to
+   * internal services, potentially leaking the bot token.
+   */
+  private async ensurePinnedAgent(): Promise<HttpsAgent> {
+    if (this.pinnedAgent) return this.pinnedAgent;
+
+    const dnsLookupAsync = promisify(dnsLookup);
+    const hostname = new URL(this.apiBase).hostname;
+    const { address } = await dnsLookupAsync(hostname, { family: 4 });
+
+    // Validate the resolved IP is not a private/reserved range
+    if (
+      address.startsWith("10.") ||
+      address.startsWith("192.168.") ||
+      /^172\.(1[6-9]|2\d|3[01])\./.test(address) ||
+      address.startsWith("127.") ||
+      address === "0.0.0.0" ||
+      address.startsWith("169.254.") ||
+      /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(address)
+    ) {
+      throw new Error(
+        `TelegramApprovalBot: DNS for ${hostname} resolved to private IP ${address} (possible DNS rebinding attack)`,
+      );
+    }
+
+    const pinnedIp = address;
+    this.pinnedAgent = new HttpsAgent({
+      keepAlive: true,
+      maxSockets: 5,
+      minVersion: "TLSv1.2",
+      lookup: ((_hostname: string, _options: unknown, cb: (err: null, address: string, family: number) => void) => {
+        cb(null, pinnedIp, 4);
+      }) as never,
+    });
+    return this.pinnedAgent;
+  }
+
+  /**
+   * SSRF-MED-01 / NET-01 fix: Fetch wrapper that routes through the DNS-pinned HTTPS agent.
+   * Node.js global fetch (undici-based) does not accept node:https agents, so this uses
+   * https.request directly. Returns a minimal Response-like object compatible with the
+   * existing call sites.
+   */
+  private async pinnedFetch(
+    url: string,
+    options: { method?: string; headers?: Record<string, string>; body?: string; signal?: AbortSignal },
+  ): Promise<{ ok: boolean; status: number; text(): Promise<string>; json(): Promise<unknown> }> {
+    const agent = await this.ensurePinnedAgent();
+    const parsed = new URL(url);
+
+    return new Promise((resolve, reject) => {
+      const req = httpsRequest(
+        {
+          hostname: parsed.hostname,
+          port: parsed.port ? Number(parsed.port) : 443,
+          path: parsed.pathname + parsed.search,
+          method: options.method ?? "GET",
+          headers: options.headers,
+          agent,
+        },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on("data", (chunk: Buffer) => chunks.push(chunk));
+          res.on("end", () => {
+            const body = Buffer.concat(chunks).toString("utf8");
+            const status = res.statusCode ?? 0;
+            resolve({
+              ok: status >= 200 && status < 300,
+              status,
+              text: () => Promise.resolve(body),
+              json: () => Promise.resolve(JSON.parse(body)),
+            });
+          });
+          res.on("error", reject);
+        },
+      );
+
+      if (options.signal) {
+        if (options.signal.aborted) {
+          req.destroy();
+          reject(new Error("Request aborted"));
+          return;
+        }
+        options.signal.addEventListener(
+          "abort",
+          () => {
+            req.destroy();
+            reject(new Error("Request aborted"));
+          },
+          { once: true },
+        );
+      }
+
+      req.on("error", reject);
+      if (options.body) req.write(options.body);
+      req.end();
+    });
+  }
+
+  /**
    * Send an approval request to Telegram and block until a human responds or timeout.
    * MED-18 fix: Rate-limits approval requests to prevent notification flooding.
    */
@@ -221,7 +345,8 @@ export class TelegramApprovalBot implements ApprovalChannel {
       }
     }
 
-    const result = await this.waitForResponse(request.id, sent.message_id, timeoutMs);
+    // HIGH-T3-03 fix: Pass the full request to waitForResponse for self-approval prevention
+    const result = await this.waitForResponse(request.id, sent.message_id, timeoutMs, request);
 
     // API-011: Echo the intentHash in the result so callers can verify which intent
     // was approved. Note (CRIT-03): The approval gate should still re-compute the
@@ -296,6 +421,7 @@ export class TelegramApprovalBot implements ApprovalChannel {
     requestId: string,
     messageId: number,
     timeoutMs: number,
+    request?: ApprovalRequest,
   ): Promise<ApprovalResult> {
     const deadline = Date.now() + timeoutMs;
     // L-31 fix: Set polling flag so destroy() can signal this loop to stop
@@ -319,13 +445,10 @@ export class TelegramApprovalBot implements ApprovalChannel {
 	          Math.max(this.requestTimeoutMs, (TELEGRAM_LONG_POLL_TIMEOUT + 1) * 1000),
 	        );
 
-	        // M-47: SECURITY NOTE — This fetch() call does not use a DNS-pinned agent.
-	        // For consistency with the RPC layer's DNS pinning, Telegram API calls should
-	        // use a DNS-pinned HTTP agent to prevent DNS rebinding attacks. If a
-	        // fetchWithAgent() utility or pinned agent is available in the project,
-	        // replace this bare fetch() call with one that routes through the pinned agent.
+	        // SSRF-MED-01 / NET-01 fix: Use pinnedFetch to route through DNS-pinned agent,
+	        // preventing DNS rebinding attacks against the Telegram Bot API endpoint.
 	        // L-25 fix: Include User-Agent header on all outbound HTTP requests
-	        const response = await fetch(
+	        const response = await this.pinnedFetch(
 	          `${this.apiBase}/getUpdates?${params.toString()}`,
 	          {
 	            signal: controller.signal,
@@ -372,10 +495,30 @@ export class TelegramApprovalBot implements ApprovalChannel {
           continue; // Callback from a different chat — ignore
         }
 
+        // T8-F6 fix: Check if this request has exceeded the HMAC failure threshold.
+        // If so, auto-reject to prevent further brute-force attempts.
+        const hmacFailures = this.hmacFailureCounts.get(requestId) ?? 0;
+        if (hmacFailures >= MAX_HMAC_FAILURES) {
+          this.pollingActive = false;
+          this.processedRequests.set(requestId, Date.now());
+          return {
+            requestId,
+            decision: "rejected",
+            decidedBy: "system:hmac-brute-force-protection",
+            decidedAt: Date.now(),
+          };
+        }
+
         // HIGH-11 fix: Verify HMAC on callback data to prevent forgery
         const isApprove = this.verifyCallbackData(data, requestId, "approve");
         const isReject = this.verifyCallbackData(data, requestId, "reject");
-        if (!isApprove && !isReject) continue;
+        if (!isApprove && !isReject) {
+          // T8-F6 fix: Track failed HMAC verification attempts for brute-force detection
+          if (data.includes(requestId)) {
+            this.hmacFailureCounts.set(requestId, hmacFailures + 1);
+          }
+          continue;
+        }
 
         // MED-16 fix: Reject replayed callbacks for already-processed requests
         // HIGH-20 fix: Also check if the entry is still within the TTL window
@@ -392,10 +535,32 @@ export class TelegramApprovalBot implements ApprovalChannel {
 
         // Validate user authorization
         if (this.allowedUserIds && !this.allowedUserIds.includes(from.id)) {
+          // T8-F13 fix: Log unauthorized approval attempts for security monitoring.
+          // Repeated unauthorized attempts could indicate an attack in progress
+          // (e.g., a compromised chat member trying to approve transactions).
+          try {
+            process.emitWarning(
+              `Unauthorized approval attempt for request ${requestId} by Telegram user ${from.id} ` +
+              `(${from.first_name || "unknown"}). User is not in allowedUserIds list.`,
+              "KovaUnauthorizedApprovalAttempt",
+            );
+          } catch { /* non-fatal */ }
           // Unauthorized user — answer and continue polling
           await this.answerCallbackQuery(
             callbackId,
             "You are not authorized to respond to this request.",
+          );
+          continue;
+        }
+
+        // HIGH-T3-03 fix: Prevent self-approval. If the request has an agentId that
+        // matches the approver's Telegram user ID, reject the approval to enforce
+        // separation of duties. A compromised authorized user should not be able to
+        // both initiate and approve their own high-value transactions.
+        if (isApprove && request?.agentId && String(from.id) === String(request.agentId)) {
+          await this.answerCallbackQuery(
+            callbackId,
+            "Self-approval is not permitted. A different authorized user must approve this request.",
           );
           continue;
         }
@@ -518,10 +683,11 @@ export class TelegramApprovalBot implements ApprovalChannel {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.requestTimeoutMs);
 
-    let response: Response;
+    let response: { ok: boolean; status: number; text(): Promise<string>; json(): Promise<unknown> };
     try {
+      // SSRF-MED-01 / NET-01 fix: Use pinnedFetch to route through DNS-pinned agent
       // L-25 fix: Include User-Agent header on all outbound HTTP requests
-      response = await fetch(`${this.apiBase}/${method}`, {
+      response = await this.pinnedFetch(`${this.apiBase}/${method}`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -648,6 +814,16 @@ export class TelegramApprovalBot implements ApprovalChannel {
    * 3. Clears the HMAC secret derived from the token.
    * 4. Clears processed request tracking data.
    * After calling destroy(), all public methods will throw.
+   *
+   * T8-F7 KNOWN LIMITATION: JavaScript's garbage collector makes no guarantees about
+   * when old string values are freed from memory. The bot token may persist in V8's
+   * heap as intermediate string copies (from concatenation in apiBase, HMAC derivation,
+   * etc.) even after this method clears the references. Memory forensics on a process
+   * dump could recover the token. Mitigations:
+   *   1. For production, use a reverse proxy that injects the token server-side so it
+   *      never enters the Node.js process memory.
+   *   2. Rotate bot tokens periodically via BotFather's /revoke command.
+   *   3. Run the wallet process with restricted memory dump permissions.
    */
   async destroy(): Promise<void> {
     if (this.destroyed) return;
@@ -663,6 +839,13 @@ export class TelegramApprovalBot implements ApprovalChannel {
     this.hmacSecret.fill(0);
     // Clear processed request tracking data
     this.processedRequests.clear();
+    // T8-F6 fix: Clear HMAC failure tracking
+    this.hmacFailureCounts.clear();
+    // SSRF-MED-01 / NET-01 fix: Destroy the DNS-pinned HTTPS agent to release sockets
+    if (this.pinnedAgent) {
+      this.pinnedAgent.destroy();
+      this.pinnedAgent = undefined;
+    }
   }
 }
 
@@ -695,7 +878,11 @@ function formatApprovalMessage(request: ApprovalRequest): string {
   }
 
   if (request.agentId) {
-    lines.push(`<b>Agent:</b> ${escapeHtml(request.agentId)}`);
+    // T8-F5 fix: Prefix agentId with [UNVERIFIED] since it is self-reported by
+    // the agent and not cryptographically authenticated. This prevents social
+    // engineering where a malicious agent sets agentId to a trusted name to
+    // mislead the human approver into approving a fraudulent transaction.
+    lines.push(`<b>Agent:</b> [UNVERIFIED] ${escapeHtml(request.agentId)}`);
   }
 
   if (request.budgetContext) {

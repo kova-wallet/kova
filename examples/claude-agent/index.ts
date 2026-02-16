@@ -21,7 +21,9 @@
 
 // Requires: npm install @anthropic-ai/sdk
 import Anthropic from "@anthropic-ai/sdk";
-import { Keypair } from "@solana/web3.js";
+import { Connection } from "@solana/web3.js";
+import { loadOrCreateKeypair, ensureDevnetSol } from "../utils.js";
+import type { PolicyRule } from "../../src/index.js";
 import {
   AgentWallet,
   Policy,
@@ -32,6 +34,10 @@ import {
   LocalSigner,
   SolanaAdapter,
   MemoryStore,
+  // NET-07 fix: Use safeHandleToolCall instead of wallet.handleToolCall directly.
+  // safeHandleToolCall integrates validateToolInput() for schema validation and
+  // the write rate limit floor (WRITE_RATE_LIMIT_PER_MINUTE = 30).
+  safeHandleToolCall,
 } from "../../src/index.js";
 
 // ── Configuration ───────────────────────────────────────────────────────────
@@ -50,9 +56,13 @@ Be concise in your responses. If a transaction is denied by policy, explain why 
 
 // ── Wallet Setup ────────────────────────────────────────────────────────────
 
-function createWallet(): AgentWallet {
-  const keypair = Keypair.generate();
+async function createWallet(): Promise<AgentWallet> {
+  const keypair = loadOrCreateKeypair();
   console.log(`Wallet address: ${keypair.publicKey.toBase58()}`);
+
+  // Airdrop devnet SOL so the wallet can transact (skips if already funded)
+  const connection = new Connection(RPC_URL, "confirmed");
+  await ensureDevnetSol(connection, keypair);
 
   // Build policy: conservative spending limits with an allowlist
   const policy = Policy.create("claude-agent-demo")
@@ -65,9 +75,11 @@ function createWallet(): AgentWallet {
     .build();
 
   // Convert Policy to PolicyEngine
-  const store = new MemoryStore();
+  // T1-F10 fix: Pass dangerouslyAllowInProduction to allow MemoryStore usage in examples.
+  // Production deployments should use SqliteStore with encryption instead.
+  const store = new MemoryStore({ dangerouslyAllowInProduction: true });
   const config = policy.toJSON();
-  const rules = [];
+  const rules: PolicyRule[] = [];
   if (config.spendingLimit) rules.push(new SpendingLimitRule(config.spendingLimit));
   if (config.allowAddresses || config.denyAddresses || config.allowPrograms || config.denyPrograms) {
     rules.push(
@@ -83,7 +95,9 @@ function createWallet(): AgentWallet {
   const engine = new PolicyEngine(rules, store);
 
   return new AgentWallet({
-    signer: new LocalSigner(keypair),
+    // T6-F5 fix: Pass dangerouslyAllowInProduction to allow LocalSigner usage in examples.
+    // Production deployments should use MpcSigner with a hardware-backed provider instead.
+    signer: new LocalSigner(keypair, { dangerouslyAllowInProduction: true }),
     chain: new SolanaAdapter({ rpcUrl: RPC_URL }),
     policy: engine,
     store,
@@ -128,8 +142,12 @@ async function runAgent(wallet: AgentWallet, userMessage: string): Promise<strin
         console.log(`  Tool call: ${block.name}`);
         console.log(`    Input: ${JSON.stringify(block.input)}`);
 
-        // Dispatch to the wallet
-        const result = await wallet.handleToolCall(
+        // NET-07 fix: Use safeHandleToolCall instead of wallet.handleToolCall directly.
+        // safeHandleToolCall wraps handleToolCall with validateToolInput() for schema
+        // validation (required fields, type checks, unknown property stripping) and the
+        // write rate limit floor (WRITE_RATE_LIMIT_PER_MINUTE = 30).
+        const result = await safeHandleToolCall(
+          wallet,
           block.name,
           block.input as Record<string, unknown>,
         );
@@ -180,7 +198,7 @@ async function main() {
 
   console.log("=== Claude Agent with Wallet Tools ===\n");
 
-  const wallet = createWallet();
+  const wallet = await createWallet();
 
   // Ask Claude to check the wallet and try a transfer
   const reply = await runAgent(

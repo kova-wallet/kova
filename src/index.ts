@@ -6,7 +6,7 @@
 // This means type errors in third-party .d.ts files will not be caught
 // at compile time. If you encounter runtime type mismatches with
 // dependencies, consider running tsc with --skipLibCheck false to diagnose.
-// (See SUPPLY-012)
+// (See SUPPLY-012, ARCH-16 cross-reference: security_audit_team10 ARCH-16)
 //
 // SUPPLY-011: PUBLIC API SURFACE — This barrel export file defines the SDK's
 // public API. Internal modules marked with @internal JSDoc tags are exported
@@ -142,7 +142,7 @@ export type { AuditEntry, PolicyRuleAudit } from "./logging/types.js";
 // Tool definitions and framework-specific adapters for AI agent integration.
 // ---------------------------------------------------------------------------
 export type { ToolDefinition, ToolParameter, ToolCallResult } from "./adapters/types.js";
-export { WALLET_TOOLS, WALLET_TOOL_NAMES, getToolByName } from "./adapters/tools.js";
+export { WALLET_TOOLS, WALLET_TOOL_NAMES, getToolByName, safeHandleToolCall } from "./adapters/tools.js";
 export type { WalletToolName } from "./adapters/tools.js";
 export { toAnthropicTools } from "./adapters/claude.js";
 export type { AnthropicTool } from "./adapters/claude.js";

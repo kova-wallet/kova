@@ -76,6 +76,18 @@ export type WalletToolDefinition = ToolDefinition;
  * Default safe tools exposed to agents. Does NOT include dangerous tools
  * (wallet_execute_custom, wallet_get_policy) which must be opted-in explicitly.
  * Use getFilteredTools() or ALL_WALLET_TOOLS if you need access to dangerous tools.
+ *
+ * ARCH-03 SECURITY WARNING — wallet_execute_custom:
+ * When enabled, wallet_execute_custom allows AI agents to submit ARBITRARY Solana
+ * instructions (any program ID, data buffer, and account list). The policy engine
+ * evaluates custom intents as opaque blobs — spending limits cannot assess the true
+ * value transfer, and allowlists cannot evaluate the actual fund recipient within
+ * the instruction data. Agents with this tool can bypass semantic policy checks by
+ * encoding transfers as raw instruction data. Only enable wallet_execute_custom when:
+ *   1. The agent is trusted and sandboxed
+ *   2. An ApprovalGateRule is configured to require human approval for all custom intents
+ *   3. A restrictive allowlist limits which program IDs can be invoked
+ * See security_audit_team10 ARCH-03 for full analysis.
  */
 export const WALLET_TOOLS: readonly ToolDefinition[] = [
   {

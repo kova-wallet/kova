@@ -213,7 +213,7 @@ Here's what one tool schema looks like:
 }
 ```
 
-There are 8 tools total:
+There are 8 tools total (6 safe by default, 2 dangerous opt-in):
 
 | Tool | What it does |
 |------|-------------|

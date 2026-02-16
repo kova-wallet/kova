@@ -4,6 +4,7 @@
  * Flow: GET /quote → POST /swap → decode VersionedTransaction → return as UnsignedTransaction.
  * The LocalSigner handles VersionedTransaction natively.
  *
+ * ARCH-11 cross-reference: See security_audit_team10 ARCH-11 for full analysis.
  * CHAIN-021: JUPITER API TRUST BOUNDARY — The swap flow trusts the Jupiter API to return
  * valid, non-malicious transaction data. While we validate program allowlists, fee payer,
  * and minimum output amounts, the Jupiter API is an external dependency. A compromised
@@ -41,6 +42,7 @@ import {
   toSmallestUnit,
   normalizeTokenSymbol,
   SolanaAdapterError,
+  stripControlChars,
 } from "./utils.js";
 
 const DEFAULT_JUPITER_API = "https://quote-api.jup.ag/v6";
@@ -60,6 +62,12 @@ const DEFAULT_FETCH_TIMEOUT_MS = 15_000;
 export class JupiterRateLimiter {
   private lastCallMs = 0;
   private readonly minIntervalMs: number;
+  /**
+   * CONC-03 fix: Promise-chain mutex to serialize enforce() calls.
+   * Without this, concurrent calls via Promise.all could both read the same
+   * lastCallMs, both skip the wait, and both proceed — defeating the rate limit.
+   */
+  private enforceLock: Promise<void> = Promise.resolve();
 
   constructor(minIntervalMs: number = 200) {
     this.minIntervalMs = minIntervalMs;
@@ -69,21 +77,36 @@ export class JupiterRateLimiter {
    * H-29 fix: Enforce rate limiting before making a Jupiter API call.
    * If the minimum interval has not elapsed since the last call, waits
    * for the remaining time before proceeding.
+   *
+   * CONC-03 fix: Serialized via Promise-chain mutex to prevent TOCTOU race
+   * where concurrent calls read the same lastCallMs and both skip the wait.
    */
   async enforce(): Promise<void> {
-    const now = Date.now();
-    const elapsed = now - this.lastCallMs;
-    if (elapsed < this.minIntervalMs) {
-      const waitMs = this.minIntervalMs - elapsed;
-      await new Promise((resolve) => setTimeout(resolve, waitMs));
+    let release: () => void;
+    const prev = this.enforceLock;
+    this.enforceLock = new Promise<void>((r) => { release = r; });
+    await prev;
+    try {
+      const now = Date.now();
+      const elapsed = now - this.lastCallMs;
+      if (elapsed < this.minIntervalMs) {
+        const waitMs = this.minIntervalMs - elapsed;
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
+      }
+      this.lastCallMs = Date.now();
+    } finally {
+      release!();
     }
-    this.lastCallMs = Date.now();
   }
 }
 
 /**
  * MED-T2-03: Default module-level rate limiter for backward compatibility.
  * New code should use per-instance rate limiters via JupiterRateLimiter class.
+ *
+ * CONC-02 KNOWN LIMITATION: This rate limiter is shared across ALL SolanaAdapter
+ * instances. One wallet's Jupiter API calls will delay another wallet's swaps.
+ * For multi-wallet deployments, use per-instance rate limiters.
  */
 const defaultRateLimiter = new JupiterRateLimiter();
 
@@ -598,9 +621,11 @@ export async function buildJupiterSwap(
 
   const quoteResponse = await fetchWithTimeout(quoteUrl.toString(), undefined, DEFAULT_FETCH_TIMEOUT_MS, rateLimiter);
   if (!quoteResponse.ok) {
+    // NET-03 fix: Sanitize Jupiter API error responses to prevent leaking internal
+    // error details, routing information, or rate limit headers that could aid reconnaissance.
     throw new SolanaAdapterError(
       "JUPITER_QUOTE_FAILED",
-      `Jupiter quote failed (${quoteResponse.status}): ${quoteResponse.body.slice(0, 200)}`,
+      `Jupiter quote request failed with status ${quoteResponse.status}`,
     );
   }
   // CRIT-04 fix: Validate response structure instead of trusting blind cast
@@ -621,9 +646,10 @@ export async function buildJupiterSwap(
   }, DEFAULT_FETCH_TIMEOUT_MS, rateLimiter);
 
   if (!swapResponse.ok) {
+    // NET-03 fix: Sanitize Jupiter API error responses (see quote error above)
     throw new SolanaAdapterError(
       "JUPITER_SWAP_FAILED",
-      `Jupiter swap failed (${swapResponse.status}): ${swapResponse.body.slice(0, 200)}`,
+      `Jupiter swap request failed with status ${swapResponse.status}`,
     );
   }
 
@@ -811,7 +837,7 @@ export async function buildJupiterSwap(
   return {
     chain: "solana",
     data: new Uint8Array(swapTransactionBuf),
-    description: `Swap ${params.amount} ${params.fromToken} for ${params.toToken} via Jupiter`,
+    description: `Swap ${stripControlChars(String(params.amount))} ${stripControlChars(params.fromToken)} for ${stripControlChars(params.toToken)} via Jupiter`,
   };
 }
 
@@ -834,6 +860,14 @@ interface PriceCacheEntry {
   price: number;
   fetchedAt: number;
 }
+/**
+ * CONC-02 KNOWN LIMITATION: This cache is module-level and shared across ALL
+ * SolanaAdapter instances within the same Node.js process. In multi-wallet
+ * deployments, one wallet's adapter writing a price affects all wallets'
+ * spending limit calculations. This is acceptable for single-wallet deployments
+ * (the primary supported configuration). For multi-wallet isolation, instantiate
+ * wallets in separate worker_threads or processes.
+ */
 const priceCache = new Map<string, PriceCacheEntry>();
 const PRICE_CACHE_TTL_MS = 30_000; // 30 seconds
 /** HIGH-20 fix: Maximum reasonable price change per cache window (300% = 3x) */

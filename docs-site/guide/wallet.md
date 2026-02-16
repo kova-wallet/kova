@@ -468,7 +468,7 @@ const tools = wallet.toAnthropicTools();
 // Claude can now decide to call wallet tools (e.g., wallet_transfer) based on the user's request.
 // When Claude returns a tool_use block, you pass it to wallet.handleToolCall() to execute.
 const response = await client.messages.create({
-  model: "claude-sonnet-4-20250514",  // The Claude model to use
+  model: "claude-sonnet-4-5-20250929",  // The Claude model to use
   max_tokens: 1024,                   // Maximum response length
   tools,                              // Attach the wallet tool definitions
   messages: [{ role: "user", content: "Send 0.1 SOL to Alice" }],

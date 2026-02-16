@@ -337,7 +337,10 @@ export class SpendingLimitRule implements PolicyRule {
       if (colonIdx === -1) continue;
       const ts = parseInt(entry.slice(0, colonIdx), 10);
       const amt = parseFloat(entry.slice(colonIdx + 1));
-      if (ts >= windowStartMs && Number.isFinite(amt)) {
+      // MED-T3-01 fix: Reject negative amounts when summing sliding window entries.
+      // Corrupted or tampered store entries with negative values would reduce windowTotal,
+      // effectively granting additional spending budget.
+      if (ts >= windowStartMs && Number.isFinite(amt) && amt >= 0) {
         windowTotal += amt;
       }
     }
@@ -472,7 +475,8 @@ export class SpendingLimitRule implements PolicyRule {
       if (colonIdx === -1) continue;
       const ts = parseInt(entry.slice(0, colonIdx), 10);
       const amt = parseFloat(entry.slice(colonIdx + 1));
-      if (ts >= windowStartMs && Number.isFinite(amt)) {
+      // MED-T3-01 fix: Reject negative amounts (see slidingWindowCheckLimit for rationale)
+      if (ts >= windowStartMs && Number.isFinite(amt) && amt >= 0) {
         windowTotal += amt;
       }
     }

@@ -213,6 +213,24 @@ export async function buildSPLTransfer(
     );
   }
 
+  // T2-9.1 fix: Warn when the SPL token recipient is a PDA (off-curve address).
+  // PDAs cannot sign transactions, so SPL tokens sent to a PDA's ATA may be
+  // permanently locked if no program can authorize transfers from that ATA.
+  // This is a warning rather than a hard error because some legitimate use cases
+  // involve sending tokens to PDA vaults (e.g., program-owned treasuries).
+  try {
+    if (!PublicKey.isOnCurve(recipient.toBytes())) {
+      process.emitWarning(
+        `SPL token transfer recipient ${params.to} is a PDA (off-curve address). ` +
+        `Tokens sent to a PDA's associated token account may be irrecoverable ` +
+        `if no program can authorize transfers from the PDA.`,
+        "KovaPDAWarning",
+      );
+    }
+  } catch {
+    // Non-fatal: isOnCurve check failure should not block the transfer
+  }
+
   // HIGH-08 fix: Validate recipient before building transaction
   validateRecipientAddress(params.to);
 
@@ -359,6 +377,27 @@ export async function buildSPLTransfer(
       );
     }
 
+    // T2-5.2 fix: Verify sender has sufficient SOL to cover ATA rent + estimated fees
+    // when ATA creation is required. Without this check, the transaction fails at
+    // broadcast with a confusing "insufficient lamports" error instead of a clear
+    // pre-flight error explaining the ATA rent requirement.
+    const ESTIMATED_FEE_LAMPORTS_SPL = 5000n;
+    try {
+      const senderSOLBalance = await connection.getBalance(sender);
+      const requiredSOL = ATA_RENT_EXEMPTION_LAMPORTS + ESTIMATED_FEE_LAMPORTS_SPL;
+      if (BigInt(senderSOLBalance) < requiredSOL) {
+        throw new SolanaAdapterError(
+          "INSUFFICIENT_BALANCE",
+          `Insufficient SOL for ATA creation: sender has ${senderSOLBalance} lamports but ATA rent ` +
+          `requires ~${ATA_RENT_EXEMPTION_LAMPORTS} lamports plus ~${ESTIMATED_FEE_LAMPORTS_SPL} lamports ` +
+          `in fees (total: ${requiredSOL} lamports). Fund the sender with at least ~0.003 SOL.`,
+        );
+      }
+    } catch (err) {
+      if (err instanceof SolanaAdapterError) throw err;
+      // Non-fatal: simulation will catch this later
+    }
+
     // ATA doesn't exist — sender pays for creation
     transaction.add(
       createAssociatedTokenAccountInstruction(
@@ -494,8 +533,14 @@ export async function addPriorityFee(
     // This prevents a single extreme fee sample (from a malicious RPC or transient
     // network spike) from skewing the priority fee estimate upward, which could
     // drain the wallet through excessive fees.
+    // T2-1.1 fix: Require a minimum of 3 fee samples before trusting the median.
+    // With fewer than 3 samples, a malicious or compromised RPC node could return
+    // extreme fee values that pass the MAX_INDIVIDUAL_FEE_SAMPLE filter but still
+    // inflate priority fees. Fall back to the default minimum fee when insufficient
+    // samples are available for reliable median estimation.
+    const MIN_FEE_SAMPLES = 3;
     let filteredFees = recentFees;
-    if (recentFees.length >= 3) {
+    if (recentFees.length >= MIN_FEE_SAMPLES) {
       const preliminaryMedian = recentFees[Math.floor(recentFees.length / 2)]!;
       const outlierThreshold = preliminaryMedian * 3;
       filteredFees = recentFees.filter((f) => f <= outlierThreshold);
@@ -506,9 +551,9 @@ export async function addPriorityFee(
     }
 
     const medianFee =
-      filteredFees.length > 0
+      filteredFees.length >= MIN_FEE_SAMPLES
         ? filteredFees[Math.floor(filteredFees.length / 2)]!
-        : 1000; // default 1000 micro-lamports per CU
+        : 1000; // default 1000 micro-lamports per CU when <3 samples available
 
     // LOW-02 fix: Cap the priority fee to prevent manipulation by malicious RPC
     let cappedFee = Math.min(medianFee, maxFee);
@@ -518,9 +563,11 @@ export async function addPriorityFee(
     // If this exceeds the absolute cap, reduce the per-CU price accordingly.
     // HIGH-T2-03 fix: Use configurable cap, defaulting to the lowered 0.001 SOL.
     const maxTotalFeeLamports = config?.maxPriorityFeeLamports ?? DEFAULT_MAX_PRIORITY_FEE_LAMPORTS;
-    const totalFeeLamports = (cappedFee * computeUnits) / 1_000_000;
+    // INT-LOW-01 fix: Use BigInt for priority fee calculation to avoid floating-point
+    // precision loss when cappedFee * computeUnits exceeds Number.MAX_SAFE_INTEGER.
+    const totalFeeLamports = Number(BigInt(cappedFee) * BigInt(computeUnits) / 1_000_000n);
     if (totalFeeLamports > maxTotalFeeLamports) {
-      cappedFee = Math.floor((maxTotalFeeLamports * 1_000_000) / computeUnits);
+      cappedFee = Number(BigInt(maxTotalFeeLamports) * 1_000_000n / BigInt(computeUnits));
     }
 
     transaction.add(

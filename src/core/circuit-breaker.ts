@@ -77,6 +77,13 @@ export interface CircuitBreakerConfig {
    * intent types, include them here so isOpen() checks their circuit breaker state.
    */
   intentTypes?: string[];
+  /**
+   * ARCH-01 fix: When true, initialize() throws an error instead of logging a
+   * warning when another instance is detected sharing the same store. This enforces
+   * the single-instance requirement at startup, preventing silent security degradation.
+   * Default: false (warning only, for backwards compatibility).
+   */
+  failOnMultiInstance?: boolean;
 }
 
 /** MED-T5-08 fix: Default intent types for isOpen() checks */
@@ -154,19 +161,33 @@ export class CircuitBreaker {
     if (this.initialized) return;
     this.initialized = true;
 
-    // Check for existing instance
+    // CONC-15 fix: Use setIfNotExists for initial instance registration.
+    // If another instance already registered, setIfNotExists returns false,
+    // providing a reliable detection mechanism instead of the previous
+    // get-then-set pattern which had a TOCTOU window where two instances
+    // starting simultaneously could both see "no existing instance."
     try {
-      const existing = await this.store.get(INSTANCE_KEY);
-      if (existing && existing !== this.instanceId) {
-        console.error(
-          "[KOVA CRITICAL] Multiple instances detected sharing the same store. " +
+      const claimed = await this.store.setIfNotExists(INSTANCE_KEY, this.instanceId, INSTANCE_TTL_SECONDS);
+      if (!claimed) {
+        // Another instance already holds the slot — check who
+        const existing = await this.store.get(INSTANCE_KEY);
+        if (existing && existing !== this.instanceId) {
+          const message =
+            "[KOVA CRITICAL] Multiple instances detected sharing the same store. " +
             "This breaks security guarantees including mutex serialization, idempotency, " +
             "spending limits, and audit hash chains. Use a single instance or implement " +
             "distributed locking. " +
-            `(existing: ${existing.slice(0, 8)}..., this: ${this.instanceId.slice(0, 8)}...)`
-        );
+            `(existing: ${existing.slice(0, 8)}..., this: ${this.instanceId.slice(0, 8)}...)`;
+          // ARCH-01 fix: When failOnMultiInstance is true, throw an error instead of
+          // just logging a warning. This enforces the single-instance requirement.
+          if (this.config.failOnMultiInstance) {
+            throw new Error(message);
+          }
+          console.error(message);
+        }
+        // Overwrite with our ID (we're taking over, but with a warning logged)
+        await this.store.set(INSTANCE_KEY, this.instanceId, INSTANCE_TTL_SECONDS);
       }
-      await this.store.set(INSTANCE_KEY, this.instanceId, INSTANCE_TTL_SECONDS);
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : "Unknown error";
       console.error(`[KOVA WARNING] Failed to perform multi-instance detection: ${message}`);
@@ -354,6 +375,11 @@ export class CircuitBreaker {
    * malicious agent from triggering circuit breaker cooldown for all agents.
    */
   async recordOutcome(decision: "ALLOW" | "DENY" | "PENDING", now?: number, intentType?: string, agentId?: string): Promise<void> {
+    // CONC-05 cross-reference: This TOCTOU between check() and recordOutcome() is
+    // documented in CRIT-10 (class header) and mitigated by the wallet's execute mutex
+    // for single-instance deployments. For multi-instance, use store-level atomic
+    // compare-and-swap or Redis Lua scripts. See security_audit_team9 CONC-05.
+    //
     // MED-T4-03 NOTE: The getState() + setState() sequence below is NOT atomic.
     // In a multi-instance deployment, concurrent calls to recordOutcome() could both
     // read the same denial count and write count+1, losing an increment. For single-

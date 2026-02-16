@@ -193,6 +193,13 @@ export class ApprovalGateRule implements PolicyRule {
           reason: `Transaction token does not match approval gate configuration and no USD threshold is set`,
         };
       }
+      // T8-F11 fix: This ALLOW is reached only when:
+      //   1. The transaction token does NOT match the configured gate token, AND
+      //   2. A USD threshold IS configured (aboveUSD), AND
+      //   3. The USD value check above (line ~172) did NOT trigger (value is below USD threshold).
+      // In this case, the transaction is in a different token but under the USD threshold,
+      // so it is safe to allow without per-token approval. This is intentional — the USD
+      // threshold serves as the universal safety net across all tokens.
       return { decision: "ALLOW" };
     }
 

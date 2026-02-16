@@ -31,7 +31,7 @@ export OPENAI_API_KEY=sk-...
 
 ## Tool Format
 
-`wallet.toOpenAITools()` converts the 8 wallet tools into OpenAI's function calling format:
+`wallet.toOpenAITools()` converts the wallet tools (6 safe by default) into OpenAI's function calling format:
 
 ```typescript
 // The OpenAI tool format for function calling.
@@ -183,9 +183,12 @@ import {
 } from "kova";
 
 // 1. Set up the wallet with policy rules that constrain what the GPT agent can do.
-const store = new MemoryStore();
-// Create a signer from the private key. In production, use a remote signer (e.g., Fireblocks).
-const signer = new LocalSigner({ privateKey: process.env.WALLET_PRIVATE_KEY! });
+const store = new MemoryStore({ dangerouslyAllowInProduction: true });
+// Create a signer from a Keypair. In production, use MpcSigner with a hardware-backed provider.
+import { Keypair } from "@solana/web3.js";
+import bs58 from "bs58";
+const keypair = Keypair.fromSecretKey(bs58.decode(process.env.WALLET_PRIVATE_KEY!));
+const signer = new LocalSigner(keypair, { dangerouslyAllowInProduction: true });
 // Connect to the Solana RPC endpoint specified in the environment.
 const chain = new SolanaAdapter({ rpcUrl: process.env.SOLANA_RPC_URL! });
 
@@ -213,7 +216,7 @@ const wallet = new AgentWallet({
 
 // 2. Create the OpenAI client (reads OPENAI_API_KEY from environment).
 const openai = new OpenAI();
-// Convert the 8 wallet tools to OpenAI's function calling format.
+// Convert the wallet tools (6 safe by default) to OpenAI's function calling format.
 const tools = wallet.toOpenAITools();
 
 // 3. Define the agent loop -- this is the core of the OpenAI integration.
@@ -233,7 +236,7 @@ async function runAgent(userMessage: string): Promise<string> {
   // 4. Send the initial chat completion with the wallet tools available.
   let response = await openai.chat.completions.create({
     model: "gpt-4o",   // The GPT model to use (supports function calling)
-    tools,              // The 8 wallet tools in OpenAI format
+    tools,              // The wallet tools in OpenAI format
     messages,           // The conversation history
   });
 

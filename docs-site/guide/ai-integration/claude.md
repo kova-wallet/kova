@@ -31,7 +31,7 @@ export ANTHROPIC_API_KEY=sk-ant-...
 
 ## Tool Format
 
-`wallet.toAnthropicTools()` converts the 8 wallet tools into Anthropic's expected format:
+`wallet.toAnthropicTools()` converts the wallet tools (6 safe by default) into Anthropic's expected format:
 
 ```typescript
 // The Anthropic tool format. This is what Claude's API expects when you
@@ -85,7 +85,7 @@ To understand the integration, it helps to see exactly what JSON gets sent to Cl
 
 ```json
 {
-  "model": "claude-sonnet-4-20250514",
+  "model": "claude-sonnet-4-5-20250929",
   "max_tokens": 1024,
   "system": "You are a helpful payment assistant with access to a crypto wallet.",
   "tools": [
@@ -173,9 +173,12 @@ import {
 } from "kova";
 
 // 1. Set up the wallet with policy rules that constrain what Claude can do.
-const store = new MemoryStore();
-// Create a signer from the private key. In production, use a remote signer (e.g., Fireblocks).
-const signer = new LocalSigner({ privateKey: process.env.WALLET_PRIVATE_KEY! });
+const store = new MemoryStore({ dangerouslyAllowInProduction: true });
+// Create a signer from a Keypair. In production, use MpcSigner with a hardware-backed provider.
+import { Keypair } from "@solana/web3.js";
+import bs58 from "bs58";
+const keypair = Keypair.fromSecretKey(bs58.decode(process.env.WALLET_PRIVATE_KEY!));
+const signer = new LocalSigner(keypair, { dangerouslyAllowInProduction: true });
 // Connect to the Solana RPC endpoint specified in the environment.
 const chain = new SolanaAdapter({ rpcUrl: process.env.SOLANA_RPC_URL! });
 
@@ -204,7 +207,7 @@ const wallet = new AgentWallet({
 
 // 2. Create the Anthropic client (reads ANTHROPIC_API_KEY from environment).
 const anthropic = new Anthropic();
-// Convert the 8 wallet tools to Anthropic's expected format.
+// Convert the wallet tools (6 safe by default) to Anthropic's expected format.
 const tools = wallet.toAnthropicTools();
 
 // 3. Define the agent loop -- this is the core of the Claude integration.
@@ -218,11 +221,11 @@ async function runAgent(userMessage: string): Promise<string> {
 
   // 4. Send the initial message to Claude with the wallet tools available.
   let response = await anthropic.messages.create({
-    model: "claude-sonnet-4-20250514",       // The Claude model to use
+    model: "claude-sonnet-4-5-20250929",       // The Claude model to use
     max_tokens: 1024,                        // Maximum response length
     // System prompt guides Claude's behavior (but is NOT a security boundary).
     system: "You are a helpful payment assistant with access to a crypto wallet. Always check your policy constraints before making transactions.",
-    tools,                                   // The 8 wallet tools in Anthropic format
+    tools,                                   // The wallet tools in Anthropic format
     messages,                                // The conversation history
   });
 
@@ -262,7 +265,7 @@ async function runAgent(userMessage: string): Promise<string> {
     // call more tools or generate a final text response.
     messages.push({ role: "user", content: toolResults });
     response = await anthropic.messages.create({
-      model: "claude-sonnet-4-20250514",
+      model: "claude-sonnet-4-5-20250929",
       max_tokens: 1024,
       system: "You are a helpful payment assistant with access to a crypto wallet. Always check your policy constraints before making transactions.",
       tools,
@@ -320,7 +323,7 @@ async function paymentAgent(
   // Send the initial request to Claude with a detailed system prompt
   // that defines the exact workflow Claude should follow.
   let response = await anthropic.messages.create({
-    model: "claude-sonnet-4-20250514",
+    model: "claude-sonnet-4-5-20250929",
     max_tokens: 1024,
     // The system prompt defines a step-by-step workflow for Claude:
     // This makes the agent's behavior predictable and auditable.
@@ -363,7 +366,7 @@ async function paymentAgent(
     // Feed the tool results back to Claude for the next turn.
     messages.push({ role: "user", content: toolResults });
     response = await anthropic.messages.create({
-      model: "claude-sonnet-4-20250514",
+      model: "claude-sonnet-4-5-20250929",
       max_tokens: 1024,
       system: [
         "You are a payment assistant. Before sending any payment:",
@@ -431,7 +434,7 @@ Key principles for system prompts:
 
 2. **Forgetting to push both the assistant message and tool results.** The conversation history must alternate between `assistant` and `user` roles. After processing Claude's tool calls, you need to push *two* messages: the assistant's response (containing tool_use blocks) and the user's tool results. Skipping either one will break the conversation.
 
-3. **Using the wrong Anthropic model.** Not all Claude models support tool use. Make sure you are using a model that supports it, such as `claude-sonnet-4-20250514` or `claude-sonnet-4-5-20250929`. Check the [Anthropic documentation](https://docs.anthropic.com/en/docs/build-with-claude/tool-use) for the latest supported models.
+3. **Using the wrong Anthropic model.** Not all Claude models support tool use. Make sure you are using a model that supports it, such as `claude-sonnet-4-5-20250929` or `claude-sonnet-4-5-20250929`. Check the [Anthropic documentation](https://docs.anthropic.com/en/docs/build-with-claude/tool-use) for the latest supported models.
 
 ## Troubleshooting
 

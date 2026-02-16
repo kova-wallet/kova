@@ -25,8 +25,24 @@ function callbackData(botToken: string, action: string, requestId: string): stri
 const BOT_TOKEN = "bot-token-123";
 
 /**
- * Helper to create a mock fetch that responds to Telegram Bot API calls.
- * Returns the mock function and a helper to set up responses.
+ * Create a minimal response-like object compatible with pinnedFetch's return type.
+ * Unlike Response, this can be safely created multiple times and consumed without
+ * body-consumption restrictions.
+ */
+function mockResponse(body: string | object, status = 200) {
+  const bodyStr = typeof body === "string" ? body : JSON.stringify(body);
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    text: () => Promise.resolve(bodyStr),
+    json: () => Promise.resolve(JSON.parse(bodyStr)),
+  };
+}
+
+/**
+ * Helper to create a mock that intercepts pinnedFetch on TelegramApprovalBot.
+ * The implementation now uses pinnedFetch (node:https with DNS-pinning) instead of
+ * globalThis.fetch (SSRF-MED-01 / NET-01 fix), so we mock pinnedFetch on the prototype.
  */
 function createTelegramMock() {
   const calls: Array<{ url: string; body?: Record<string, unknown> }> = [];
@@ -42,19 +58,19 @@ function createTelegramMock() {
   let getUpdatesCallCount = 0;
   let deliverOnPoll = 0; // which getUpdates call to deliver the callback on
 
-  const mockFetch = vi.fn(async (url: string, init?: RequestInit) => {
-    const body = init?.body ? (JSON.parse(init.body as string) as Record<string, unknown>) : undefined;
+  const mockFetchImpl = async (
+    url: string,
+    options?: { method?: string; headers?: Record<string, string>; body?: string; signal?: AbortSignal },
+  ) => {
+    const body = options?.body ? (JSON.parse(options.body) as Record<string, unknown>) : undefined;
     calls.push({ url, body });
 
     // sendMessage
     if (url.includes("/sendMessage")) {
-      return new Response(
-        JSON.stringify({
-          ok: true,
-          result: { message_id: 42, chat: { id: 123456789 } },
-        }),
-        { status: 200 },
-      );
+      return mockResponse({
+        ok: true,
+        result: { message_id: 42, chat: { id: 123456789 } },
+      });
     }
 
     // getUpdates
@@ -63,42 +79,31 @@ function createTelegramMock() {
       if (getUpdatesCallCount >= deliverOnPoll && callbackUpdates.length > 0) {
         const updates = [...callbackUpdates];
         callbackUpdates = [];
-        return new Response(
-          JSON.stringify({ ok: true, result: updates }),
-          { status: 200 },
-        );
+        return mockResponse({ ok: true, result: updates });
       }
-      return new Response(
-        JSON.stringify({ ok: true, result: [] }),
-        { status: 200 },
-      );
+      return mockResponse({ ok: true, result: [] });
     }
 
     // answerCallbackQuery
     if (url.includes("/answerCallbackQuery")) {
-      return new Response(
-        JSON.stringify({ ok: true, result: true }),
-        { status: 200 },
-      );
+      return mockResponse({ ok: true, result: true });
     }
 
     // editMessageReplyMarkup
     if (url.includes("/editMessageReplyMarkup")) {
-      return new Response(
-        JSON.stringify({ ok: true, result: true }),
-        { status: 200 },
-      );
+      return mockResponse({ ok: true, result: true });
     }
 
     // Default — success
-    return new Response(
-      JSON.stringify({ ok: true, result: true }),
-      { status: 200 },
-    );
-  });
+    return mockResponse({ ok: true, result: true });
+  };
+
+  // Install mock on prototype — affects all instances created after this call
+  vi.spyOn(TelegramApprovalBot.prototype as never, "pinnedFetch" as never).mockImplementation(mockFetchImpl as never);
 
   return {
-    mockFetch,
+    /** The mock implementation function (usable as a delegate for wrapper mocks) */
+    mockFetch: mockFetchImpl,
     calls,
     /** Queue a callback update to deliver on the next getUpdates call */
     queueCallback(data: string, userId = 777, firstName = "Alice", callbackId = "cb-1") {
@@ -141,14 +146,7 @@ describe("TelegramApprovalBot", () => {
     allowAllUsers: true as const,
   };
 
-  let originalFetch: typeof globalThis.fetch;
-
-  beforeEach(() => {
-    originalFetch = globalThis.fetch;
-  });
-
   afterEach(() => {
-    globalThis.fetch = originalFetch;
     vi.restoreAllMocks();
   });
 
@@ -215,7 +213,6 @@ describe("TelegramApprovalBot", () => {
   describe("approval flow", () => {
     it("should send message and return 'approved' on Approve callback", async () => {
       const { mockFetch, queueCallback, deliverOn } = createTelegramMock();
-      globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
       queueCallback(callbackData(BOT_TOKEN, "approve", "req-test-1"));
@@ -231,7 +228,6 @@ describe("TelegramApprovalBot", () => {
 
     it("should return 'rejected' on Reject callback", async () => {
       const { mockFetch, queueCallback, deliverOn } = createTelegramMock();
-      globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
       queueCallback(callbackData(BOT_TOKEN, "reject", "req-test-1"), 777, "Bob");
@@ -245,7 +241,6 @@ describe("TelegramApprovalBot", () => {
 
     it("should send message with correct inline keyboard", async () => {
       const { mockFetch, calls, queueCallback, deliverOn } = createTelegramMock();
-      globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
       queueCallback(callbackData(BOT_TOKEN, "approve", "req-test-1"));
@@ -272,7 +267,6 @@ describe("TelegramApprovalBot", () => {
 
     it("should answer callback query after decision", async () => {
       const { mockFetch, calls, queueCallback, deliverOn } = createTelegramMock();
-      globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
       queueCallback(callbackData(BOT_TOKEN, "approve", "req-test-1"));
@@ -287,7 +281,6 @@ describe("TelegramApprovalBot", () => {
 
     it("should remove inline keyboard after decision", async () => {
       const { mockFetch, calls, queueCallback, deliverOn } = createTelegramMock();
-      globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
       queueCallback(callbackData(BOT_TOKEN, "approve", "req-test-1"));
@@ -303,7 +296,6 @@ describe("TelegramApprovalBot", () => {
 
     it("should use HTML parse mode for messages", async () => {
       const { mockFetch, calls, queueCallback, deliverOn } = createTelegramMock();
-      globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
       queueCallback(callbackData(BOT_TOKEN, "approve", "req-test-1"));
@@ -321,7 +313,6 @@ describe("TelegramApprovalBot", () => {
   describe("message formatting", () => {
     it("should include amount and token in message", async () => {
       const { mockFetch, calls, queueCallback, deliverOn } = createTelegramMock();
-      globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
       queueCallback(callbackData(BOT_TOKEN, "approve", "req-test-1"));
@@ -337,7 +328,6 @@ describe("TelegramApprovalBot", () => {
 
     it("should include recipient address in message", async () => {
       const { mockFetch, calls, queueCallback, deliverOn } = createTelegramMock();
-      globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
       queueCallback(callbackData(BOT_TOKEN, "approve", "req-test-1"));
@@ -352,7 +342,6 @@ describe("TelegramApprovalBot", () => {
 
     it("should include reason when provided", async () => {
       const { mockFetch, calls, queueCallback, deliverOn } = createTelegramMock();
-      globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
       queueCallback(callbackData(BOT_TOKEN, "approve", "req-test-1"));
@@ -367,7 +356,6 @@ describe("TelegramApprovalBot", () => {
 
     it("should include agent ID when provided", async () => {
       const { mockFetch, calls, queueCallback, deliverOn } = createTelegramMock();
-      globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
       queueCallback(callbackData(BOT_TOKEN, "approve", "req-test-1"));
@@ -382,7 +370,6 @@ describe("TelegramApprovalBot", () => {
 
     it("should include budget context when provided", async () => {
       const { mockFetch, calls, queueCallback, deliverOn } = createTelegramMock();
-      globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
       queueCallback(callbackData(BOT_TOKEN, "approve", "req-test-1"));
@@ -403,7 +390,6 @@ describe("TelegramApprovalBot", () => {
 
     it("should include USD value when provided", async () => {
       const { mockFetch, calls, queueCallback, deliverOn } = createTelegramMock();
-      globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
       queueCallback(callbackData(BOT_TOKEN, "approve", "req-test-1"));
@@ -418,7 +404,6 @@ describe("TelegramApprovalBot", () => {
 
     it("should escape HTML in reason text", async () => {
       const { mockFetch, calls, queueCallback, deliverOn } = createTelegramMock();
-      globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
       queueCallback(callbackData(BOT_TOKEN, "approve", "req-test-1"));
@@ -438,7 +423,6 @@ describe("TelegramApprovalBot", () => {
   describe("timeout", () => {
     it("should return 'timeout' when no response within deadline", async () => {
       const { mockFetch } = createTelegramMock();
-      globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({
         ...defaultConfig,
@@ -457,7 +441,6 @@ describe("TelegramApprovalBot", () => {
 
     it("should use defaultTimeout from config when request has no expiresAt", async () => {
       const { mockFetch } = createTelegramMock();
-      globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({
         ...defaultConfig,
@@ -477,7 +460,6 @@ describe("TelegramApprovalBot", () => {
 
     it("should remove keyboard on timeout", async () => {
       const { mockFetch, calls } = createTelegramMock();
-      globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({
         ...defaultConfig,
@@ -493,7 +475,6 @@ describe("TelegramApprovalBot", () => {
 
     it("should return timeout immediately for already-expired request", async () => {
       const { mockFetch } = createTelegramMock();
-      globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
 
@@ -510,7 +491,6 @@ describe("TelegramApprovalBot", () => {
   describe("security", () => {
     it("should reject callback from unauthorized user", async () => {
       const { mockFetch, queueCallback, deliverOn } = createTelegramMock();
-      globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({
         ...defaultConfig,
@@ -533,7 +513,6 @@ describe("TelegramApprovalBot", () => {
 
     it("should accept callback from authorized user", async () => {
       const { mockFetch, queueCallback, deliverOn } = createTelegramMock();
-      globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({
         ...defaultConfig,
@@ -552,7 +531,6 @@ describe("TelegramApprovalBot", () => {
 
     it("should allow any user when allowAllUsers is true and allowedUserIds is not set", async () => {
       const { mockFetch, queueCallback, deliverOn } = createTelegramMock();
-      globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({
         token: "bot-token-123",
@@ -572,7 +550,6 @@ describe("TelegramApprovalBot", () => {
 
     it("should answer unauthorized callback with rejection text", async () => {
       const { mockFetch, calls, queueCallback, deliverOn } = createTelegramMock();
-      globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({
         ...defaultConfig,
@@ -600,10 +577,9 @@ describe("TelegramApprovalBot", () => {
 
   describe("error handling", () => {
     it("should throw when sendMessage API fails", async () => {
-      const mockFetch = vi.fn().mockResolvedValue(
-        new Response("Internal Server Error", { status: 500 }),
+      vi.spyOn(TelegramApprovalBot.prototype as never, "pinnedFetch" as never).mockResolvedValue(
+        mockResponse("Internal Server Error", 500) as never,
       );
-      globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
 
@@ -614,13 +590,9 @@ describe("TelegramApprovalBot", () => {
     });
 
     it("should throw when sendMessage returns ok: false", async () => {
-      const mockFetch = vi.fn().mockResolvedValue(
-        new Response(
-          JSON.stringify({ ok: false, description: "Bad Request: chat not found" }),
-          { status: 200 },
-        ),
+      vi.spyOn(TelegramApprovalBot.prototype as never, "pinnedFetch" as never).mockResolvedValue(
+        mockResponse({ ok: false, description: "Bad Request: chat not found" }) as never,
       );
-      globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
 
@@ -630,22 +602,17 @@ describe("TelegramApprovalBot", () => {
     });
 
     it("should handle getUpdates API failure gracefully (timeout instead of crash)", async () => {
-      let callCount = 0;
-      const mockFetch = vi.fn(async (url: string) => {
-        callCount++;
-        if (url.includes("/sendMessage")) {
-          return new Response(
-            JSON.stringify({ ok: true, result: { message_id: 42, chat: { id: 123456789 } } }),
-            { status: 200 },
-          );
-        }
-        if (url.includes("/getUpdates")) {
-          // Always fail
-          return new Response("Service Unavailable", { status: 503 });
-        }
-        return new Response(JSON.stringify({ ok: true, result: true }), { status: 200 });
-      });
-      globalThis.fetch = mockFetch;
+      vi.spyOn(TelegramApprovalBot.prototype as never, "pinnedFetch" as never).mockImplementation(
+        (async (url: string) => {
+          if (url.includes("/sendMessage")) {
+            return mockResponse({ ok: true, result: { message_id: 42, chat: { id: 123456789 } } });
+          }
+          if (url.includes("/getUpdates")) {
+            return mockResponse("Service Unavailable", 503);
+          }
+          return mockResponse({ ok: true, result: true });
+        }) as never,
+      );
 
       const bot = new TelegramApprovalBot({
         ...defaultConfig,
@@ -662,21 +629,17 @@ describe("TelegramApprovalBot", () => {
     });
 
     it("should handle network errors during polling", async () => {
-      let callCount = 0;
-      const mockFetch = vi.fn(async (url: string) => {
-        callCount++;
-        if (url.includes("/sendMessage")) {
-          return new Response(
-            JSON.stringify({ ok: true, result: { message_id: 42, chat: { id: 123456789 } } }),
-            { status: 200 },
-          );
-        }
-        if (url.includes("/getUpdates")) {
-          throw new TypeError("fetch failed");
-        }
-        return new Response(JSON.stringify({ ok: true, result: true }), { status: 200 });
-      });
-      globalThis.fetch = mockFetch;
+      vi.spyOn(TelegramApprovalBot.prototype as never, "pinnedFetch" as never).mockImplementation(
+        (async (url: string) => {
+          if (url.includes("/sendMessage")) {
+            return mockResponse({ ok: true, result: { message_id: 42, chat: { id: 123456789 } } });
+          }
+          if (url.includes("/getUpdates")) {
+            throw new TypeError("fetch failed");
+          }
+          return mockResponse({ ok: true, result: true });
+        }) as never,
+      );
 
       const bot = new TelegramApprovalBot({
         ...defaultConfig,
@@ -697,7 +660,6 @@ describe("TelegramApprovalBot", () => {
   describe("edge cases", () => {
     it("should ignore callback_query for different request IDs", async () => {
       const { mockFetch, queueCallback, deliverOn } = createTelegramMock();
-      globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({
         ...defaultConfig,
@@ -719,7 +681,6 @@ describe("TelegramApprovalBot", () => {
 
     it("should handle empty getUpdates response", async () => {
       const { mockFetch } = createTelegramMock();
-      globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({
         ...defaultConfig,
@@ -738,13 +699,13 @@ describe("TelegramApprovalBot", () => {
     it("should handle callback_query with no data field", async () => {
       const { mockFetch } = createTelegramMock();
 
-      // Inject a callback with no data
+      // Inject a callback with no data — override pinnedFetch with wrapper
       let injected = false;
-      const wrappedFetch = vi.fn(async (url: string, init?: RequestInit) => {
-        if (url.includes("/getUpdates") && !injected) {
-          injected = true;
-          return new Response(
-            JSON.stringify({
+      vi.spyOn(TelegramApprovalBot.prototype as never, "pinnedFetch" as never).mockImplementation(
+        (async (url: string, options?: Record<string, unknown>) => {
+          if (url.includes("/getUpdates") && !injected) {
+            injected = true;
+            return mockResponse({
               ok: true,
               result: [
                 {
@@ -756,13 +717,11 @@ describe("TelegramApprovalBot", () => {
                   },
                 },
               ],
-            }),
-            { status: 200 },
-          );
-        }
-        return mockFetch(url, init);
-      });
-      globalThis.fetch = wrappedFetch;
+            });
+          }
+          return mockFetch(url, options);
+        }) as never,
+      );
 
       const bot = new TelegramApprovalBot({
         ...defaultConfig,
@@ -780,7 +739,6 @@ describe("TelegramApprovalBot", () => {
 
     it("should use the correct API base URL from token", async () => {
       const { mockFetch, calls, queueCallback, deliverOn } = createTelegramMock();
-      globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({
         token: "123:ABC_def",
@@ -799,7 +757,6 @@ describe("TelegramApprovalBot", () => {
 
     it("should send to the configured chatId", async () => {
       const { mockFetch, calls, queueCallback, deliverOn } = createTelegramMock();
-      globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({
         ...defaultConfig,
@@ -822,7 +779,6 @@ describe("TelegramApprovalBot", () => {
   describe("message formatting — additional coverage", () => {
     it("should format message without optional fields (no reason, agentId, budgetContext, usdValue)", async () => {
       const { mockFetch, calls, queueCallback, deliverOn } = createTelegramMock();
-      globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
       queueCallback(callbackData(BOT_TOKEN, "approve", "req-test-1"));
@@ -845,7 +801,6 @@ describe("TelegramApprovalBot", () => {
 
     it("should format USD value of 0 as $0.00", async () => {
       const { mockFetch, calls, queueCallback, deliverOn } = createTelegramMock();
-      globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
       queueCallback(callbackData(BOT_TOKEN, "approve", "req-test-1"));
@@ -860,7 +815,6 @@ describe("TelegramApprovalBot", () => {
 
     it("should escape HTML ampersand in reason text", async () => {
       const { mockFetch, calls, queueCallback, deliverOn } = createTelegramMock();
-      globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
       queueCallback(callbackData(BOT_TOKEN, "approve", "req-test-1"));
@@ -876,7 +830,6 @@ describe("TelegramApprovalBot", () => {
 
     it("should escape HTML in agent ID text", async () => {
       const { mockFetch, calls, queueCallback, deliverOn } = createTelegramMock();
-      globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
       queueCallback(callbackData(BOT_TOKEN, "approve", "req-test-1"));
@@ -892,7 +845,6 @@ describe("TelegramApprovalBot", () => {
 
     it("should show expires in minutes (singular for 1 minute)", async () => {
       const { mockFetch, calls, queueCallback, deliverOn } = createTelegramMock();
-      globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
       queueCallback(callbackData(BOT_TOKEN, "approve", "req-test-1"));
@@ -908,7 +860,6 @@ describe("TelegramApprovalBot", () => {
 
     it("should show 0 minutes for already expired requests", async () => {
       const { mockFetch, calls, queueCallback, deliverOn } = createTelegramMock();
-      globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
       queueCallback(callbackData(BOT_TOKEN, "approve", "req-test-1"));
@@ -923,7 +874,6 @@ describe("TelegramApprovalBot", () => {
 
     it("should include the request ID in the message", async () => {
       const { mockFetch, calls, queueCallback, deliverOn } = createTelegramMock();
-      globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
       queueCallback(callbackData(BOT_TOKEN, "approve", "req-unique-xyz"));
@@ -938,7 +888,6 @@ describe("TelegramApprovalBot", () => {
 
     it("should include all fields when everything is provided", async () => {
       const { mockFetch, calls, queueCallback, deliverOn } = createTelegramMock();
-      globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
       queueCallback(callbackData(BOT_TOKEN, "approve", "req-full"));
@@ -976,11 +925,11 @@ describe("TelegramApprovalBot", () => {
       // Custom mock that delivers two callbacks at once — one for wrong request, one for ours
       let injected = false;
       const { mockFetch } = createTelegramMock();
-      const wrappedFetch = vi.fn(async (url: string, init?: RequestInit) => {
-        if (url.includes("/getUpdates") && !injected) {
-          injected = true;
-          return new Response(
-            JSON.stringify({
+      vi.spyOn(TelegramApprovalBot.prototype as never, "pinnedFetch" as never).mockImplementation(
+        (async (url: string, options?: Record<string, unknown>) => {
+          if (url.includes("/getUpdates") && !injected) {
+            injected = true;
+            return mockResponse({
               ok: true,
               result: [
                 {
@@ -1002,13 +951,11 @@ describe("TelegramApprovalBot", () => {
                   },
                 },
               ],
-            }),
-            { status: 200 },
-          );
-        }
-        return mockFetch(url, init);
-      });
-      globalThis.fetch = wrappedFetch;
+            });
+          }
+          return mockFetch(url, options);
+        }) as never,
+      );
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
       const result = await bot.requestApproval(makeRequest());
@@ -1020,11 +967,11 @@ describe("TelegramApprovalBot", () => {
     it("should handle callback_query with empty string data", async () => {
       let injected = false;
       const { mockFetch } = createTelegramMock();
-      const wrappedFetch = vi.fn(async (url: string, init?: RequestInit) => {
-        if (url.includes("/getUpdates") && !injected) {
-          injected = true;
-          return new Response(
-            JSON.stringify({
+      vi.spyOn(TelegramApprovalBot.prototype as never, "pinnedFetch" as never).mockImplementation(
+        (async (url: string, options?: Record<string, unknown>) => {
+          if (url.includes("/getUpdates") && !injected) {
+            injected = true;
+            return mockResponse({
               ok: true,
               result: [
                 {
@@ -1037,13 +984,11 @@ describe("TelegramApprovalBot", () => {
                   },
                 },
               ],
-            }),
-            { status: 200 },
-          );
-        }
-        return mockFetch(url, init);
-      });
-      globalThis.fetch = wrappedFetch;
+            });
+          }
+          return mockFetch(url, options);
+        }) as never,
+      );
 
       const bot = new TelegramApprovalBot({
         ...defaultConfig,
@@ -1059,25 +1004,18 @@ describe("TelegramApprovalBot", () => {
     });
 
     it("should handle getUpdates returning ok: false gracefully", async () => {
-      let callCount = 0;
-      const mockFetch = vi.fn(async (url: string) => {
-        if (url.includes("/sendMessage")) {
-          return new Response(
-            JSON.stringify({ ok: true, result: { message_id: 42, chat: { id: 123456789 } } }),
-            { status: 200 },
-          );
-        }
-        if (url.includes("/getUpdates")) {
-          callCount++;
-          // Return ok: false on every getUpdates
-          return new Response(
-            JSON.stringify({ ok: false, description: "Service unavailable" }),
-            { status: 200 },
-          );
-        }
-        return new Response(JSON.stringify({ ok: true, result: true }), { status: 200 });
-      });
-      globalThis.fetch = mockFetch;
+      vi.spyOn(TelegramApprovalBot.prototype as never, "pinnedFetch" as never).mockImplementation(
+        (async (url: string) => {
+          if (url.includes("/sendMessage")) {
+            return mockResponse({ ok: true, result: { message_id: 42, chat: { id: 123456789 } } });
+          }
+          if (url.includes("/getUpdates")) {
+            // Return ok: false on every getUpdates
+            return mockResponse({ ok: false, description: "Service unavailable" });
+          }
+          return mockResponse({ ok: true, result: true });
+        }) as never,
+      );
 
       const bot = new TelegramApprovalBot({
         ...defaultConfig,
@@ -1095,11 +1033,11 @@ describe("TelegramApprovalBot", () => {
     it("should handle update without callback_query field", async () => {
       let injected = false;
       const { mockFetch } = createTelegramMock();
-      const wrappedFetch = vi.fn(async (url: string, init?: RequestInit) => {
-        if (url.includes("/getUpdates") && !injected) {
-          injected = true;
-          return new Response(
-            JSON.stringify({
+      vi.spyOn(TelegramApprovalBot.prototype as never, "pinnedFetch" as never).mockImplementation(
+        (async (url: string, options?: Record<string, unknown>) => {
+          if (url.includes("/getUpdates") && !injected) {
+            injected = true;
+            return mockResponse({
               ok: true,
               result: [
                 {
@@ -1107,13 +1045,11 @@ describe("TelegramApprovalBot", () => {
                   // no callback_query at all
                 },
               ],
-            }),
-            { status: 200 },
-          );
-        }
-        return mockFetch(url, init);
-      });
-      globalThis.fetch = wrappedFetch;
+            });
+          }
+          return mockFetch(url, options);
+        }) as never,
+      );
 
       const bot = new TelegramApprovalBot({
         ...defaultConfig,
@@ -1133,7 +1069,6 @@ describe("TelegramApprovalBot", () => {
   describe("timeout — additional coverage", () => {
     it("should return timeout immediately when defaultTimeout is 0 and no expiresAt override", async () => {
       const { mockFetch } = createTelegramMock();
-      globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({
         ...defaultConfig,
@@ -1158,7 +1093,6 @@ describe("TelegramApprovalBot", () => {
   describe("removeInlineKeyboard behavior", () => {
     it("should send status reply for approved decision", async () => {
       const { mockFetch, calls, queueCallback, deliverOn } = createTelegramMock();
-      globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
       queueCallback(callbackData(BOT_TOKEN, "approve", "req-test-1"), 777, "Alice");
@@ -1176,7 +1110,6 @@ describe("TelegramApprovalBot", () => {
 
     it("should send status reply for rejected decision", async () => {
       const { mockFetch, calls, queueCallback, deliverOn } = createTelegramMock();
-      globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
       queueCallback(callbackData(BOT_TOKEN, "reject", "req-test-1"), 777, "Bob");
@@ -1191,25 +1124,14 @@ describe("TelegramApprovalBot", () => {
     });
 
     it("should handle errors in removeInlineKeyboard gracefully", async () => {
-      let editCallCount = 0;
       const { mockFetch } = createTelegramMock();
-      const wrappedFetch = vi.fn(async (url: string, init?: RequestInit) => {
-        if (url.includes("/editMessageReplyMarkup")) {
-          editCallCount++;
-          throw new Error("Edit message failed");
-        }
-        return mockFetch(url, init);
-      });
-      globalThis.fetch = wrappedFetch;
 
-      const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
-      // We need to manually set up the callback response
       let injected = false;
-      const wrappedFetch2 = vi.fn(async (url: string, init?: RequestInit) => {
-        if (url.includes("/getUpdates") && !injected) {
-          injected = true;
-          return new Response(
-            JSON.stringify({
+      vi.spyOn(TelegramApprovalBot.prototype as never, "pinnedFetch" as never).mockImplementation(
+        (async (url: string, options?: Record<string, unknown>) => {
+          if (url.includes("/getUpdates") && !injected) {
+            injected = true;
+            return mockResponse({
               ok: true,
               result: [{
                 update_id: 600,
@@ -1220,17 +1142,16 @@ describe("TelegramApprovalBot", () => {
                   message: { message_id: 42, chat: { id: 123456789 } },
                 },
               }],
-            }),
-            { status: 200 },
-          );
-        }
-        if (url.includes("/editMessageReplyMarkup")) {
-          throw new Error("Edit message failed");
-        }
-        return mockFetch(url, init);
-      });
-      globalThis.fetch = wrappedFetch2;
+            });
+          }
+          if (url.includes("/editMessageReplyMarkup")) {
+            throw new Error("Edit message failed");
+          }
+          return mockFetch(url, options);
+        }) as never,
+      );
 
+      const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
       // Should still return approved despite editMessage error
       const result = await bot.requestApproval(makeRequest());
       expect(result.decision).toBe("approved");
@@ -1239,11 +1160,11 @@ describe("TelegramApprovalBot", () => {
     it("should handle errors in answerCallbackQuery gracefully", async () => {
       let injected = false;
       const { mockFetch } = createTelegramMock();
-      const wrappedFetch = vi.fn(async (url: string, init?: RequestInit) => {
-        if (url.includes("/getUpdates") && !injected) {
-          injected = true;
-          return new Response(
-            JSON.stringify({
+      vi.spyOn(TelegramApprovalBot.prototype as never, "pinnedFetch" as never).mockImplementation(
+        (async (url: string, options?: Record<string, unknown>) => {
+          if (url.includes("/getUpdates") && !injected) {
+            injected = true;
+            return mockResponse({
               ok: true,
               result: [{
                 update_id: 700,
@@ -1254,16 +1175,14 @@ describe("TelegramApprovalBot", () => {
                   message: { message_id: 42, chat: { id: 123456789 } },
                 },
               }],
-            }),
-            { status: 200 },
-          );
-        }
-        if (url.includes("/answerCallbackQuery")) {
-          throw new Error("Answer callback failed");
-        }
-        return mockFetch(url, init);
-      });
-      globalThis.fetch = wrappedFetch;
+            });
+          }
+          if (url.includes("/answerCallbackQuery")) {
+            throw new Error("Answer callback failed");
+          }
+          return mockFetch(url, options);
+        }) as never,
+      );
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
       // Should still return approved despite answerCallbackQuery error
@@ -1273,13 +1192,14 @@ describe("TelegramApprovalBot", () => {
 
     it("should handle editMessageExpired errors gracefully on timeout", async () => {
       const { mockFetch } = createTelegramMock();
-      const wrappedFetch = vi.fn(async (url: string, init?: RequestInit) => {
-        if (url.includes("/editMessageReplyMarkup")) {
-          throw new Error("Edit message expired failed");
-        }
-        return mockFetch(url, init);
-      });
-      globalThis.fetch = wrappedFetch;
+      vi.spyOn(TelegramApprovalBot.prototype as never, "pinnedFetch" as never).mockImplementation(
+        (async (url: string, options?: Record<string, unknown>) => {
+          if (url.includes("/editMessageReplyMarkup")) {
+            throw new Error("Edit message expired failed");
+          }
+          return mockFetch(url, options);
+        }) as never,
+      );
 
       const bot = new TelegramApprovalBot({
         ...defaultConfig,
@@ -1301,11 +1221,11 @@ describe("TelegramApprovalBot", () => {
     it("should use user ID as string when first_name is empty", async () => {
       let injected = false;
       const { mockFetch } = createTelegramMock();
-      const wrappedFetch = vi.fn(async (url: string, init?: RequestInit) => {
-        if (url.includes("/getUpdates") && !injected) {
-          injected = true;
-          return new Response(
-            JSON.stringify({
+      vi.spyOn(TelegramApprovalBot.prototype as never, "pinnedFetch" as never).mockImplementation(
+        (async (url: string, options?: Record<string, unknown>) => {
+          if (url.includes("/getUpdates") && !injected) {
+            injected = true;
+            return mockResponse({
               ok: true,
               result: [{
                 update_id: 800,
@@ -1316,13 +1236,11 @@ describe("TelegramApprovalBot", () => {
                   message: { message_id: 42, chat: { id: 123456789 } },
                 },
               }],
-            }),
-            { status: 200 },
-          );
-        }
-        return mockFetch(url, init);
-      });
-      globalThis.fetch = wrappedFetch;
+            });
+          }
+          return mockFetch(url, options);
+        }) as never,
+      );
 
       const bot = new TelegramApprovalBot({ ...defaultConfig, pollInterval: 1 });
       const result = await bot.requestApproval(makeRequest());
@@ -1337,7 +1255,6 @@ describe("TelegramApprovalBot", () => {
   describe("polling — delayed delivery", () => {
     it("should find callback on the second poll", async () => {
       const { mockFetch, queueCallback, deliverOn } = createTelegramMock();
-      globalThis.fetch = mockFetch;
 
       const bot = new TelegramApprovalBot({
         ...defaultConfig,

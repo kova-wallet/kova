@@ -136,7 +136,7 @@ const wallet = new AgentWallet({
 // --- 3. Set up the Anthropic client ---
 // The SDK reads ANTHROPIC_API_KEY from the environment automatically.
 const anthropic = new Anthropic();
-// Convert kova's 8 wallet tools into Anthropic's expected format.
+// Convert kova's wallet tools (6 safe by default) into Anthropic's expected format.
 // These schemas tell Claude what tools are available and how to call them.
 const tools = wallet.toAnthropicTools();
 
@@ -387,7 +387,7 @@ curl -X POST http://localhost:3000/chat \
 When you sent a curl request to `POST /chat`, the server:
 
 1. Received your JSON message and validated the `message` field.
-2. Sent the message to Claude's API along with the 8 wallet tool schemas.
+2. Sent the message to Claude's API along with the wallet tool schemas (6 safe by default, 2 dangerous opt-in).
 3. Claude decided which tools to call (e.g., `wallet_get_balance`, then `wallet_transfer`).
 4. For each tool call, the server invoked `wallet.handleToolCall()`, which ran the request through the policy engine, built the transaction, signed it, and broadcast it.
 5. The server sent the tool results back to Claude.

@@ -106,9 +106,12 @@ import {
 } from "kova";
 
 // Create a shared store for the SDK to persist state.
-const store = new MemoryStore();
-// Create a signer from the wallet's private key.
-const signer = new LocalSigner({ privateKey: process.env.WALLET_PRIVATE_KEY! });
+const store = new MemoryStore({ dangerouslyAllowInProduction: true });
+// Create a signer from a Keypair. In production, use MpcSigner.
+import { Keypair } from "@solana/web3.js";
+import bs58 from "bs58";
+const keypair = Keypair.fromSecretKey(bs58.decode(process.env.WALLET_PRIVATE_KEY!));
+const signer = new LocalSigner(keypair, { dangerouslyAllowInProduction: true });
 // Create a Solana adapter connected to the configured RPC endpoint.
 const chain = new SolanaAdapter({ rpcUrl: process.env.SOLANA_RPC_URL! });
 

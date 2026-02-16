@@ -15,6 +15,16 @@
  * dependencies that handle key material, transaction construction, and data persistence.
  * Pin exact versions in package-lock.json and audit regularly with `npm audit`.
  * Consider using npm's `--ignore-scripts` flag and verifying package integrity hashes.
+ *
+ * ARCH-02 cross-reference: See security_audit_team10 ARCH-02 for full analysis.
+ * T8-F12 SECURITY NOTE — NO AUTHENTICATION LAYER:
+ * This SDK does not implement caller authentication (passwords, sessions, OAuth, MFA,
+ * API keys). Any code that obtains a reference to an AgentWallet instance can call
+ * execute(), handleToolCall(), or any other method. The agentId field is explicitly
+ * self-reported and untrusted (see M-56). Authentication and access control MUST be
+ * enforced at the transport/application layer above this SDK. For multi-agent deployments,
+ * each agent should have its own AgentWallet instance with agent-specific policy rules
+ * to enforce isolation via the policy engine rather than caller identity.
  */
 
 import { randomUUID, createHash, createHmac, timingSafeEqual, randomBytes } from "node:crypto";
@@ -37,6 +47,7 @@ import { toOpenAITools as convertToOpenAITools, type OpenAITool } from "../adapt
 // imported for MED-T3-08 constructor validation of enabledTools).
 import { WALLET_TOOL_NAMES, type WalletToolName } from "../adapters/tools.js";
 import { SpendingLimitRule } from "../policy/rules/spending-limit.js";
+import { normalizeTokenId } from "../policy/utils.js";
 import { AllowlistRule } from "../policy/rules/allowlist.js";
 import { RateLimitRule } from "../policy/rules/rate-limit.js";
 import { TimeWindowRule } from "../policy/rules/time-window.js";
@@ -169,6 +180,7 @@ function normalizeAmountForHash(amount: string): string {
  * denial messages to prevent policy reconnaissance. An agent that knows exact limits
  * can craft transactions just below thresholds or calculate remaining budget.
  *
+ * ARCH-10 cross-reference: See security_audit_team10 ARCH-10 for full analysis.
  * CORE-012 TRADEOFF: This function intentionally over-strips numeric values rather
  * than under-strips. Over-stripping (replacing harmless numbers like rule IDs) produces
  * slightly less informative denial messages, but under-stripping (allowing amounts or
@@ -292,6 +304,7 @@ export interface AgentWalletConfig {
    */
   idempotencyHmacKey?: string | Buffer;
   /**
+   * ARCH-13 cross-reference: See security_audit_team10 ARCH-13 for full analysis.
    * STORE-005 fix: Optional prefix for store key isolation.
    * When multiple AgentWallet instances share a Store backend, each wallet
    * MUST use a unique prefix (e.g., derived from the signer's public key)
@@ -386,8 +399,14 @@ export class AgentWallet {
     // H-11 fix: Enforce minimum HMAC key length of 32 bytes (64 hex chars) to prevent
     // weak keys that are vulnerable to brute-force attacks.
     if (config.idempotencyHmacKey) {
+      // T1-F8 fix: Detect hex-encoded keys and use the appropriate encoding.
+      // A 64-char hex string represents 32 bytes. Using UTF-8 encoding on a hex string
+      // would produce 64 bytes (one per char), defeating the key length validation
+      // and producing a different HMAC than intended.
       const keyBuffer = typeof config.idempotencyHmacKey === "string"
-        ? Buffer.from(config.idempotencyHmacKey, "utf-8")
+        ? (/^[0-9a-fA-F]+$/.test(config.idempotencyHmacKey) && config.idempotencyHmacKey.length >= 64
+          ? Buffer.from(config.idempotencyHmacKey, "hex")
+          : Buffer.from(config.idempotencyHmacKey, "utf-8"))
         : config.idempotencyHmacKey;
       if (keyBuffer.length < 32) {
         throw new Error(
@@ -400,6 +419,21 @@ export class AgentWallet {
       // CRIT-05: Auto-generate a cryptographically random 32-byte key so that
       // idempotency cache integrity is always protected, even without explicit config.
       this.idempotencyHmacKey = randomBytes(32);
+      // T8-F8 fix: Warn when the HMAC key is auto-generated in non-test environments.
+      // After a process restart, all existing idempotency cache entries become
+      // unverifiable (HMAC mismatch), effectively clearing the cache and allowing
+      // duplicate transaction execution for previously submitted intents.
+      try {
+        if (typeof process !== "undefined" && process.env.NODE_ENV !== "test") {
+          process.emitWarning(
+            "AgentWallet: idempotencyHmacKey was auto-generated. After a process restart, " +
+            "existing idempotency cache entries will become unverifiable. For production use, " +
+            "provide a persistent idempotencyHmacKey in the config to prevent duplicate " +
+            "transaction execution across restarts.",
+            "KovaIdempotencyKeyWarning",
+          );
+        }
+      } catch { /* non-fatal */ }
     }
 
     // Create CircuitBreaker unless disabled
@@ -430,6 +464,19 @@ export class AgentWallet {
         );
       }
     }
+
+    // T6-F14 fix: Emit a one-time startup warning when KOVA_AUDIT_STDERR is enabled.
+    // When set, audit fallback data (intent IDs and types) flows to stderr on audit
+    // failure. Operators should be aware that this metadata may be captured by log
+    // aggregators or container runtimes without the same access controls as the audit store.
+    if (typeof process !== "undefined" && process.env.KOVA_AUDIT_STDERR === "1") {
+      process.emitWarning(
+        "KOVA_AUDIT_STDERR=1 is set. Audit fallback data (intent IDs, types) will be written " +
+        "to stderr when the primary audit store is unavailable. Ensure stderr output has " +
+        "equivalent access controls to the audit store.",
+        "SecurityWarning",
+      );
+    }
   }
 
   /**
@@ -440,29 +487,46 @@ export class AgentWallet {
    *
    * After calling destroy(), the wallet cannot process any more transactions.
    * This method is idempotent — calling it multiple times is safe.
+   *
+   * CONC-08 NOTE — GRACEFUL SHUTDOWN:
+   * This method does NOT wait for in-flight transactions to complete and does NOT
+   * register SIGINT/SIGTERM handlers. Callers should:
+   *   1. Stop submitting new execute() calls before calling destroy().
+   *   2. Optionally register process.on('SIGTERM', () => wallet.destroy()) in
+   *      their startup code to handle container/orchestrator signals.
+   *   3. Be aware that calling destroy() while a transaction is in-flight may
+   *      leave spending counters inflated (consumed budget without a transaction)
+   *      or audit log entries incomplete.
+   * See security_audit_team9 CONC-08 for full analysis.
    */
   async destroy(): Promise<void> {
     // Destroy circuit breaker (stops heartbeat interval timer, allows clean process exit)
     if (this.circuitBreaker) {
       try {
         await this.circuitBreaker.destroy();
-      } catch {
-        // Non-fatal: circuit breaker cleanup failure should not prevent wallet destruction
+      } catch (err: unknown) {
+        // ARCH-15 fix: Emit observable warning instead of silently swallowing.
+        const msg = err instanceof Error ? err.message : "Unknown error";
+        process.emitWarning(`AgentWallet.destroy: circuit breaker cleanup failed: ${msg}`, "KovaDestroyWarning");
       }
     }
 
     // Destroy audit logger (zeroes HMAC key material in memory)
     try {
       await this.logger.destroy();
-    } catch {
-      // Non-fatal: logger cleanup failure should not prevent wallet destruction
+    } catch (err: unknown) {
+      // ARCH-15 fix: Emit observable warning instead of silently swallowing.
+      const msg = err instanceof Error ? err.message : "Unknown error";
+      process.emitWarning(`AgentWallet.destroy: audit logger cleanup failed: ${msg}`, "KovaDestroyWarning");
     }
 
     // Destroy signer (zeroes private key material for LocalSigner, clears cache for MpcSigner)
     try {
       await this.signer.destroy();
-    } catch {
-      // Non-fatal: signer cleanup failure should not prevent wallet destruction
+    } catch (err: unknown) {
+      // ARCH-15 fix: Emit observable warning instead of silently swallowing.
+      const msg = err instanceof Error ? err.message : "Unknown error";
+      process.emitWarning(`AgentWallet.destroy: signer cleanup failed: ${msg}`, "KovaDestroyWarning");
     }
   }
 
@@ -519,6 +583,23 @@ export class AgentWallet {
     // If the mutex cannot be acquired within the configured timeout (default 30s),
     // the call fails with an error rather than blocking indefinitely. This prevents
     // long-running approval waits from starving subsequent execute() calls.
+    //
+    // CONC-04 KNOWN LIMITATION: When ApprovalGateRule triggers, it blocks inside
+    // the mutex for up to 5 minutes (DEFAULT_TIMEOUT_MS). All other execute() calls
+    // are queued behind this wait. The 30-second mutex timeout partially mitigates
+    // this, but callers experience up to 30s of latency per attempt. For high-throughput
+    // deployments, reduce the approval timeout or use a background polling architecture.
+    //
+    // CONC-14 KNOWN LIMITATION: When a timeout fires, releaseLock() is called to
+    // unblock the chain, but the long-running holder's slot is still in the chain.
+    // This is safe under single-instance deployment because the holder's eventual
+    // releaseLock() just resolves an already-resolved promise (no-op). However,
+    // this pattern should not be extended to distributed locking.
+    //
+    // CONC-21 KNOWN LIMITATION: This mutex is process-local. It provides no protection
+    // across multiple AgentWallet instances or Node.js processes sharing the same store.
+    // All TOCTOU protections, idempotency, spending limits, and audit integrity depend
+    // on single-instance deployment. See CRIT-02 in circuit-breaker.ts.
     let releaseLock: () => void;
     const previousLock = this.executeLock;
     this.executeLock = new Promise<void>((resolve) => { releaseLock = resolve; });
@@ -973,6 +1054,8 @@ export class AgentWallet {
    * call with no shared mutable state. However, the balance returned may be stale
    * if a concurrent execute() call is in-flight (read-after-write inconsistency).
    * Callers should not use getBalance() for authorization decisions.
+   * CONC-16 cross-reference: See security_audit_team9 CONC-16 for full analysis.
+   * ARCH-18 cross-reference: See security_audit_team10 ARCH-18 for read/write separation analysis.
    *
    * H-32 fix: Returns a structured error result instead of throwing raw exceptions.
    * RPC errors are sanitized to prevent leaking endpoint URLs and internal details.
@@ -1396,7 +1479,15 @@ export class AgentWallet {
 	            /^10\./.test(hostname) ||
 	            /^172\.(1[6-9]|2\d|3[01])\./.test(hostname) ||
 	            /^192\.168\./.test(hostname) ||
-	            /^169\.254\./.test(hostname)
+	            /^169\.254\./.test(hostname) ||
+	            // SSRF-MED-02 fix: Add CGNAT range (100.64.0.0/10), commonly used in
+	            // cloud/container environments with custom DNS resolvers
+	            /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(hostname) ||
+	            // SSRF-MED-02 fix: Add IPv6 ULA (fd00::/8, fc00::/7)
+	            hostname.startsWith("[fd") ||
+	            hostname.startsWith("[fc") ||
+	            // SSRF-MED-02 fix: Add IPv6-mapped IPv4 (e.g., [::ffff:192.168.1.1])
+	            hostname.startsWith("[::ffff:")
 	          ) {
 	            return "Mint: 'metadataUri' must not point to private/reserved IP ranges or localhost (SSRF protection)";
 	          }
@@ -1488,17 +1579,45 @@ export class AgentWallet {
 
   /** S1-02 fix: Cache a result for idempotency
    *  STORE-004 fix: When idempotencyHmacKey is configured, stores an HMAC-SHA256
-   *  tag alongside the JSON payload to prevent forged cache entries. */
+   *  tag alongside the JSON payload to prevent forged cache entries.
+   *  CONC-07 fix: Use setIfNotExists to prevent overwriting an existing cache entry
+   *  from a concurrent instance. If another instance already cached a result for this
+   *  intent, we preserve theirs rather than overwriting with ours (first-writer-wins). */
   private async cacheResult(key: string, result: TransactionResult): Promise<void> {
     try {
-      const json = JSON.stringify(result);
+      // T6-F7 fix: Strip sensitive fields from the cached result before serialization.
+      // The idempotency cache has a 24-hour default TTL, meaning full transaction details
+      // would persist on disk for a full day. Only cache the fields needed for idempotency
+      // replay: status, txId, intentId, timestamp, summary, and error codes. Raw params
+      // (recipient addresses, token amounts) from the original intent are excluded.
+      const sanitizedResult: Record<string, unknown> = {
+        status: result.status,
+        txId: result.txId,
+        intentId: result.intentId,
+        timestamp: result.timestamp,
+        summary: result.summary,
+      };
+      if (result.error) {
+        sanitizedResult.error = { code: result.error.code, message: result.error.message };
+      }
+      const json = JSON.stringify(sanitizedResult);
+      let value: string;
       if (this.idempotencyHmacKey) {
         // STORE-004: Compute HMAC over the JSON and store as "hmac:json" so
         // the reader can split, verify, and only trust authenticated entries.
         const hmac = createHmac("sha256", this.idempotencyHmacKey).update(json).digest("hex");
-        await this.store.set(key, hmac + ":" + json, this.idempotencyTtl);
+        value = hmac + ":" + json;
       } else {
-        await this.store.set(key, json, this.idempotencyTtl);
+        value = json;
+      }
+      // CONC-07 fix: Use setIfNotExists for defense-in-depth against concurrent writes.
+      // In multi-instance deployments, another instance may have already cached a result.
+      // setIfNotExists preserves the first writer's result (first-writer-wins semantics).
+      const wasSet = await this.store.setIfNotExists(key, value, this.idempotencyTtl);
+      if (!wasSet) {
+        // Another instance already cached a result — this is expected in multi-instance
+        // deployments and indicates a potential double-execution (documented as H-18).
+        // Fall through silently; the existing cached result takes precedence.
       }
     } catch {
       // Cache failure must not break the transaction flow
@@ -1740,23 +1859,61 @@ export class AgentWallet {
           if (amount === null) continue;
           const token = this.extractTokenForRollback(intent);
           const config = rule.getConfig();
+          // HIGH-T3-05 fix: Read the key prefix from the SpendingLimitRule configuration
+          // instead of hardcoding "spending:". If a custom prefix is configured, the
+          // hardcoded prefix would target the wrong keys, causing rollback to silently fail.
+          const keyPrefix = config.keyPrefix ?? "spending:";
+          // HIGH-T3-04 fix: Normalize the token ID using the same normalizeTokenId()
+          // function that SpendingLimitRule uses. Without this, casing differences
+          // (e.g., "sol" vs "SOL") cause rollback to target a different key than
+          // the one that was incremented.
+          const normalizedToken = normalizeTokenId(token);
           const windowKeys: Array<{ window: string; ttl: number }> = [];
           if (config.daily) windowKeys.push({ window: "daily", ttl: 86_400 });
           if (config.weekly) windowKeys.push({ window: "weekly", ttl: 604_800 });
           if (config.monthly) windowKeys.push({ window: "monthly", ttl: 2_592_000 });
           for (const { window } of windowKeys) {
-            const key = `spending:${window}:${token}`;
+            const key = `${keyPrefix}${window}:${normalizedToken}`;
             try {
-              await this.store.increment(key, -Math.round(amount * 1e9));
+              // CRIT-T3-02 fix: Remove the erroneous 1e9 scale factor. The
+              // SpendingLimitRule increments counters by the RAW amount (no scale factor),
+              // so rollback must decrement by the same raw amount. The old code multiplied
+              // by 1e9, making rollback decrement ~1 billion times the original increment,
+              // driving counters deeply negative and granting unlimited spending budget.
+              await this.store.increment(key, -amount);
             } catch (err) {
               // Track the failure but continue rolling back other windows
-              rollbackErrors.push(`${window}:${token}: ${err instanceof Error ? err.message : String(err)}`);
+              rollbackErrors.push(`${window}:${normalizedToken}: ${err instanceof Error ? err.message : String(err)}`);
             }
           }
-          // NOTE: USD-denominated counters (dailyUSD, weeklyUSD, monthlyUSD) are NOT
-          // rolled back because the exact USD value depends on the price oracle at
-          // evaluation time, which we don't have here. Incorrect rollback values could
-          // over-count remaining budget (unsafe). USD counters reset naturally via TTL.
+          // HIGH-T3-06 fix: Also roll back USD-denominated counters. Previously skipped
+          // because the exact USD value depends on the price oracle at evaluation time.
+          // Now we use a best-effort approach: re-query the price oracle if available,
+          // and only skip if unavailable. Incorrect rollback values could over-count
+          // remaining budget (unsafe), so we only rollback if we can get a current price.
+          if (this.chain && typeof (this.chain as any).getValueInUSD === "function") {
+            const usdWindowKeys: Array<{ window: string }> = [];
+            if (config.dailyUSD) usdWindowKeys.push({ window: "daily" });
+            if (config.weeklyUSD) usdWindowKeys.push({ window: "weekly" });
+            if (config.monthlyUSD) usdWindowKeys.push({ window: "monthly" });
+            if (usdWindowKeys.length > 0) {
+              try {
+                const usdValue = await (this.chain as any).getValueInUSD(token, String(amount));
+                if (typeof usdValue === "number" && Number.isFinite(usdValue) && usdValue > 0) {
+                  for (const { window } of usdWindowKeys) {
+                    const usdKey = `${keyPrefix}${window}:USD`;
+                    try {
+                      await this.store.increment(usdKey, -usdValue);
+                    } catch (err) {
+                      rollbackErrors.push(`${window}:USD: ${err instanceof Error ? err.message : String(err)}`);
+                    }
+                  }
+                }
+              } catch {
+                // Best-effort: if price oracle unavailable, USD counters reset via TTL
+              }
+            }
+          }
         }
       }
     } catch (err) {
@@ -1770,15 +1927,39 @@ export class AgentWallet {
     }
   }
 
-  /** Extract numeric amount from intent for spending rollback */
+  /**
+   * Extract numeric amount from intent for spending rollback.
+   * INT-MED-01 fix: Aligned with SpendingLimitRule.extractAmount() to use BigInt-based
+   * parsing for integer amounts, preventing parseFloat precision loss for large values.
+   */
   private extractAmountForRollback(intent: TransactionIntent): number | null {
-    if (isTransferIntent(intent)) return parseFloat(intent.params.amount);
-    if (isSwapIntent(intent)) return parseFloat(intent.params.amount);
-    if (isStakeIntent(intent)) return parseFloat(intent.params.amount);
-    return null; // Mint and custom intents don't have standard amounts
+    let amountStr: string | undefined;
+    if (isTransferIntent(intent)) amountStr = intent.params.amount;
+    else if (isSwapIntent(intent)) amountStr = intent.params.amount;
+    else if (isStakeIntent(intent)) amountStr = intent.params.amount;
+    if (!amountStr) return null;
+
+    // INT-MED-01 fix: Use BigInt for pure integer amounts (aligned with SpendingLimitRule)
+    if (/^\d+$/.test(amountStr)) {
+      try {
+        const bigAmount = BigInt(amountStr);
+        if (bigAmount <= 0n) return null;
+        return Number(bigAmount);
+      } catch {
+        return null;
+      }
+    }
+    // For decimal amounts, validate format before parseFloat
+    if (!/^\d+\.\d+$/.test(amountStr)) return null;
+    const parsed = parseFloat(amountStr);
+    return (Number.isFinite(parsed) && parsed > 0) ? parsed : null;
   }
 
-  /** Extract token identifier from intent for spending rollback */
+  /**
+   * Extract token identifier from intent for spending rollback.
+   * HIGH-T3-04 fix: Returns the raw token — normalization is applied in
+   * rollbackSpendingCounters() using normalizeTokenId() for consistency.
+   */
   private extractTokenForRollback(intent: TransactionIntent): string {
     if (isTransferIntent(intent)) return intent.params.token;
     if (isSwapIntent(intent)) return intent.params.fromToken;
