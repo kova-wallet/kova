@@ -1,8 +1,46 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" fill="none">
-  <rect width="128" height="128" rx="24" fill="#6366f1"/>
-  <path d="M32 48h64v8H32z" fill="#fff" opacity="0.9"/>
-  <path d="M32 64h48v8H32z" fill="#fff" opacity="0.7"/>
-  <path d="M32 80h56v8H32z" fill="#fff" opacity="0.5"/>
-  <circle cx="96" cy="84" r="16" fill="#22d3ee" opacity="0.9"/>
-  <path d="M90 84l4 4 8-8" stroke="#fff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <!--
+    KOVA Logo — "Aegis"
+    Team 1: Designer Elina Voss × Branding Specialist Marcus Chen
+
+    Concept: The shield represents Kova's core promise — protection.
+    Every AI agent transaction passes through Kova's policy guardrails,
+    like a fortress protecting assets. The bold K monogram conveys
+    authority and permanence. The cyan checkmark in the K's arm gap
+    echoes the existing brand element (validation/approval) and
+    symbolizes every policy-approved transaction.
+
+    Audience signal: Enterprise-grade trust, institutional security.
+    Best for: Documentation headers, security badges, trust seals.
+  -->
+  <defs>
+    <linearGradient id="aegis-shield" x1="256" y1="28" x2="256" y2="490" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#818cf8"/>
+      <stop offset="1" stop-color="#3730a3"/>
+    </linearGradient>
+    <linearGradient id="aegis-accent" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#22d3ee"/>
+      <stop offset="1" stop-color="#06b6d4"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Shield body -->
+  <path d="M256 28 C186 28 76 66 62 110 L62 300 C62 406 152 460 256 490 C360 460 450 406 450 300 L450 110 C436 66 326 28 256 28Z" fill="url(#aegis-shield)"/>
+
+  <!-- Shield inner highlight -->
+  <path d="M256 52 C198 52 102 84 90 122 L90 294 C90 388 170 436 256 464 C342 436 422 388 422 294 L422 122 C410 84 314 52 256 52Z" fill="none" stroke="white" stroke-width="1.5" opacity="0.12"/>
+
+  <!-- Subtle horizontal policy lines (representing guardrails) -->
+  <line x1="110" y1="192" x2="402" y2="192" stroke="white" stroke-width="0.75" opacity="0.06"/>
+  <line x1="100" y1="228" x2="412" y2="228" stroke="white" stroke-width="0.75" opacity="0.06"/>
+  <line x1="96"  y1="264" x2="416" y2="264" stroke="white" stroke-width="0.75" opacity="0.06"/>
+  <line x1="100" y1="300" x2="412" y2="300" stroke="white" stroke-width="0.75" opacity="0.06"/>
+  <line x1="110" y1="336" x2="402" y2="336" stroke="white" stroke-width="0.75" opacity="0.06"/>
+
+  <!-- K letterform -->
+  <path d="M180 148 L220 148 L220 232 L316 148 L352 148 L240 262 L352 384 L316 384 L220 292 L220 384 L180 384Z" fill="white"/>
+
+  <!-- Cyan accent circle with check — in the K arm gap -->
+  <circle cx="290" cy="262" r="22" fill="url(#aegis-accent)"/>
+  <path d="M280 262 L287 269 L302 254" stroke="white" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>

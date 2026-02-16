@@ -5,13 +5,16 @@ hero:
   name: "kova"
   text: "Secure Crypto Wallets for AI Agents"
   tagline: "Policy-constrained crypto wallet SDK for AI agents"
+  image:
+    src: /logo.svg
+    alt: kova
   actions:
     - theme: brand
       text: Get Started
       link: /getting-started/how-it-works
     - theme: alt
       text: View on GitHub
-      link: https://github.com/kova-wallet/kova
+      link: https://github.com/0xKeyserSoze/kova
 
 features:
   - title: Policy Engine
