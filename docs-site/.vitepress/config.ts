@@ -3,7 +3,8 @@ import { defineConfig } from 'vitepress'
 export default defineConfig({
   title: 'kova',
   description: 'Policy-constrained crypto wallet SDK for AI agents',
-  head: [['link', { rel: 'icon', href: '/logo.svg' }]],
+  base: '/kova/',
+  head: [['link', { rel: 'icon', href: '/kova/logo.svg' }]],
 
   themeConfig: {
     logo: '/logo.svg',
@@ -108,7 +109,7 @@ export default defineConfig({
     },
 
     socialLinks: [
-      { icon: 'github', link: 'https://github.com/kova-wallet/kova' },
+      { icon: 'github', link: 'https://github.com/0xKeyserSoze/kova' },
     ],
 
     search: {
@@ -121,7 +122,7 @@ export default defineConfig({
     },
 
     editLink: {
-      pattern: 'https://github.com/kova-wallet/kova/edit/main/docs-site/:path',
+      pattern: 'https://github.com/0xKeyserSoze/kova/edit/master/docs-site/:path',
       text: 'Edit this page on GitHub',
     },
   },
