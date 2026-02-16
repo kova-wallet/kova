@@ -607,7 +607,6 @@ describe("AgentWallet", () => {
 
   describe("execute() — intent normalization", () => {
     it("should preserve caller-provided createdAt timestamp", async () => {
-      const wallet = createWallet();
       // CORE-018: Use a recent timestamp (within ±5 min of now) so it's not clamped
       const customTime = Date.now() - 60_000; // 1 minute ago
 
