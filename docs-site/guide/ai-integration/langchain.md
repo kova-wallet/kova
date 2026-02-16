@@ -1,6 +1,12 @@
 # LangChain Integration
 
-> **What you'll learn:** How to use kova with LangChain to build tool-calling agents, how to bridge kova tools into LangChain's `DynamicStructuredTool` format, how to create and run a `ToolCallingAgent` with the `AgentExecutor`, how to switch between OpenAI and Anthropic models, how to stream responses, and how to create read-only agent subsets.
+::: info What you'll learn
+- How to use `createLangChainTools()` to generate LangChain-compatible tool definitions
+- How to bridge kova tools into LangChain's `DynamicStructuredTool` format with Zod schemas
+- How to create and run a `ToolCallingAgent` with the `AgentExecutor`
+- How to switch between OpenAI and Anthropic models using the same tool setup
+- How to stream responses and create read-only agent subsets
+:::
 
 This guide shows how to use kova with LangChain to build tool-calling agents. The `createLangChainTools()` function generates tool definitions that integrate naturally with LangChain's agent framework.
 

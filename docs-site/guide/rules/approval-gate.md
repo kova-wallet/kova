@@ -1,5 +1,13 @@
 # ApprovalGateRule
 
+::: info What you'll learn
+- How to require human approval for transactions above a configurable threshold
+- The full approval flow: request, wait, approve/reject/timeout
+- How to integrate with TelegramApprovalBot for real-time notifications
+- Fail-closed behavior: what happens when approval channels are unavailable
+- Why the approval gate should always be the last rule in the chain
+:::
+
 `ApprovalGateRule` pauses high-value transactions and waits for a human to approve or reject them -- like a manager signing off on expense reports above a certain dollar amount.
 
 The `ApprovalGateRule` requires human approval for transactions above a configurable threshold. It integrates with the `ApprovalChannel` abstraction to send approval requests and wait for human decisions.

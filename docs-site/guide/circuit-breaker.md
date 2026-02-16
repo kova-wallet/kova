@@ -1,5 +1,13 @@
 # Circuit Breaker
 
+::: info What you'll learn
+- How the circuit breaker detects and stops runaway agent behavior
+- The two-state machine: Closed (normal) and Open (blocking)
+- How consecutive denial tracking works with ALLOW/DENY/PENDING outcomes
+- How to configure threshold and cooldown via `AgentWallet`
+- The difference between the transaction circuit breaker and the audit circuit breaker
+:::
+
 The circuit breaker prevents runaway agent behavior by blocking all transactions after a threshold of consecutive policy denials. If an agent keeps attempting actions that violate policy, the circuit breaker trips and forces a cooldown period before any new transactions can be submitted.
 
 ## Purpose

@@ -1,5 +1,13 @@
 # Chain Adapters
 
+::: info What you'll learn
+- How chain adapters abstract blockchain-specific complexity behind a common interface
+- The 6-method ChainAdapter interface for building, signing, and broadcasting transactions
+- How to configure the `SolanaAdapter` for devnet and mainnet
+- How Jupiter DEX integration enables token swaps
+- URL validation and SSRF protection for secure RPC connections
+:::
+
 A Chain Adapter is the SDK's connection to a specific blockchain -- it translates high-level instructions like "send 1 SOL to Alice" into the low-level operations that the blockchain actually understands.
 
 Chain adapters encapsulate all blockchain-specific logic: building transactions, broadcasting, checking balances, and validating addresses. The SDK interacts with blockchains exclusively through the `ChainAdapter` interface.
@@ -460,6 +468,17 @@ const mainnet = new SolanaAdapter({
   commitment: "finalized", // Strongest confirmation level for production safety
 });
 ```
+
+## Common Mistakes
+
+**1. Using `"processed"` commitment in production.**
+`"processed"` is the fastest but least safe commitment level. A transaction that appears "processed" can still be rolled back. Use `"confirmed"` (default) or `"finalized"` for production to avoid acting on transactions that are later reversed.
+
+**2. Using the chain adapter directly instead of `wallet.execute()`.**
+When you call `chain.buildTransaction()` and `chain.broadcast()` directly, you bypass the policy engine, audit logging, circuit breaker, and idempotency protections. Only use the chain adapter directly for debugging and testing.
+
+**3. Using HTTP for non-localhost RPC endpoints.**
+The `SolanaAdapter` rejects HTTP URLs for security -- transaction data and wallet addresses should not be sent over unencrypted connections. Use HTTPS for all remote endpoints.
 
 ## See Also
 

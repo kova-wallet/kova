@@ -1,6 +1,12 @@
 # AI Integration Overview
 
-> **What you'll learn:** How kova exposes wallet functionality to AI agents through standardized tools, how the `handleToolCall()` dispatch mechanism works, what data flows between your server and the AI model, and how errors are sanitized to prevent information leakage.
+::: info What you'll learn
+- How kova exposes wallet functionality to AI agents through 8 standardized tools (6 safe, 2 dangerous)
+- How the `handleToolCall()` dispatch mechanism routes every tool call through a single entry point
+- The complete data flow between your server and the AI model (tool schemas, tool calls, tool results)
+- The `ToolCallResult` format returned by every tool call
+- How errors are sanitized to prevent information leakage to agents
+:::
 
 kova exposes **6 safe tools** by default that AI agents can call to interact with the blockchain, plus **2 dangerous tools** (`wallet_execute_custom` and `wallet_get_policy`) that must be explicitly opted into. These tools are framework-agnostic at their core and can be adapted to work with any AI provider -- Anthropic Claude, OpenAI, LangChain, or custom integrations.
 

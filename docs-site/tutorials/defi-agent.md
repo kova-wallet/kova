@@ -1,6 +1,12 @@
 # Building a DeFi Agent
 
-> **What you'll learn:** How to build an AI agent that executes token swaps on Solana using Jupiter (the largest decentralized exchange aggregator on Solana), checks multiple token balances, handles swap errors gracefully, and maintains a tamper-evident audit trail. By the end of this tutorial, you will have a working DeFi agent that swaps between SOL and USDC with proper policy guardrails.
+::: info What you'll learn
+- How to build an AI agent that executes token swaps on Solana using Jupiter (the largest DEX aggregator on Solana)
+- How to create a `swap` TransactionIntent and configure policy rules for DeFi operations
+- How to check multiple token balances (SOL and SPL tokens like USDC)
+- How to handle swap errors gracefully (slippage, insufficient liquidity, failed routes)
+- How to maintain a tamper-evident audit trail for every swap executed
+:::
 
 This tutorial walks you through building an agent that can execute <Term id="token-swap">token swaps</Term> on Solana using Jupiter, check multiple token balances, and maintain a full audit trail. By the end you will have a working DeFi agent that can swap between SOL and <Term id="usdc">USDC</Term> with proper policy guardrails.
 

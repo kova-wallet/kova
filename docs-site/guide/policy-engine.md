@@ -1,5 +1,13 @@
 # Policy Engine
 
+::: info What you'll learn
+- How the PolicyEngine evaluates rules sequentially with fail-closed semantics
+- Why rule ordering matters and the recommended order for performance
+- How to use the fluent Policy builder to define constraints declaratively
+- How policy configs can be serialized, stored, and restored
+- The three possible evaluation outcomes: ALLOW, DENY, and PENDING
+:::
+
 ## Overview
 
 The `PolicyEngine` is **like middleware in Express.js or a firewall in front of your server -- every transaction request must pass through it before anything happens on the blockchain**. Just as Express middleware can inspect an incoming HTTP request and decide to allow it, reject it, or ask for additional authentication, the PolicyEngine inspects every transaction intent and decides whether to allow it, deny it, or pause it for human approval.
@@ -82,6 +90,17 @@ async evaluate(intent: TransactionIntent): Promise<PolicyEvaluationResult>
 ```
 
 The `evaluate()` method processes rules **sequentially** in the order they were provided to the constructor. Think of it as a pipeline of security checkpoints -- the transaction must pass through each one, and any single checkpoint can reject it.
+
+### Two-Phase Evaluation (Dry-Run + Commit)
+
+The PolicyEngine uses a **two-phase evaluation** strategy to prevent counter inflation:
+
+1. **Dry-run phase**: All rules are evaluated without modifying any counters in the store. This determines whether the transaction _would_ be allowed.
+2. **Commit phase**: If the dry-run returns ALLOW, the engine re-evaluates and commits counter updates (spending amounts, rate limit increments) to the store.
+
+This prevents a subtle bug: if a rule increments a spending counter during evaluation, but a later rule denies the transaction, the counter would be inflated even though no money was actually spent. The two-phase approach ensures counters are only updated when the transaction actually proceeds.
+
+### Sequential Rule Evaluation
 
 1. For each rule, call `rule.evaluate(intent, context)`.
 2. If a rule returns `DENY`, stop immediately and return the denial.

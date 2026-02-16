@@ -1,5 +1,13 @@
 # RateLimitRule
 
+::: info What you'll learn
+- How per-minute and per-hour transaction limits prevent runaway agents
+- How TTL-based counters automatically reset after each time window
+- Why denied transactions do not count against the rate limit
+- The atomic increment-then-check pattern that prevents concurrent bypasses
+- How to combine rate limits with spending limits for comprehensive protection
+:::
+
 `RateLimitRule` limits how many transactions your AI agent can execute in a given time period -- like an API rate limiter, but for blockchain transactions.
 
 The `RateLimitRule` limits the number of transactions per time window. It prevents a runaway agent from executing too many transactions in a short period.

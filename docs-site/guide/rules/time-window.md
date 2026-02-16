@@ -1,5 +1,13 @@
 # TimeWindowRule
 
+::: info What you'll learn
+- How to restrict agent transactions to specific days and times
+- How IANA timezones handle daylight saving time automatically
+- How overnight windows (start > end) wrap around midnight
+- How multiple windows combine with logical OR
+- The `outsideHoursPolicy` option for require-approval vs deny
+:::
+
 `TimeWindowRule` restricts when your AI agent can send transactions -- like setting "business hours" on a bank account so no transfers happen at 3 AM.
 
 The `TimeWindowRule` restricts when the agent can transact by defining active hours windows. Transactions outside active hours are denied or require approval.

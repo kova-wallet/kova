@@ -1,5 +1,13 @@
 # Human Approval
 
+::: info What you'll learn
+- The `ApprovalChannel` interface and how to implement custom approval backends
+- The complete `ApprovalRequest` and `ApprovalResult` data structures
+- How to set up and configure the `TelegramApprovalBot`
+- The polling-based approval flow from request to decision
+- How to build a custom approval channel (e.g., Slack)
+:::
+
 The human approval system provides a human-in-the-loop mechanism for high-value or sensitive transactions. When a policy rule requires approval, the SDK sends a request through an `ApprovalChannel` and blocks until a human responds or the request times out.
 
 ## ApprovalChannel Interface

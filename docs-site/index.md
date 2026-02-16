@@ -4,7 +4,7 @@ layout: home
 hero:
   name: "kova"
   text: "Secure Crypto Wallets for AI Agents"
-  tagline: "Policy-constrained crypto wallet SDK for AI agents"
+  tagline: "Give your AI agent the ability to transact on the blockchain -- without giving it the keys. kova is a TypeScript SDK that enforces policy constraints on every transaction, so autonomous agents can spend within the rules you define."
   image:
     src: /logo.svg
     alt: kova
@@ -17,22 +17,28 @@ hero:
       link: https://github.com/0xKeyserSoze/kova
 
 features:
-  - title: Policy Engine
-    details: Composable rules for spending limits, rate limits, allowlists, time windows, and approval gates. Every transaction is evaluated before execution. Deny-by-default, fail-closed design.
-    icon: "\U0001F6E1\uFE0F"
-  - title: AI Integration
-    details: First-class tool definitions for Claude (Anthropic), OpenAI, and LangChain. Agents interact through structured tool calls — the SDK handles policy enforcement transparently.
-    icon: "\U0001F916"
-  - title: Human Approval
-    details: Built-in Telegram bot for human-in-the-loop approval of high-value transactions. Configurable thresholds, timeouts, and user whitelisting. Fail-closed on timeout.
-    icon: "\u2705"
-  - title: Audit Logging
-    details: Every policy decision and transaction is recorded in a SHA-256 hash chain. Tamper-evident audit trail with integrity verification. Circuit breaker blocks transactions when audit is down.
+  - title: "AgentWallet -- One Object, Full Control"
+    details: "The AgentWallet class is the single entry point your AI agent interacts with. It orchestrates signing, policy enforcement, chain interaction, and audit logging behind one simple execute() call. Your agent sees tool schemas; your server holds the keys."
+    icon: "\U0001F4BC"
+  - title: "Intent-Based Transactions"
+    details: "Agents describe what they want (transfer 1 SOL to Alice), not how to do it. Five intent types -- transfer, swap, mint, stake, custom -- cover all common blockchain operations. The SDK handles instruction building, signing, and broadcasting."
     icon: "\U0001F4DD"
-  - title: Solana Support
-    details: Full Solana integration including native SOL transfers, SPL token transfers, and Jupiter DEX swaps. Real RPC interaction with configurable commitment levels.
+  - title: "Policy Engine -- Deny by Default"
+    details: "Every transaction passes through an ordered chain of policy rules before execution. Spending limits, rate limits, address allowlists, time windows, and human approval gates. Fail-closed design: if anything goes wrong, the transaction is denied."
+    icon: "\U0001F6E1\uFE0F"
+  - title: "AI Framework Integration"
+    details: "First-class tool definitions for Claude (Anthropic), OpenAI, and LangChain. One call to toAnthropicTools(), toOpenAITools(), or createLangChainTools() gives your agent structured tool schemas. Policy enforcement is transparent to the agent."
+    icon: "\U0001F916"
+  - title: "Human Approval via Telegram"
+    details: "High-value transactions can require human sign-off before execution. The built-in TelegramApprovalBot sends inline-button approval requests with configurable thresholds, timeouts, and reviewer whitelists. No response means denial."
+    icon: "\u2705"
+  - title: "Tamper-Evident Audit Trail"
+    details: "Every policy decision and transaction is recorded in a SHA-256 hash chain with HMAC integrity verification. Each entry references the previous hash, making it impossible to alter history undetected. A circuit breaker halts all transactions if audit logging fails."
+    icon: "\U0001F50D"
+  - title: "Solana with Jupiter DEX"
+    details: "Full Solana support: native SOL transfers, SPL token transfers, and token swaps via the Jupiter DEX aggregator. Real RPC interaction with configurable commitment levels. Chain-agnostic architecture means more chains can be added without changing your code."
     icon: "\u26A1"
-  - title: TypeScript First
-    details: Written entirely in TypeScript with strict mode. Full type safety across intents, policies, results, and tool definitions. Zero runtime type surprises.
+  - title: "TypeScript with Strict Mode"
+    details: "Written entirely in TypeScript with strict mode enabled. Full type safety across intents, policies, results, and tool definitions. Every function parameter, return type, and configuration object is typed so your editor catches mistakes before your code runs."
     icon: "\U0001F4E6"
 ---

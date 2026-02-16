@@ -1,5 +1,13 @@
 # Stores
 
+::: info What you'll learn
+- Why the SDK needs a persistence layer and what happens without one
+- The 5-method Store interface that all backends implement
+- When to use `MemoryStore` (dev) vs `SqliteStore` (production)
+- How to implement a custom Store for Redis, DynamoDB, or other backends
+- Why `increment()` must be atomic for spending limit safety
+:::
+
 A Store is the SDK's internal database -- it remembers how much your agent has spent, how many transactions it has sent, and what happened in the past, so that safety rules work correctly even after your application restarts.
 
 Stores provide pluggable persistence for the SDK's internal state. The interface is deliberately minimal (5 methods) to make custom adapters trivial to implement.
@@ -337,6 +345,17 @@ const wallet = new AgentWallet({
 ```
 
 The same `Store` instance is shared between the `PolicyEngine` and `AgentWallet`. This ensures spending counters, rate limits, and audit logs all use the same persistence backend.
+
+## Common Mistakes
+
+**1. Using `MemoryStore` in production.**
+Spending limits reset on every process restart, letting the agent spend beyond configured limits. Always use `SqliteStore` or a custom persistent store in production.
+
+**2. Non-atomic `increment()` in custom stores.**
+If your custom store implements `increment()` as a read-then-write (instead of an atomic operation), concurrent `execute()` calls can read the same stale value and both increment it, allowing the agent to exceed spending limits. Use database transactions, Redis `INCRBYFLOAT`, or compare-and-swap to ensure atomicity.
+
+**3. Not sharing the store between `PolicyEngine` and `AgentWallet`.**
+The policy engine and wallet must use the same store instance. If they use different stores, spending counters and audit logs will be out of sync.
 
 ## See Also
 
