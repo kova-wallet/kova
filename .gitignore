@@ -4,7 +4,7 @@ coverage/
 *.log
 .env
 .env.*
-!.env.devnet.example
+!.env.example
 .DS_Store
 
 # Local dev (scripts/local-dev.sh)
