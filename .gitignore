@@ -30,6 +30,9 @@ SECURITY_AUDIT*.md
 # Source maps (H-36: prevent source map leaks in published packages)
 *.map
 
+# Design assets (local only)
+assets/
+
 # Documentation build artifacts
 docs/
 docs-site/.vitepress/cache/
