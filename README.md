@@ -26,13 +26,20 @@ Give your AI agents the ability to transact on Solana — with guardrails. kova 
 - **Security hardened** — 196 audit findings remediated (14 CRIT, 27 HIGH, 38 MED, 31 LOW)
 - **Solana** — SOL transfers, SPL tokens, Jupiter swaps (devnet by default)
 
-## Install
+## Getting Started
+
+### Prerequisites
+
+- Node.js 20+
+- npm
+
+### Install
 
 ```bash
 npm install kova
 ```
 
-## Quick Start
+### Quick Start
 
 ```typescript
 import { Keypair } from "@solana/web3.js";
@@ -88,6 +95,8 @@ const result = await wallet.execute({
 console.log(result.status);  // "confirmed" | "denied" | "pending" | "failed"
 console.log(result.summary); // "Sent 0.5 SOL to Gsbw...QRre"
 ```
+
+All consumer code should pass `network: "devnet"` to `SolanaAdapter` and the `dangerouslyAllowInProduction: true` flags to `LocalSigner` and `MemoryStore` during development.
 
 ## How It Works
 
@@ -223,12 +232,9 @@ cp .env.example .env    # copy the template and fill in your RPC URL, keys, etc.
 npx tsx examples/basic-transfer/index.ts   # run any example with tsx
 ```
 
-## Getting Started
+The `claude-agent` example requires an `ANTHROPIC_API_KEY` in `.env`.
 
-### Prerequisites
-
-- Node.js 20+
-- npm
+## Development
 
 ### Clone and verify
 
@@ -251,8 +257,6 @@ cp .env.example .env                             # fill in RPC URL if needed (de
 npx tsx examples/basic-transfer/index.ts         # generates a keypair, airdrops SOL, sends a transfer
 ```
 
-The `claude-agent` example requires an `ANTHROPIC_API_KEY` in `.env`.
-
 ### Run the dashboard
 
 ```bash
@@ -263,14 +267,6 @@ npm run dev                   # starts at http://localhost:3000
 ```
 
 Fund the wallet at [faucet.solana.com](https://faucet.solana.com) using the address printed by `generate.ts`. The dashboard auto-loads the keypair on startup with a default policy (0.01 SOL per-tx, 1 SOL daily, 5 txns/min rate limit).
-
-### Use kova in your own project
-
-```bash
-npm install kova
-```
-
-Then follow the [Quick Start](#quick-start) above. All consumer code should pass `network: "devnet"` to `SolanaAdapter` and the `dangerouslyAllowInProduction: true` flags to `LocalSigner` and `MemoryStore` during development.
 
 ## Security
 
