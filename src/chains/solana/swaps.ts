@@ -33,7 +33,10 @@
  */
 
 import { PublicKey, VersionedTransaction, type Connection } from "@solana/web3.js";
+import { getAssociatedTokenAddressSync } from "@solana/spl-token";
 import { lookup } from "node:dns/promises";
+import { request as httpsRequest, Agent as HttpsAgent } from "node:https";
+import { request as httpRequest, Agent as HttpAgent } from "node:http";
 import type { SwapParams } from "../../core/intent.js";
 import type { UnsignedTransaction } from "../../signers/interface.js";
 import {
@@ -43,6 +46,9 @@ import {
   normalizeTokenSymbol,
   SolanaAdapterError,
   stripControlChars,
+  sanitizeTokenName,
+  isPrivateIPv4,
+  isPrivateIPv6,
 } from "./utils.js";
 
 const DEFAULT_JUPITER_API = "https://quote-api.jup.ag/v6";
@@ -199,13 +205,22 @@ const DEFAULT_ALLOWED_SWAP_PROGRAMS: ReadonlyArray<string> = [
  */
 const MAX_RESPONSE_SIZE = 10_485_760; // 10 MB
 
+/** CHAIN-001 fix: Return type for DNS resolution with validated IP */
+interface ResolvedTarget {
+  ip: string;
+  family: number;
+}
+
 /**
- * CRIT-T2-01 fix: Validate that a URL's hostname does not resolve to a private/internal IP.
- * This is called before each Jupiter API fetch to prevent SSRF via DNS rebinding.
- * The Jupiter API URL is validated at construction time, but DNS can change between
- * construction and the actual request. This per-request validation closes that gap.
+ * CRIT-T2-01 / CHAIN-001 fix: Validate that a URL's hostname does not resolve to a
+ * private/internal IP, and return the validated resolved address. The caller MUST use
+ * the returned IP (via a pinned HTTPS agent) to ensure the actual connection goes to
+ * the same validated address, eliminating the DNS rebinding TOCTOU gap.
+ *
+ * Previously returned void and the caller used a separate fetch() that re-resolved DNS
+ * independently, creating a window where DNS could change between validation and connection.
  */
-async function validateFetchTarget(url: string): Promise<void> {
+async function validateAndResolveFetchTarget(url: string): Promise<ResolvedTarget> {
   let parsed: URL;
   try {
     parsed = new URL(url);
@@ -217,25 +232,17 @@ async function validateFetchTarget(url: string): Promise<void> {
 
   // Skip validation for localhost (dev only)
   if (hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1") {
-    return;
+    return { ip: hostname === "localhost" ? "127.0.0.1" : hostname, family: 4 };
   }
 
-  // Skip validation for IP literals (already validated at construction)
+  // CHAIN-005 fix: Use shared IP validation functions from utils.ts
+  // to prevent divergence between validateRpcUrl and validateFetchTarget.
   const ipv4Parts = hostname.split(".");
   if (ipv4Parts.length === 4 && ipv4Parts.every((p) => /^\d{1,3}$/.test(p))) {
-    const octets = ipv4Parts.map(Number);
-    const [o0, o1] = octets;
-    const isPrivate =
-      o0 === 10 ||
-      (o0 === 172 && o1! >= 16 && o1! <= 31) ||
-      (o0 === 192 && o1 === 168) ||
-      (o0 === 169 && o1 === 254) ||
-      (o0 === 100 && o1! >= 64 && o1! <= 127) ||
-      o0 === 127 || o0 === 0;
-    if (isPrivate) {
+    if (isPrivateIPv4(hostname)) {
       throw new SolanaAdapterError("SSRF_BLOCKED", `Jupiter API URL resolves to private IP: ${hostname}`);
     }
-    return;
+    return { ip: hostname, family: 4 };
   }
 
   // Resolve DNS and validate the resolved IP
@@ -245,35 +252,22 @@ async function validateFetchTarget(url: string): Promise<void> {
     const family = result.family;
 
     if (family === 4) {
-      const octets = ip.split(".").map(Number);
-      const [o0, o1] = octets;
-      const isPrivate =
-        o0 === 10 ||
-        (o0 === 172 && o1! >= 16 && o1! <= 31) ||
-        (o0 === 192 && o1 === 168) ||
-        (o0 === 169 && o1 === 254) ||
-        (o0 === 100 && o1! >= 64 && o1! <= 127) ||
-        o0 === 127 || o0 === 0;
-      if (isPrivate) {
+      if (isPrivateIPv4(ip)) {
         throw new SolanaAdapterError(
           "SSRF_BLOCKED",
           `Jupiter API hostname "${hostname}" resolved to private IPv4 address. DNS rebinding attack suspected.`,
         );
       }
     } else {
-      const lower = ip.toLowerCase();
-      const isPrivateV6 =
-        lower === "::" || lower === "::1" ||
-        lower.startsWith("fc") || lower.startsWith("fd") ||
-        /^fe[89ab]/i.test(lower) ||
-        lower.startsWith("::ffff:");
-      if (isPrivateV6) {
+      if (isPrivateIPv6(ip)) {
         throw new SolanaAdapterError(
           "SSRF_BLOCKED",
           `Jupiter API hostname "${hostname}" resolved to private IPv6 address. DNS rebinding attack suspected.`,
         );
       }
     }
+
+    return { ip, family };
   } catch (err) {
     if (err instanceof SolanaAdapterError) throw err;
     // LOW-T2-05 fix: Sanitize DNS error to remove hostname details that could
@@ -297,94 +291,146 @@ async function validateFetchTarget(url: string): Promise<void> {
  *
  * H-29 fix: Enforces Jupiter API rate limiting before each request.
  *
- * CRIT-T2-01 fix: Validates the target URL's resolved IP against private IP ranges
- * before each request to prevent SSRF via DNS rebinding. The Jupiter API URL is
- * validated at construction time, but DNS can change between construction and the
- * actual request. This per-request validation closes that TOCTOU gap.
+ * CHAIN-001 fix: Uses node:https.request with a DNS-pinned agent instead of the global
+ * fetch() API. validateAndResolveFetchTarget() resolves DNS and validates the IP in a
+ * single step, then the validated IP is locked into a one-shot HTTPS agent via a custom
+ * lookup function. This eliminates the DNS rebinding TOCTOU gap where fetch() would
+ * independently re-resolve DNS after validation, potentially connecting to a different IP.
  *
  * Returns the response body as a string (not a Response object) to ensure
  * the body is fully consumed within the timeout window.
  */
 async function fetchWithTimeout(
   url: string,
-  init?: RequestInit,
+  init?: { method?: string; headers?: Record<string, string>; body?: string },
   timeoutMs: number = DEFAULT_FETCH_TIMEOUT_MS,
   rateLimiter?: JupiterRateLimiter,
 ): Promise<{ ok: boolean; status: number; body: string }> {
-  // CRIT-T2-01 fix: Validate DNS before each fetch to prevent SSRF via DNS rebinding
-  await validateFetchTarget(url);
+  // CHAIN-001 fix: Resolve DNS and validate IP atomically. The returned IP is pinned
+  // into the HTTPS agent below, ensuring the connection goes to the SAME address that
+  // was validated — no independent DNS re-resolution by the HTTP client.
+  const resolved = await validateAndResolveFetchTarget(url);
+
   // H-29 / MED-T2-03 fix: Enforce rate limiting using per-instance limiter if provided,
   // otherwise fall back to the default module-level limiter for backward compatibility.
   await (rateLimiter ?? defaultRateLimiter).enforce();
 
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    // L-25 fix: Add User-Agent header to identify this SDK
-    const headers = new Headers(init?.headers);
-    if (!headers.has("User-Agent")) {
-      headers.set("User-Agent", "kova-wallet-sdk/0.1.0");
+  const parsed = new URL(url);
+  const isHttps = parsed.protocol === "https:";
+
+  // CHAIN-001 fix: Create a one-shot agent that pins DNS to the validated IP.
+  // The lookup function always returns the pre-resolved address, preventing the
+  // HTTP client from performing its own DNS resolution.
+  const pinnedLookup = (_hostname: string, _opts: unknown, cb: (...args: unknown[]) => void) => {
+    cb(null, resolved.ip, resolved.family);
+  };
+
+  const agent = isHttps
+    ? new HttpsAgent({
+        lookup: pinnedLookup as never,
+        keepAlive: false,
+        maxSockets: 1,
+        minVersion: "TLSv1.2",
+      })
+    : new HttpAgent({
+        lookup: pinnedLookup as never,
+        keepAlive: false,
+        maxSockets: 1,
+      });
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const settle = (fn: typeof resolve | typeof reject, value: unknown) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutId);
+      agent.destroy();
+      (fn as (...args: unknown[]) => void)(value);
+    };
+
+    const timeoutId = setTimeout(() => {
+      req.destroy();
+      settle(reject, new SolanaAdapterError(
+        "JUPITER_TIMEOUT",
+        `Jupiter API request timed out after ${timeoutMs}ms`,
+      ));
+    }, timeoutMs);
+
+    // L-25 fix: Add User-Agent header
+    const headers: Record<string, string> = {
+      "User-Agent": "kova-wallet-sdk/0.1.0",
+      ...(init?.headers ?? {}),
+    };
+    if (init?.body && !headers["Content-Length"]) {
+      headers["Content-Length"] = Buffer.byteLength(init.body).toString();
     }
 
-    const response = await fetch(url, {
-      ...init,
-      headers,
-      signal: controller.signal,
+    const requestFn = isHttps ? httpsRequest : httpRequest;
+    const req = requestFn(
+      {
+        hostname: parsed.hostname,
+        port: parsed.port || (isHttps ? 443 : 80),
+        path: parsed.pathname + parsed.search,
+        method: init?.method || "GET",
+        headers,
+        agent,
+        // TLS SNI: set servername to original hostname so the server presents the right cert
+        ...(isHttps ? { servername: parsed.hostname } : {}),
+      },
+      (res) => {
+        // M-49 fix: Check Content-Length before reading body
+        const contentLength = res.headers["content-length"];
+        if (contentLength && parseInt(contentLength, 10) > MAX_RESPONSE_SIZE) {
+          req.destroy();
+          settle(reject, new SolanaAdapterError(
+            "JUPITER_RESPONSE_TOO_LARGE",
+            `Jupiter API response Content-Length (${contentLength}) exceeds maximum allowed size (${MAX_RESPONSE_SIZE} bytes).`,
+          ));
+          return;
+        }
+
+        // M-49 fix: Stream body with size limit to prevent memory exhaustion
+        const chunks: Buffer[] = [];
+        let totalSize = 0;
+
+        res.on("data", (chunk: Buffer) => {
+          totalSize += chunk.length;
+          if (totalSize > MAX_RESPONSE_SIZE) {
+            req.destroy();
+            settle(reject, new SolanaAdapterError(
+              "JUPITER_RESPONSE_TOO_LARGE",
+              `Jupiter API response body exceeds maximum allowed size (${MAX_RESPONSE_SIZE} bytes). Read ${totalSize} bytes so far.`,
+            ));
+            return;
+          }
+          chunks.push(chunk);
+        });
+
+        res.on("end", () => {
+          const body = Buffer.concat(chunks).toString("utf-8");
+          const statusCode = res.statusCode ?? 500;
+          settle(resolve, {
+            ok: statusCode >= 200 && statusCode < 300,
+            status: statusCode,
+            body,
+          });
+        });
+
+        res.on("error", (err) => {
+          settle(reject, err);
+        });
+      },
+    );
+
+    req.on("error", (err) => {
+      settle(reject, err);
     });
 
-    // M-49 fix: Check Content-Length header before reading body
-    const contentLength = response.headers.get("content-length");
-    if (contentLength && parseInt(contentLength, 10) > MAX_RESPONSE_SIZE) {
-      throw new SolanaAdapterError(
-        "JUPITER_RESPONSE_TOO_LARGE",
-        `Jupiter API response Content-Length (${contentLength}) exceeds maximum allowed size (${MAX_RESPONSE_SIZE} bytes).`,
-      );
+    if (init?.body) {
+      req.write(init.body);
     }
-
-    // M-51 fix: Read body within the same timeout window.
-    // M-49 fix: Stream body with size limit to prevent memory exhaustion.
-    const reader = response.body?.getReader();
-    if (!reader) {
-      return { ok: response.ok, status: response.status, body: "" };
-    }
-
-    const chunks: Uint8Array[] = [];
-    let totalSize = 0;
-    // eslint-disable-next-line no-constant-condition
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      totalSize += value.byteLength;
-      if (totalSize > MAX_RESPONSE_SIZE) {
-        reader.cancel();
-        throw new SolanaAdapterError(
-          "JUPITER_RESPONSE_TOO_LARGE",
-          `Jupiter API response body exceeds maximum allowed size (${MAX_RESPONSE_SIZE} bytes). Read ${totalSize} bytes so far.`,
-        );
-      }
-      chunks.push(value);
-    }
-
-    // MED-T2-02 fix: Use efficient Uint8Array concatenation instead of spread operator.
-    // The previous implementation used `acc.push(...c)` which creates ~8x memory amplification
-    // by converting each Uint8Array chunk to individual number arguments on the call stack.
-    // This pre-allocates a single buffer of the exact required size and copies chunks into it.
-    let merged: Uint8Array;
-    if (chunks.length === 1) {
-      merged = chunks[0]!;
-    } else {
-      merged = new Uint8Array(totalSize);
-      let offset = 0;
-      for (const chunk of chunks) {
-        merged.set(chunk, offset);
-        offset += chunk.byteLength;
-      }
-    }
-    const body = new TextDecoder().decode(merged);
-    return { ok: response.ok, status: response.status, body };
-  } finally {
-    clearTimeout(timeoutId);
-  }
+    req.end();
+  });
 }
 
 interface JupiterQuote {
@@ -601,6 +647,16 @@ export async function buildJupiterSwap(
   // MED-12 fix: Cap slippage at 5% to prevent excessive value loss.
   // A slippage of 100% (1.0) would allow Jupiter to return zero output tokens.
   const MAX_SLIPPAGE = 0.05; // 5%
+  // HIGH-12 fix: Warn callers when the default slippage is applied silently.
+  // Without an explicit maxSlippage, the 0.5% default may not match the caller's
+  // risk tolerance. The warning allows operators to detect and address this.
+  if (params.maxSlippage === undefined || params.maxSlippage === null) {
+    process.emitWarning(
+      "No maxSlippage specified for swap — using default of 0.5% (0.005). " +
+      "Set maxSlippage explicitly in SwapParams to suppress this warning.",
+      "KovaDefaultSlippageWarning",
+    );
+  }
   const rawSlippage = params.maxSlippage ?? 0.005;
   if (rawSlippage > MAX_SLIPPAGE) {
     throw new SolanaAdapterError(
@@ -687,6 +743,32 @@ export async function buildJupiterSwap(
     );
   }
 
+  // CHAIN-015 fix: Warn if the signer's expected token ATAs are not in staticAccountKeys.
+  // A valid Jupiter swap should include the signer's input and output token ATAs
+  // as writable accounts. Their absence in staticAccountKeys could indicate the
+  // transaction routes through unexpected accounts. Note: ATAs may also appear via
+  // ALTs, so this is a warning rather than a hard rejection.
+  try {
+    const signerPubkey = new PublicKey(signerAddress);
+    const staticKeys = tx.message.staticAccountKeys.map((k) => k.toBase58());
+    const SOL_MINT_ADDR = "So11111111111111111111111111111111111111112";
+    for (const [label, mintAddr] of [["input", inputMint], ["output", outputMint]] as const) {
+      if (mintAddr && mintAddr !== SOL_MINT_ADDR) {
+        const mintPubkey = new PublicKey(mintAddr);
+        const expectedAta = getAssociatedTokenAddressSync(mintPubkey, signerPubkey).toBase58();
+        if (!staticKeys.includes(expectedAta)) {
+          process.emitWarning(
+            `CHAIN-015: Signer's ${label} token ATA (${expectedAta}) not found in ` +
+            `staticAccountKeys. It may be referenced via an Address Lookup Table.`,
+            "KovaSwapWarning",
+          );
+        }
+      }
+    }
+  } catch {
+    // Non-fatal: token resolution may fail for unknown mints
+  }
+
   // CHAIN-002: Handle Address Table Lookups (ALTs).
   // Jupiter V6 API returns transactions with ALTs for most swap routes.
   // ALTs add additional account keys (token accounts, etc.) but do NOT change
@@ -717,10 +799,13 @@ export async function buildJupiterSwap(
     // defense-in-depth against a compromised Jupiter API injecting unexpected
     // account references. Resolution requires fetching ALT account data from
     // the chain via connection.getAddressLookupTable().
-    console.warn(
-      `[kova-wallet] CHAIN-002: Jupiter swap transaction contains ${addressTableLookups.length} ` +
+    // CHAIN-020 fix: Use process.emitWarning instead of console.warn so ALT
+    // security events can be captured by structured logging pipelines.
+    process.emitWarning(
+      `Jupiter swap transaction contains ${addressTableLookups.length} ` +
       `Address Lookup Table(s). ALTs are allowed; program validation uses static account keys only. ` +
       `ALT-referenced accounts are not individually validated.`,
+      "KovaSwapWarning",
     );
   }
 
@@ -810,6 +895,80 @@ export async function buildJupiterSwap(
           );
         }
       }
+      // CHAIN-025 fix: Validate SetComputeUnitPrice (discriminator byte 3, u64 microLamports).
+      // A compromised Jupiter API could set an excessively high priority fee per CU,
+      // draining the wallet via inflated fees. Cap at 10M microLamports/CU (~0.01 SOL/CU).
+      if (ix.data[0] === 3 && ix.data.length >= 9) {
+        const microLamports =
+          BigInt(ix.data[1]!) |
+          (BigInt(ix.data[2]!) << 8n) |
+          (BigInt(ix.data[3]!) << 16n) |
+          (BigInt(ix.data[4]!) << 24n) |
+          (BigInt(ix.data[5]!) << 32n) |
+          (BigInt(ix.data[6]!) << 40n) |
+          (BigInt(ix.data[7]!) << 48n) |
+          (BigInt(ix.data[8]!) << 56n);
+        const MAX_MICRO_LAMPORTS_PER_CU = 10_000_000n; // 10M microLamports/CU
+        if (microLamports > MAX_MICRO_LAMPORTS_PER_CU) {
+          throw new SolanaAdapterError(
+            "JUPITER_EXCESSIVE_PRIORITY_FEE",
+            `Jupiter swap transaction sets compute unit price to ${microLamports} microLamports/CU, ` +
+            `exceeding maximum of ${MAX_MICRO_LAMPORTS_PER_CU}. ` +
+            `This may indicate a manipulated transaction designed to drain the wallet via inflated priority fees.`,
+          );
+        }
+      }
+    }
+  }
+
+  // CHAIN-002 fix: Defense-in-depth check — verify that the quoted otherAmountThreshold
+  // value appears in the Jupiter program's instruction data as a little-endian u64.
+  // A compromised Jupiter API could return a correct threshold in JSON but embed a
+  // different (lower or zero) minimum output in the compiled transaction instructions.
+  // This check scans Jupiter instructions for the expected byte pattern.
+  //
+  // LIMITATION: This is a heuristic check, not a full instruction layout parser.
+  // Jupiter's instruction format varies across versions (v3-v6) and instruction types
+  // (Route, SharedAccountsRoute, ExactOutRoute, etc.). A sophisticated attacker could
+  // potentially structure the instruction data to include the expected byte pattern at a
+  // non-threshold offset. Full protection requires a versioned instruction layout parser.
+  // For high-value swaps (>$10,000), use verifySwapOutput() after confirmation as a
+  // secondary check.
+  const quotedThreshold = BigInt(quote.otherAmountThreshold);
+  if (quotedThreshold > 0n) {
+    const thresholdBytes = Buffer.alloc(8);
+    thresholdBytes.writeBigUInt64LE(quotedThreshold);
+
+    let thresholdFoundInIx = false;
+    for (const ix of compiledInstructions) {
+      const programKey = accountKeys[ix.programIdIndex];
+      if (programKey && KNOWN_JUPITER_PROGRAMS.has(programKey) && ix.data.length >= 16) {
+        // Search for the threshold value in the instruction data (skip the 8-byte discriminator)
+        const ixBuf = Buffer.from(ix.data);
+        for (let offset = 8; offset <= ixBuf.length - 8; offset++) {
+          if (ixBuf.subarray(offset, offset + 8).equals(thresholdBytes)) {
+            thresholdFoundInIx = true;
+            break;
+          }
+        }
+        if (thresholdFoundInIx) break;
+      }
+    }
+
+    if (!thresholdFoundInIx) {
+      // CHAIN-002: The quoted minimum output amount was not found in any Jupiter
+      // instruction data. This COULD indicate the on-chain slippage parameter differs
+      // from the quoted value. Emit a warning rather than a hard rejection because:
+      // 1. Jupiter's instruction layout may have changed in newer versions
+      // 2. The threshold encoding format may differ from little-endian u64
+      // 3. Some Jupiter instruction types encode the threshold differently
+      // For production high-value swaps, ALWAYS use verifySwapOutput() after confirmation.
+      process.emitWarning(
+        `CHAIN-002: Jupiter swap otherAmountThreshold (${quote.otherAmountThreshold}) not found in ` +
+        `on-chain instruction data. The on-chain slippage parameter may differ from the quoted value. ` +
+        `Use verifySwapOutput() after confirmation for high-value swaps.`,
+        "SecurityWarning",
+      );
     }
   }
 
@@ -837,7 +996,7 @@ export async function buildJupiterSwap(
   return {
     chain: "solana",
     data: new Uint8Array(swapTransactionBuf),
-    description: `Swap ${stripControlChars(String(params.amount))} ${stripControlChars(params.fromToken)} for ${stripControlChars(params.toToken)} via Jupiter`,
+    description: `Swap ${stripControlChars(String(params.amount))} ${sanitizeTokenName(params.fromToken)} for ${sanitizeTokenName(params.toToken)} via Jupiter`,
   };
 }
 
@@ -925,12 +1084,16 @@ const ABSOLUTE_PRICE_BOUNDS: Record<string, { min: number; max: number }> = {
  * HIGH-20 fix: Caches prices with TTL and rejects anomalous price deviations
  * compared to the last known good value (prevents oracle manipulation).
  *
- * MED-14 note: This relies on a single price oracle (Jupiter Price API v2).
- * For production deployments handling significant value, consider:
- * - Adding a secondary oracle (Pyth, Switchboard, CoinGecko)
- * - Using the median of multiple oracles for spending limit calculations
- * - The price cache (30s TTL) provides some resilience against brief outages
- * - The deviation check (3x max) provides protection against price manipulation
+ * CHAIN-014 SECURITY LIMITATION: Single-source price oracle (Jupiter Price API v2).
+ * If the Jupiter Price API is compromised, returns stale data, or is unreachable,
+ * spending limit USD calculations may be bypassed or inaccurate. The deviation check
+ * (3x max) and cache TTL (30s) provide partial resilience, but a sophisticated
+ * attacker controlling the API could gradually shift prices within the deviation
+ * window over multiple cache cycles. For production deployments handling >$10,000:
+ * - Add a secondary oracle (Pyth Network on-chain, Switchboard, CoinGecko API)
+ * - Use the median of multiple oracles for spending limit calculations
+ * - Consider on-chain TWAP oracles for manipulation resistance
+ * - Implement circuit breaker on sustained API failures/anomalies
  */
 export async function getTokenPriceUSD(
   token: string,

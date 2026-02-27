@@ -83,6 +83,18 @@ function secureAuxFiles(dbPath: string): void {
   }
 }
 
+/**
+ * LOW-27 fix: Redact store keys in warning messages to prevent leaking sensitive
+ * information like token identifiers, agent IDs, or wallet addresses.
+ * Keys longer than 16 characters are truncated to first 8 + "..." + last 4 chars.
+ */
+function redactStoreKey(key: string): string {
+  if (key.length > 16) {
+    return key.slice(0, 8) + "..." + key.slice(-4);
+  }
+  return key;
+}
+
 /** MED-21 fix: Validate store key length and content */
 function validateKey(key: string): void {
   if (key.length > MAX_KEY_LENGTH) {
@@ -136,6 +148,23 @@ export interface SqliteStoreConfig {
    * database itself.
    */
   hmacKey?: string;
+  /**
+   * CRIT-09 fix: Optional AES-256-GCM encryption key for application-level encryption
+   * of values stored in the database. When provided, all values written to the kv and
+   * lists tables are encrypted before storage and decrypted on retrieval.
+   *
+   * Must be exactly 32 bytes (256 bits) for AES-256-GCM. Generate one with:
+   *   crypto.randomBytes(32)
+   *
+   * Encrypted values are stored in the format: iv:authTag:ciphertext (all base64-encoded).
+   * A fresh random 12-byte IV is generated for each encryption operation.
+   *
+   * WARNING: Enabling encryption on an existing plaintext database will cause all
+   * previously stored values to fail decryption. Migrate data before enabling.
+   * Store this key in a secret manager or environment variable — NOT in the
+   * database itself.
+   */
+  encryptionKey?: Buffer;
 }
 
 /** H-19 fix: Maximum retries for SQLITE_BUSY errors with exponential backoff */
@@ -156,6 +185,12 @@ export class SqliteStore implements Store {
   // T1-F5 fix: Mutable Buffer (not readonly string) so destroy() can zero the key material
   // in-place via Buffer.fill(0). Strings are immutable in V8 and cannot be reliably zeroed.
   private hmacKey: Buffer;
+  /**
+   * CRIT-09 fix: Optional AES-256-GCM encryption key for application-level encryption.
+   * When set, all values are encrypted before writing and decrypted after reading.
+   * Stored as a mutable Buffer so destroy() can zero the key material in-place.
+   */
+  private encryptionKey: Buffer | null = null;
 
   /**
    * Create a new SqliteStore. Opens (or creates) the database at the given path.
@@ -280,6 +315,30 @@ export class SqliteStore implements Store {
     // M-36 fix: Store the resolved path for all subsequent operations
     this.dbPath = resolvedDbPath;
 
+    // DATA-014 fix: After opening the database, verify the real path matches what
+    // we validated. An attacker could recreate a symlink between realpathSync()
+    // and Database() open, redirecting the database to an attacker-controlled location.
+    if (resolvedDbPath !== ":memory:") {
+      try {
+        const actualPath = fs.realpathSync(resolvedDbPath);
+        if (actualPath !== resolvedDbPath) {
+          this.db.close();
+          throw new Error(
+            `SqliteStore: symlink TOCTOU detected — path resolved to "${actualPath}" after open, ` +
+            `but was expected to be "${resolvedDbPath}". The file may have been replaced with a symlink.`,
+          );
+        }
+      } catch (err) {
+        if (err instanceof Error && err.message.includes("symlink TOCTOU")) throw err;
+        // If realpath fails (file was deleted?), close and throw
+        this.db.close();
+        throw new Error(
+          `SqliteStore: post-open path validation failed for "${resolvedDbPath}". ` +
+          `Original error: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+
     // MED-21 fix: Set restrictive file permissions (owner read/write only) on the
     // database file to prevent other users on the system from reading wallet data.
     // Skipped for in-memory databases which have no file on disk.
@@ -357,6 +416,10 @@ export class SqliteStore implements Store {
 
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("busy_timeout = 5000");
+    // DATA-010 fix: Enable secure_delete so deleted data (counter values, HMAC keys,
+    // audit entries) is overwritten with zeros instead of being left recoverable in
+    // SQLite's free pages. Without this, sensitive data can be recovered forensically.
+    this.db.pragma("secure_delete = ON");
 
     // STORE-002 fix: Secure WAL and SHM auxiliary files after enabling WAL mode
     // M-20 fix: Only secure once during initialization (not on every write)
@@ -381,14 +444,32 @@ export class SqliteStore implements Store {
     } else {
       // T1-F5 fix: Store raw bytes instead of hex string
       this.hmacKey = crypto.randomBytes(32);
+      // DATA-003 fix: Upgrade from warning to hard error for persistent (non-memory) databases.
+      // Ephemeral HMAC keys mean all counter HMACs become invalid on process restart,
+      // resetting spending/rate limit counters to zero. An attacker who can force a
+      // restart can bypass all spending limits. Only :memory: databases (testing) are
+      // exempt since they lose all data on restart anyway.
       if (config.path !== ":memory:") {
-        process.emitWarning(
-          "SqliteStore: no hmacKey provided. Counter HMAC keys will be ephemeral and " +
-          "all spending/rate limit counters will reset on process restart. " +
-          "Provide a persistent hmacKey via config for production use.",
-          "SecurityWarning",
+        throw new Error(
+          "SqliteStore: no hmacKey provided for persistent database at '" + config.path + "'. " +
+          "Without a persistent hmacKey, all spending/rate limit counters will reset on process " +
+          "restart, allowing bypass of spending limits. Generate a key with: " +
+          "crypto.randomBytes(32).toString('hex') and pass it via SqliteStoreConfig.hmacKey. " +
+          "For testing, use path: ':memory:' which does not require a persistent hmacKey.",
         );
       }
+    }
+
+    // CRIT-09 fix: Validate and store optional AES-256-GCM encryption key
+    if (config.encryptionKey) {
+      if (config.encryptionKey.length !== 32) {
+        throw new Error(
+          "SqliteStore: encryptionKey must be exactly 32 bytes (256 bits) for AES-256-GCM. " +
+          `Got ${config.encryptionKey.length} bytes. Generate one with: crypto.randomBytes(32)`,
+        );
+      }
+      // Copy the buffer so the caller cannot mutate it after construction
+      this.encryptionKey = Buffer.from(config.encryptionKey);
     }
 
     // HIGH-T5-04 fix: Wrap initialization in try/catch to ensure the database
@@ -467,6 +548,52 @@ export class SqliteStore implements Store {
   }
 
   /**
+   * CRIT-09 fix: Encrypt a plaintext string using AES-256-GCM.
+   * Returns a string in the format: iv:authTag:ciphertext (all base64-encoded).
+   * A fresh random 12-byte IV is generated for each call to ensure unique ciphertexts.
+   * If no encryptionKey is configured, returns the plaintext unchanged.
+   */
+  private encrypt(plaintext: string): string {
+    if (!this.encryptionKey) return plaintext;
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv("aes-256-gcm", this.encryptionKey, iv);
+    const encrypted = Buffer.concat([
+      cipher.update(plaintext, "utf8"),
+      cipher.final(),
+    ]);
+    const authTag = cipher.getAuthTag();
+    return `${iv.toString("base64")}:${authTag.toString("base64")}:${encrypted.toString("base64")}`;
+  }
+
+  /**
+   * CRIT-09 fix: Decrypt a ciphertext string produced by encrypt().
+   * Expects format: iv:authTag:ciphertext (all base64-encoded).
+   * If no encryptionKey is configured, returns the ciphertext unchanged.
+   * Throws on authentication failure (tampered data) or malformed input.
+   */
+  private decrypt(ciphertext: string): string {
+    if (!this.encryptionKey) return ciphertext;
+    const parts = ciphertext.split(":");
+    if (parts.length !== 3) {
+      throw new Error(
+        "SqliteStore: encrypted value has invalid format (expected iv:authTag:ciphertext). " +
+        "The database may contain plaintext values from before encryption was enabled.",
+      );
+    }
+    const [ivStr, authTagStr, encryptedStr] = parts as [string, string, string];
+    const iv = Buffer.from(ivStr, "base64");
+    const authTag = Buffer.from(authTagStr, "base64");
+    const encrypted = Buffer.from(encryptedStr, "base64");
+    const decipher = crypto.createDecipheriv("aes-256-gcm", this.encryptionKey, iv);
+    decipher.setAuthTag(authTag);
+    const decrypted = Buffer.concat([
+      decipher.update(encrypted),
+      decipher.final(),
+    ]);
+    return decrypted.toString("utf8");
+  }
+
+  /**
    * H-25 fix: Compute HMAC for a counter value. This is defense-in-depth against
    * direct store manipulation — if an attacker modifies counter values in the
    * database file (e.g., via direct file access or SQL injection in another
@@ -475,9 +602,14 @@ export class SqliteStore implements Store {
    * lifetime of this SqliteStore instance.
    */
   private computeCounterHmac(key: string, value: string): string {
+    // MED-01 fix: Use length-prefixed concatenation to prevent ambiguity.
+    // Previously `key + ":" + value` was used, but if key contains a colon,
+    // different key/value pairs can produce the same HMAC input (e.g.,
+    // key="a:b" value="c" vs key="a" value="b:c"). Length-prefixing the key
+    // makes the boundary unambiguous regardless of key content.
     return crypto
       .createHmac("sha256", this.hmacKey)
-      .update(`${key}:${value}`)
+      .update(`${key.length.toString(16)}:${key}:${value}`)
       .digest("hex");
   }
 
@@ -557,21 +689,26 @@ export class SqliteStore implements Store {
    */
   async get(key: string): Promise<string | null> {
     validateKey(key);
+    // DATA-006 fix: Filter expired entries directly in the SELECT query instead of
+    // lazy deletion after read. With WAL mode and multiple connections, a reader
+    // could see a counter value that another connection has already expired.
+    const now = Date.now();
     const row = this.db
-      .prepare("SELECT value, expires_at FROM kv WHERE key = ?")
-      .get(key) as { value: string; expires_at: number | null } | undefined;
+      .prepare("SELECT value, expires_at FROM kv WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)")
+      .get(key, now) as { value: string; expires_at: number | null } | undefined;
 
-    if (!row) return null;
-
-    if (row.expires_at !== null && Date.now() > row.expires_at) {
-      // H-19 fix: Use retry logic for write operations that may hit SQLITE_BUSY
-      await this.executeWithRetry(() => {
-        this.db.prepare("DELETE FROM kv WHERE key = ?").run(key);
-      });
+    if (!row) {
+      // Best-effort cleanup of potentially expired entry
+      try {
+        await this.executeWithRetry(() => {
+          this.db.prepare("DELETE FROM kv WHERE key = ? AND expires_at IS NOT NULL AND expires_at <= ?").run(key, now);
+        });
+      } catch { /* non-fatal cleanup */ }
       return null;
     }
 
-    return row.value;
+    // CRIT-09 fix: Decrypt value before returning if encryption is enabled
+    return this.decrypt(row.value);
   }
 
   /**
@@ -580,6 +717,11 @@ export class SqliteStore implements Store {
    */
   async set(key: string, value: string, ttlSeconds?: number): Promise<void> {
     validateKey(key);
+    // MED-08 fix: Validate ttlSeconds is a finite positive number to prevent
+    // NaN or Infinity from causing incorrect TTL behavior (e.g., NaN * 1000 = NaN).
+    if (ttlSeconds !== undefined && (!Number.isFinite(ttlSeconds) || ttlSeconds <= 0)) {
+      throw new Error(`SqliteStore.set: ttlSeconds must be a positive finite number, got ${ttlSeconds}`);
+    }
     // STORE-008 fix: Reject values exceeding maximum length to prevent unbounded disk growth
     if (value.length > MAX_VALUE_LENGTH) {
       throw new Error(`Value exceeds maximum length of ${MAX_VALUE_LENGTH} characters`);
@@ -589,13 +731,16 @@ export class SqliteStore implements Store {
         ? Date.now() + ttlSeconds * 1000
         : null;
 
+    // CRIT-09 fix: Encrypt value before storing if encryption is enabled
+    const encryptedValue = this.encrypt(value);
+
     // H-19 fix: Retry on SQLITE_BUSY with exponential backoff
     await this.executeWithRetry(() => {
       this.db
         .prepare(
           "INSERT OR REPLACE INTO kv (key, value, expires_at) VALUES (?, ?, ?)",
         )
-        .run(key, value, expiresAt);
+        .run(key, encryptedValue, expiresAt);
     });
 
     // M-20 fix: Only secure auxiliary files once instead of on every write.
@@ -613,6 +758,11 @@ export class SqliteStore implements Store {
    */
   async setIfNotExists(key: string, value: string, ttlSeconds?: number): Promise<boolean> {
     validateKey(key);
+    // MED-08 fix: Validate ttlSeconds is a finite positive number to prevent
+    // NaN or Infinity from causing incorrect TTL behavior.
+    if (ttlSeconds !== undefined && (!Number.isFinite(ttlSeconds) || ttlSeconds <= 0)) {
+      throw new Error(`SqliteStore.setIfNotExists: ttlSeconds must be a positive finite number, got ${ttlSeconds}`);
+    }
     // STORE-008 fix: Reject values exceeding maximum length to prevent unbounded disk growth
     if (value.length > MAX_VALUE_LENGTH) {
       throw new Error(`Value exceeds maximum length of ${MAX_VALUE_LENGTH} characters`);
@@ -621,6 +771,9 @@ export class SqliteStore implements Store {
       ttlSeconds !== undefined && ttlSeconds > 0
         ? Date.now() + ttlSeconds * 1000
         : null;
+
+    // CRIT-09 fix: Encrypt value before storing if encryption is enabled
+    const encryptedValue = this.encrypt(value);
 
     // H-19 fix: Retry on SQLITE_BUSY with exponential backoff
     const result = await this.executeWithRetry(() => {
@@ -640,7 +793,7 @@ export class SqliteStore implements Store {
 
         this.db
           .prepare("INSERT INTO kv (key, value, expires_at) VALUES (?, ?, ?)")
-          .run(key, value, expiresAt);
+          .run(key, encryptedValue, expiresAt);
         return true;
       })();
     });
@@ -704,28 +857,54 @@ export class SqliteStore implements Store {
             // Expired — treat as fresh
             this.db.prepare("DELETE FROM kv WHERE key = ?").run(key);
           } else {
+            // CRIT-09 fix: Decrypt the stored value before parsing if encryption is enabled
+            const decryptedValue = this.decrypt(existing.value);
             // H-25 fix: Verify HMAC integrity of existing counter value before trusting it.
             // The HMAC is stored in a separate key ({key}:__hmac) to avoid polluting the
             // counter value returned by get().
+            // CRIT-09 note: HMAC is computed on the plaintext value, not the encrypted form,
+            // so we verify against the decrypted value.
             const hmacRow = this.db
               .prepare("SELECT value FROM kv WHERE key = ?")
               .get(key + ":__hmac") as { value: string } | undefined;
-            if (hmacRow && !this.verifyCounterHmac(key, existing.value, hmacRow.value)) {
+            // CRIT-09 fix: Decrypt HMAC value if encryption is enabled
+            const hmacValue = hmacRow ? this.decrypt(hmacRow.value) : undefined;
+            // DATA-005 fix: Warn when HMAC entry is missing. This could indicate:
+            // (a) the counter was initialized via set() (legitimate, no HMAC created), or
+            // (b) an attacker deleted the HMAC entry to bypass integrity checks.
+            // We emit a SecurityWarning but trust the value, since set()-initialized
+            // counters legitimately lack HMAC entries. Only when an HMAC EXISTS but is
+            // INVALID do we reset to 0 (definitive evidence of tampering).
+            if (!hmacValue) {
               try {
+                // LOW-27 fix: Redact key to prevent leaking sensitive token/agent/wallet info in warnings
                 process.emitWarning(
-                  `SqliteStore.increment: HMAC verification failed for key "${key}". ` +
+                  `SqliteStore.increment: HMAC entry missing for key "${redactStoreKey(key)}". ` +
+                  `Counter may have been tampered with (HMAC deleted), or was initialized via set().`,
+                  "SecurityWarning",
+                );
+              } catch { /* non-fatal */ }
+              // Trust the value but proceed with caution — next increment will create an HMAC
+              const parsed = parseFloat(decryptedValue);
+              current = isNaN(parsed) ? 0 : parsed;
+            } else if (!this.verifyCounterHmac(key, decryptedValue, hmacValue)) {
+              try {
+                // LOW-27 fix: Redact key to prevent leaking sensitive token/agent/wallet info in warnings
+                process.emitWarning(
+                  `SqliteStore.increment: HMAC verification failed for key "${redactStoreKey(key)}". ` +
                   `Counter value may have been tampered with. Resetting to 0.`,
                   "SecurityWarning",
                 );
               } catch { /* non-fatal */ }
               current = 0;
             } else {
-              const parsed = parseFloat(existing.value);
+              const parsed = parseFloat(decryptedValue);
               // MED-23 fix: Detect non-numeric counter values instead of silently resetting
               if (isNaN(parsed)) {
                 try {
+                  // LOW-27 fix: Redact key to prevent leaking sensitive token/agent/wallet info in warnings
                   process.emitWarning(
-                    `SqliteStore.increment: key "${key}" contains non-numeric value "${existing.value.slice(0, 50)}". ` +
+                    `SqliteStore.increment: key "${redactStoreKey(key)}" contains non-numeric value. ` +
                     `Treating as 0. This may indicate data corruption or key collision.`,
                     "StoreWarning",
                   );
@@ -744,19 +923,22 @@ export class SqliteStore implements Store {
 
         // H-25 fix: Compute HMAC for integrity protection of the new counter value.
         // Stored in a separate key ({key}:__hmac) so get() returns the clean counter value.
+        // CRIT-09 note: HMAC is computed on the plaintext value string, then the HMAC
+        // itself is encrypted before storage (if encryption is enabled).
         const valueStr = String(newValue);
         const hmac = this.computeCounterHmac(key, valueStr);
         this.db
           .prepare(
             "INSERT OR REPLACE INTO kv (key, value, expires_at) VALUES (?, ?, ?)",
           )
-          .run(key + ":__hmac", hmac, expiresAt);
+          .run(key + ":__hmac", this.encrypt(hmac), expiresAt);
 
+        // CRIT-09 fix: Encrypt the counter value before storing
         this.db
           .prepare(
             "INSERT OR REPLACE INTO kv (key, value, expires_at) VALUES (?, ?, ?)",
           )
-          .run(key, valueStr, expiresAt);
+          .run(key, this.encrypt(valueStr), expiresAt);
 
         return newValue;
       })();
@@ -777,6 +959,8 @@ export class SqliteStore implements Store {
    */
   async append(key: string, value: string): Promise<void> {
     validateKey(key);
+    // CRIT-09 fix: Encrypt value before storing if encryption is enabled
+    const encryptedValue = this.encrypt(value);
     // H-19 fix: Retry on SQLITE_BUSY with exponential backoff
     await this.executeWithRetry(() => {
       this.db.transaction(() => {
@@ -784,7 +968,7 @@ export class SqliteStore implements Store {
           .prepare(
             "INSERT INTO lists (key, value, created_at) VALUES (?, ?, ?)",
           )
-          .run(key, value, Date.now());
+          .run(key, encryptedValue, Date.now());
 
         // CRIT-03 fix: Evict oldest entries when list exceeds max size
         const countRow = this.db
@@ -793,6 +977,16 @@ export class SqliteStore implements Store {
 
         if (countRow.cnt > MAX_LIST_SIZE) {
           const excess = countRow.cnt - MAX_LIST_SIZE;
+          // DATA-007 fix: Emit a warning when eviction occurs to distinguish
+          // expected FIFO eviction from unexpected truncation in verifyIntegrity().
+          try {
+            // LOW-27 fix: Redact key to prevent leaking sensitive token/agent/wallet info in warnings
+            process.emitWarning(
+              `SqliteStore: evicting ${excess} oldest entries from list "${redactStoreKey(key)}" (MAX_LIST_SIZE=${MAX_LIST_SIZE}). ` +
+              `Hash chain verification may report missing entries — this is expected eviction, not tampering.`,
+              "KovaStoreEviction",
+            );
+          } catch { /* non-fatal */ }
           this.db
             .prepare(
               "DELETE FROM lists WHERE key = ? AND id IN (SELECT id FROM lists WHERE key = ? ORDER BY id ASC LIMIT ?)",
@@ -824,7 +1018,8 @@ export class SqliteStore implements Store {
       )
       .all(key, cappedCount) as { value: string }[];
 
-    return rows.map((r) => r.value);
+    // CRIT-09 fix: Decrypt values before returning if encryption is enabled
+    return rows.map((r) => this.decrypt(r.value));
   }
 
   /**
@@ -878,14 +1073,32 @@ export class SqliteStore implements Store {
     if (this.hmacKey) {
       this.hmacKey.fill(0);
     }
+    // CRIT-09 fix: Zero the encryption key material on destroy to prevent recovery
+    // from heap dumps or core dumps.
+    if (this.encryptionKey) {
+      this.encryptionKey.fill(0);
+      this.encryptionKey = null;
+    }
     this.db.close();
   }
 
   /** Delete all data (for testing).
    *  HIGH-T5-05 fix: Wrapped in a transaction for atomicity so partial
    *  deletes (e.g., kv cleared but lists not) cannot occur on error.
+   *  MED-26 fix: Emits a SecurityWarning when called, since clear() deletes all
+   *  data including audit logs without any audit trail of the deletion itself.
    */
   clear(): void {
+    // MED-26 fix: Emit a security warning because clear() bypasses audit trail
+    // protection — an attacker with store access can silently wipe all evidence
+    // (audit logs, spending counters, circuit breaker state) with no record.
+    try {
+      process.emitWarning(
+        "SqliteStore.clear() called — all data including audit logs will be deleted. " +
+        "This operation is not recorded in the audit trail.",
+        "SecurityWarning",
+      );
+    } catch { /* non-fatal — do not block the clear operation */ }
     this.db.transaction(() => {
       this.db.exec("DELETE FROM kv; DELETE FROM lists;");
     })();

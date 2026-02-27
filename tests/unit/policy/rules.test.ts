@@ -491,12 +491,14 @@ describe("ApprovalGateRule", () => {
     expect(result.decision).toBe("ALLOW");
   });
 
-  it("should ALLOW when amount equals threshold", async () => {
+  // POLICY-004 fix: amount == threshold now requires approval (strict < comparison).
+  // Previously used <=, allowing exact-threshold transactions without approval.
+  it("should DENY when amount equals threshold (POLICY-004: exact threshold requires approval)", async () => {
     const rule = new ApprovalGateRule({
       above: { amount: "1", token: "SOL" },
     });
     const result = await rule.evaluate(makeIntent(), makeContext());
-    expect(result.decision).toBe("ALLOW");
+    expect(result.decision).toBe("DENY");
   });
 
   it("should DENY when amount exceeds threshold and no approval channel", async () => {
@@ -721,7 +723,7 @@ describe("SpendingLimitRule — Edge Cases", () => {
     expect(r4.decision).toBe("DENY");
   });
 
-  it("should allow exactly remaining daily budget", async () => {
+  it("should DENY when spending exactly meets the daily budget (HIGH-21 off-by-one fix)", async () => {
     const store = new MemoryStore();
     const rule = new SpendingLimitRule({
       daily: { amount: "10", token: "SOL" },
@@ -735,18 +737,20 @@ describe("SpendingLimitRule — Edge Cases", () => {
     );
 
     // Spend exactly 3 more (7 + 3 = 10, exactly at limit)
+    // HIGH-21 fix: This should now be DENIED because projected total (10) >= limit (10).
+    // Previously, this was ALLOWED due to an off-by-one error using > instead of >=.
     const r2 = await rule.evaluate(
       makeIntent({ params: { to: "addr", amount: "3", token: "SOL" } }),
       ctx,
     );
-    expect(r2.decision).toBe("ALLOW");
+    expect(r2.decision).toBe("DENY");
 
-    // Any further spending should be denied
+    // Spending just under the remaining budget should still be allowed
     const r3 = await rule.evaluate(
-      makeIntent({ params: { to: "addr", amount: "0.001", token: "SOL" } }),
+      makeIntent({ params: { to: "addr", amount: "2.999", token: "SOL" } }),
       ctx,
     );
-    expect(r3.decision).toBe("DENY");
+    expect(r3.decision).toBe("ALLOW");
   });
 
   it("should DENY untracked token when no USD limits exist (AUDIT-CRIT-01)", async () => {
@@ -883,11 +887,23 @@ describe("AllowlistRule — Edge Cases", () => {
     expect(result.decision).toBe("DENY");
   });
 
-  it("should ALLOW non-custom intents even when allowPrograms is configured", async () => {
+  it("should DENY non-custom intents when their inferred program is not in allowPrograms (HIGH-24)", async () => {
     const rule = new AllowlistRule({
       allowPrograms: ["OnlyThisProgram"],
     });
-    // Transfer intent — extractProgramId returns null for non-custom
+    // HIGH-24 fix: Transfer intents now infer the System Program as their programId.
+    // Since "11111111111111111111111111111111" (System Program) is NOT in allowPrograms,
+    // this should be denied. Previously, extractProgramId returned null for non-custom
+    // intents, bypassing the program allowlist entirely.
+    const result = await rule.evaluate(makeIntent(), makeContext());
+    expect(result.decision).toBe("DENY");
+  });
+
+  it("should ALLOW transfer intent when its inferred program is in allowPrograms (HIGH-24)", async () => {
+    const rule = new AllowlistRule({
+      // Include the System Program (used for native SOL transfers)
+      allowPrograms: ["11111111111111111111111111111111"],
+    });
     const result = await rule.evaluate(makeIntent(), makeContext());
     expect(result.decision).toBe("ALLOW");
   });
@@ -1128,7 +1144,8 @@ describe("TimeWindowRule — Edge Cases", () => {
     );
     expect(result.decision).toBe("DENY");
     if (result.decision === "DENY") {
-      expect(result.reason).toContain("UTC");
+      // POLICY-011 fix: Timezone is no longer leaked in denial message
+      expect(result.reason).toContain("outside active hours");
     }
   });
 
@@ -1160,13 +1177,15 @@ describe("TimeWindowRule — Edge Cases", () => {
 // ApprovalGateRule — Edge Cases
 // ─────────────────────────────────────────────────
 describe("ApprovalGateRule — Edge Cases", () => {
-  it("should ALLOW when amount exactly equals threshold (threshold is strict >)", async () => {
+  // POLICY-004 fix: amount == threshold now requires approval (strict < comparison).
+  // "above" config means "at or above this amount, require approval".
+  it("should DENY when amount exactly equals threshold (POLICY-004: >= requires approval)", async () => {
     const rule = new ApprovalGateRule({
       above: { amount: "1.0", token: "SOL" },
     });
-    // Intent amount is 1.0, threshold is 1.0 — "above" means > not >=
+    // Intent amount is 1.0, threshold is 1.0 — requires approval per POLICY-004
     const result = await rule.evaluate(makeIntent(), makeContext());
-    expect(result.decision).toBe("ALLOW");
+    expect(result.decision).toBe("DENY");
   });
 
   it("should DENY when amount is just above threshold (e.g., 1.000001 > 1.0)", async () => {

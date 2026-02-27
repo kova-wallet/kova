@@ -5,11 +5,28 @@
  * Delegates to transfers.ts, swaps.ts, and utils.ts for specific operations.
  */
 
-import { createHash } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import { Agent as HttpsAgent } from "node:https";
 import { Agent as HttpAgent } from "node:http";
 import { Connection, PublicKey, VersionedTransaction, Transaction } from "@solana/web3.js";
+/**
+ * INPUT-002 KNOWN VULNERABILITY: @solana/spl-token (>=0.2.0) has a transitive dependency
+ * on bigint-buffer (via @solana/buffer-layout-utils) which has a HIGH severity Buffer
+ * Overflow in toBigIntLE() (GHSA-3gc7-fjrx-p6mg). No patched version exists.
+ *
+ * RISK ASSESSMENT: The vulnerability requires RPC-level data manipulation to exploit —
+ * an attacker would need to control the on-chain account data returned by the RPC node
+ * (e.g., via a compromised or malicious RPC endpoint). The affected code path is
+ * getAccount() which deserializes SPL Token account data. getAssociatedTokenAddressSync
+ * is a pure address computation and is NOT affected.
+ *
+ * MITIGATIONS:
+ * 1. Use trusted RPC endpoints only (not user-provided or untrusted endpoints)
+ * 2. Monitor @solana/spl-token for a release that drops bigint-buffer
+ * 3. For maximum safety, replace getAccount() with direct RPC deserialization
+ *    that does not use bigint-buffer
+ */
 import { getAccount, getAssociatedTokenAddressSync } from "@solana/spl-token";
 import type { ChainAdapter, TransactionStatusResult, SimulationResult } from "../interface.js";
 import type { TransactionIntent } from "../../core/intent.js";
@@ -25,6 +42,8 @@ import {
   getTokenDecimals,
   fromSmallestUnit,
   SolanaAdapterError,
+  isPrivateIPv4 as isPrivateIPv4Shared,
+  isPrivateIPv6 as isPrivateIPv6Shared,
 } from "./utils.js";
 
 export interface SolanaAdapterConfig {
@@ -78,42 +97,20 @@ function validateRpcUrl(url: string, label: string): void {
     );
   }
 
-  // Reject private/internal network addresses (IPv4 + IPv6)
+  // CHAIN-005 fix: Use shared IP validation functions from utils.ts
+  // to prevent divergence between validateRpcUrl and validateFetchTarget.
   if (!isLocalhost) {
-    // Check IPv4 private ranges (RFC 1918, link-local, loopback)
-    if (isValidIpv4) {
-      const [o0, o1] = ipv4Octets!;
-      const isPrivate =
-        o0 === 10 ||
-        (o0 === 172 && o1! >= 16 && o1! <= 31) ||
-        (o0 === 192 && o1 === 168) ||
-        (o0 === 169 && o1 === 254) ||
-        (o0 === 100 && o1! >= 64 && o1! <= 127) || // CGNAT (100.64.0.0/10)
-        o0 === 0;
-      if (isPrivate) {
-        throw new SolanaAdapterError(
-          "SSRF_BLOCKED",
-          `${label} cannot target private/internal network addresses: ${hostname}`,
-        );
-      }
+    if (isValidIpv4 && isPrivateIPv4Shared(hostname)) {
+      throw new SolanaAdapterError(
+        "SSRF_BLOCKED",
+        `${label} cannot target private/internal network addresses: ${hostname}`,
+      );
     }
-
-    // SEC: Check IPv6 private ranges (ULA fc00::/7, link-local fe80::/10, loopback ::1,
-    // IPv4-mapped ::ffff:x.x.x.x, and other non-global addresses)
-    if (hostname.includes(":")) {
-      const lower = hostname.toLowerCase();
-      const isPrivateIPv6 =
-        lower.startsWith("fc") || lower.startsWith("fd") || // ULA (fc00::/7)
-        lower.startsWith("fe80") ||                          // Link-local (fe80::/10)
-        lower.startsWith("::ffff:") ||                       // IPv4-mapped IPv6
-        lower.startsWith("100:") ||                          // Discard prefix (100::/64)
-        lower === "::";                                      // Unspecified address
-      if (isPrivateIPv6) {
-        throw new SolanaAdapterError(
-          "SSRF_BLOCKED",
-          `${label} cannot target private/internal IPv6 addresses: ${hostname}`,
-        );
-      }
+    if (hostname.includes(":") && isPrivateIPv6Shared(hostname)) {
+      throw new SolanaAdapterError(
+        "SSRF_BLOCKED",
+        `${label} cannot target private/internal IPv6 addresses: ${hostname}`,
+      );
     }
   }
 }
@@ -190,20 +187,8 @@ function evictDnsCache(): void {
  * Check whether an IPv4 address falls within a private/internal range.
  * Covers RFC 1918, loopback, link-local, CGNAT, and unspecified addresses.
  */
-function isPrivateIPv4(ip: string): boolean {
-  const octets = ip.split(".").map(Number);
-  if (octets.length !== 4) return false;
-  const [o0, o1] = octets;
-  return (
-    o0 === 10 ||
-    (o0 === 172 && o1! >= 16 && o1! <= 31) ||
-    (o0 === 192 && o1 === 168) ||
-    (o0 === 169 && o1 === 254) ||
-    (o0 === 100 && o1! >= 64 && o1! <= 127) ||
-    o0 === 127 ||
-    o0 === 0
-  );
-}
+// CHAIN-005 fix: Local isPrivateIPv4 replaced by shared isPrivateIPv4 from utils.ts.
+// The alias import (isPrivateIPv4Shared) is used directly below.
 
 /**
  * M-46 / L-20 fix: Check whether an IPv6 address falls within a private/reserved range.
@@ -211,28 +196,8 @@ function isPrivateIPv4(ip: string): boolean {
  * discard prefix (100::/64), documentation (2001:db8::/32), 6to4 (2002::/16), Teredo (2001::/32),
  * and the unspecified address (::).
  */
-function isPrivateIPv6(ip: string): boolean {
-  const lower = ip.toLowerCase();
-  // Unspecified address
-  if (lower === "::" || lower === "0:0:0:0:0:0:0:0") return true;
-  // Loopback
-  if (lower === "::1" || lower === "0:0:0:0:0:0:0:1") return true;
-  // ULA (fc00::/7 — addresses starting with fc or fd)
-  if (lower.startsWith("fc") || lower.startsWith("fd")) return true;
-  // Link-local (fe80::/10 — addresses starting with fe8, fe9, fea, feb)
-  if (/^fe[89ab]/i.test(lower)) return true;
-  // IPv4-mapped IPv6 (::ffff:x.x.x.x)
-  if (lower.startsWith("::ffff:")) return true;
-  // Discard prefix (100::/64)
-  if (lower.startsWith("100:")) return true;
-  // Documentation (2001:db8::/32)
-  if (lower.startsWith("2001:db8:") || lower.startsWith("2001:0db8:")) return true;
-  // 6to4 (2002::/16) — may embed private IPv4 addresses
-  if (lower.startsWith("2002:")) return true;
-  // Teredo (2001:0000::/32) — tunneling protocol, may bypass network controls
-  if (lower.startsWith("2001:0000:") || lower.startsWith("2001:0:")) return true;
-  return false;
-}
+// CHAIN-005 fix: Local isPrivateIPv6 replaced by shared isPrivateIPv6 from utils.ts.
+// The alias import (isPrivateIPv6Shared) is used directly in resolveAndValidateDns below.
 
 /**
  * HIGH-01 / CHAIN-001 fix: Resolve DNS, validate the resolved IP is not
@@ -293,7 +258,7 @@ async function resolveAndValidateDns(url: string, label: string): Promise<string
     }
 
     // Validate against appropriate private range blocklist
-    const isPrivate = family === 4 ? isPrivateIPv4(ip) : isPrivateIPv6(ip);
+    const isPrivate = family === 4 ? isPrivateIPv4Shared(ip) : isPrivateIPv6Shared(ip);
     if (isPrivate) {
       // Remove any stale cache entry for this hostname
       dnsCache.delete(hostname);
@@ -367,7 +332,7 @@ function createPinnedLookup(
         const resolvedFamily: 4 | 6 = result.family === 6 ? 6 : 4;
 
         // M-46 / L-20 fix: Validate against appropriate private range blocklist
-        const isPrivate = resolvedFamily === 4 ? isPrivateIPv4(ip) : isPrivateIPv6(ip);
+        const isPrivate = resolvedFamily === 4 ? isPrivateIPv4Shared(ip) : isPrivateIPv6Shared(ip);
         if (isPrivate) {
           dnsCache.delete(lower);
           callback(
@@ -906,7 +871,12 @@ export class SolanaAdapter implements ChainAdapter {
       );
     }
 
-    if (preSignHash !== postSignHash) {
+    // CRYPTO-003 fix: Use constant-time comparison to prevent timing side-channel
+    // leakage of the pre-sign hash. While the risk is low (hashes are not secrets),
+    // constant-time comparison is a defense-in-depth best practice for integrity checks.
+    const preSignBuf = Buffer.from(preSignHash, "hex");
+    const postSignBuf = Buffer.from(postSignHash, "hex");
+    if (preSignBuf.length !== postSignBuf.length || !timingSafeEqual(preSignBuf, postSignBuf)) {
       throw new SolanaAdapterError(
         "TRANSACTION_TAMPERED",
         `Transaction message was modified during signing. ` +
@@ -1273,9 +1243,19 @@ export class SolanaAdapter implements ChainAdapter {
     }
 
     let postBalance: bigint;
+    // CHAIN-021 fix: When the output token is native SOL, the wallet's SOL balance
+    // is reduced by the transaction fee (typically 5000 lamports + priority fee).
+    // This means actualReceived = postBalance - preBalance will be LESS than the
+    // actual swap output because the tx fee is subtracted from the same SOL balance.
+    // We estimate the fee and add it back to get the true swap output amount.
+    let estimatedTxFee = 0n;
     if (isNativeSOL(outputToken)) {
       const lamports = await this.connection.getBalance(pubkey);
       postBalance = BigInt(lamports);
+      // Solana base fee is 5000 lamports per signature. Most swap transactions
+      // have 1 signature, but we use a conservative estimate of 10000 lamports
+      // (2 signatures) to avoid false-positive verification failures.
+      estimatedTxFee = 10_000n;
     } else {
       const mint = resolveTokenMint(outputToken, this.isDevnet);
       if (!mint) {
@@ -1290,7 +1270,8 @@ export class SolanaAdapter implements ChainAdapter {
       }
     }
 
-    const actualReceived = postBalance - preBalance;
+    // CHAIN-021 fix: Add estimated tx fee back for SOL output to get true swap output
+    const actualReceived = postBalance - preBalance + estimatedTxFee;
 
     const result: {
       passed: boolean;

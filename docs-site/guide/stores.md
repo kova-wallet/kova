@@ -132,6 +132,21 @@ Reset all data. Useful in test suites.
 store.clear();
 ```
 
+### Size Limits
+
+MemoryStore enforces hard limits to prevent unbounded memory growth:
+
+| Limit | Value | Description |
+|-------|-------|-------------|
+| `MAX_KV_SIZE` | 500,000 | Maximum number of key-value entries. Oldest non-TTL entries are evicted when exceeded |
+| `MAX_LIST_SIZE` | 100,000 | Maximum entries per list (e.g., audit log). Oldest entries are evicted FIFO |
+| `MAX_KEY_LENGTH` | 512 | Maximum length of a store key in characters |
+| `MAX_VALUE_LENGTH` | 1,000,000 | Maximum length of a single value in characters (~1 MB) |
+
+::: tip Memory budgeting
+Estimate memory usage as (number of list keys) x MAX_LIST_SIZE x (average entry size). For production with large audit logs, prefer `SqliteStore` which writes to disk.
+:::
+
 ### When to Use
 
 - Unit tests and integration tests
@@ -166,7 +181,27 @@ SQLite is a lightweight database engine that stores everything in a single file 
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `path` | `string` | Yes | Path to the SQLite database file. Use `":memory:"` for in-memory testing. |
+| `path` | `string` | Yes | Path to the SQLite database file |
+| `allowedDirectories` | `string[]` | No | Additional parent directories allowed for the database file. By default only the current working directory is allowed |
+| `pragmas` | `string[]` | No | PRAGMA statements executed after opening the database. Used for SQLCipher encryption |
+| `requireEncryption` | `boolean` | No | When `true` (default), the constructor throws if no encryption pragma is provided. Set to `false` for development |
+| `hmacKey` | `string` | No | Hex-encoded 32-byte HMAC key for counter integrity. Without a persistent key, counter HMACs become invalid after restart |
+| `encryptionKey` | `Buffer` | No | AES-256-GCM key (32 bytes) for application-level encryption of all stored values |
+
+```typescript
+import { SqliteStore } from "kova";
+
+// Production SqliteStore with application-level encryption.
+const store = new SqliteStore({
+  path: "./wallet-data.db",
+  // AES-256-GCM encryption for all stored values.
+  encryptionKey: Buffer.from(process.env.STORE_ENCRYPTION_KEY!, "hex"),
+  // HMAC key for counter integrity across restarts.
+  hmacKey: process.env.STORE_HMAC_KEY!,
+  // Not using SQLCipher -- app-level encryption instead.
+  requireEncryption: false,
+});
+```
 
 ### Characteristics
 
@@ -178,6 +213,8 @@ SQLite is a lightweight database engine that stores everything in a single file 
 - **Tables**: Two tables are created automatically:
   - `kv` -- Key-value pairs with optional TTL (`key TEXT PRIMARY KEY`, `value TEXT`, `expires_at INTEGER`)
   - `lists` -- Append-only list entries with auto-increment ID (`key TEXT`, `value TEXT`, `created_at INTEGER`, `id INTEGER PRIMARY KEY AUTOINCREMENT`)
+
+> **Worker thread**: All synchronous better-sqlite3 operations are offloaded to a dedicated worker thread, keeping the main event loop unblocked. Worker health checks and backpressure (max 1,000 pending requests) prevent resource exhaustion.
 
 ### In-Memory Mode
 
@@ -232,6 +269,25 @@ store.clear();
 | Setup | None | Requires `better-sqlite3` |
 | Use case | Dev / Testing | Production |
 | Data after restart | Lost | Preserved |
+
+## createStore() Factory
+
+The `createStore()` factory wraps any Store with a `StoreWithTimeout` that prevents operations from blocking indefinitely:
+
+```typescript
+import { createStore, SqliteStore } from "kova";
+
+// Wrap a SqliteStore with a 3-second timeout per operation.
+const store = createStore(
+  new SqliteStore({ path: "./wallet.db", requireEncryption: false }),
+  { timeoutMs: 3000 },
+);
+
+// Default timeout is 5000ms. To skip the timeout wrapper:
+const rawStore = createStore(baseStore, { noTimeout: true });
+```
+
+If a store operation does not complete within the timeout, a `StoreTimeoutError` is thrown.
 
 ## Implementing a Custom Store
 

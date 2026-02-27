@@ -50,8 +50,11 @@ import {
   AuditLogger,        // Tamper-evident audit log with SHA-256 hash chain
 } from "kova";
 
-// Load the wallet's secret key from an environment variable.
-// The key is a JSON array of 64 bytes representing the Solana Keypair.
+// ⚠️ SECURITY WARNING: Environment variables are NOT safe for private keys in production.
+// Keys in env vars are exposed via /proc/[pid]/environ, `ps e`, shell history, and logging systems.
+// Use MpcSigner with a hardware-backed provider (e.g., Turnkey, Fireblocks) or a secrets manager instead.
+// See the MPC Signing tutorial: /tutorials/turnkey-mpc
+// This pattern is acceptable ONLY for local development and testing.
 const keypair = Keypair.fromSecretKey(
   Uint8Array.from(JSON.parse(process.env.SOLANA_SECRET_KEY!))
 );
@@ -416,6 +419,8 @@ const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
 async function main() {
   // --- Setup: create signer, store, and chain adapter ---
+  // ⚠️ SECURITY WARNING: Environment variables are NOT safe for private keys in production.
+  // Use MpcSigner with a hardware-backed provider or a secrets manager instead.
   const keypair = Keypair.fromSecretKey(
     Uint8Array.from(JSON.parse(process.env.SOLANA_SECRET_KEY!))
   );

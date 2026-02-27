@@ -275,6 +275,10 @@ import { TurnkeyProvider } from "./turnkey-provider";
 async function main() {
   // ── 1. Create the Turnkey provider ──────────────────────────────────────
   // Load credentials from environment variables (never hardcode these).
+  // ⚠️ SECURITY WARNING: For production, use a dedicated secrets manager (e.g., AWS Secrets Manager,
+  // HashiCorp Vault, GCP Secret Manager) instead of environment variables. Env vars are readable
+  // via /proc/[pid]/environ, `ps e`, and may leak into logging systems. The TURNKEY_API_PRIVATE_KEY
+  // grants signing authority over your Turnkey-managed keys and must be protected accordingly.
   const provider = new TurnkeyProvider({
     apiPublicKey: process.env.TURNKEY_API_PUBLIC_KEY!,
     apiPrivateKey: process.env.TURNKEY_API_PRIVATE_KEY!,

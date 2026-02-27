@@ -39,15 +39,46 @@ export interface AllowlistConfig {
   denyTokens?: string[];
 }
 
+// POLICY-008 fix: Base58 alphabet for Solana address validation.
+const BASE58_ALPHABET = /^[123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz]+$/;
+
+/**
+ * HIGH-24 fix: Well-known Solana program IDs for standard intent types.
+ * These are used by extractProgramId() to return the appropriate program ID
+ * for transfer and swap intents, enabling program allowlist/denylist enforcement
+ * for standard operations — not just custom intents.
+ *
+ * Without these, extractProgramId() returned null for transfers and swaps,
+ * effectively bypassing any configured program allowlists for the most common
+ * transaction types.
+ */
+const SOLANA_SYSTEM_PROGRAM = "11111111111111111111111111111111";
+const SOLANA_TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+const JUPITER_V6_PROGRAM = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
+
+/**
+ * POLICY-008 fix: Validate that a Solana address is well-formed base58 of correct length.
+ * Solana public keys are 32 bytes, encoded as 32–44 character base58 strings.
+ * Emits a warning at construction time for misconfigured addresses that would
+ * silently deny all intended transactions.
+ */
+function warnIfInvalidSolanaAddress(address: string, listName: string): void {
+  // Skip EVM addresses
+  if (address.startsWith("0x") && address.length === 42) return;
+  // Solana base58 addresses are 32-44 characters
+  if (address.length < 32 || address.length > 44 || !BASE58_ALPHABET.test(address)) {
+    process.emitWarning(
+      `AllowlistRule: address "${address.slice(0, 20)}..." in ${listName} does not appear to be a valid ` +
+      `Solana address (expected 32-44 base58 characters). Misconfigured addresses will silently ` +
+      `deny all intended transactions.`,
+      "KovaAllowlistWarning",
+    );
+  }
+}
+
 /**
  * HIGH-03 fix: Normalize EVM addresses to lowercase for case-insensitive matching.
  * Solana addresses are case-sensitive (base58), so they are left as-is.
- *
- * POLICY-015: Address format validation (e.g., verifying that a Solana address is valid
- * base58 of the correct length, or that an EVM address has a valid checksum) is NOT
- * performed here. Format validation is the responsibility of the wallet/chain adapter
- * layer, which has chain-specific knowledge. The policy rule treats addresses as opaque
- * strings and only performs set-membership checks against the allow/deny lists.
  */
 function normalizeAddress(address: string): string {
   // EVM addresses start with 0x and are 42 characters long (case-insensitive per EIP-55)
@@ -70,6 +101,9 @@ export class AllowlistRule implements PolicyRule {
   private readonly hasAllowTokens: boolean;
 
   constructor(config: AllowlistConfig) {
+    // POLICY-008 fix: Warn about potentially invalid Solana addresses at construction time
+    for (const addr of config.allowAddresses ?? []) warnIfInvalidSolanaAddress(addr, "allowAddresses");
+    for (const addr of config.denyAddresses ?? []) warnIfInvalidSolanaAddress(addr, "denyAddresses");
     // HIGH-03 fix: Normalize addresses for case-insensitive matching on EVM chains
     this.allowAddresses = new Set((config.allowAddresses ?? []).map(normalizeAddress));
     this.denyAddresses = new Set((config.denyAddresses ?? []).map(normalizeAddress));
@@ -297,20 +331,49 @@ export class AllowlistRule implements PolicyRule {
    * may still carry a programId field (e.g., for auditing or verification). If present,
    * it should be checked against the program allowlist/denylist for defense-in-depth.
    *
-   * This ensures that:
-   * - Swap intents specifying a DEX program ID are checked against the program lists
-   * - Transfer intents specifying a token program ID are checked
-   * - Custom intents continue to require program ID validation
-   * - Intents without a programId field are unaffected (returns null)
+   * HIGH-24 fix: For standard intent types (transfer, swap), infer the program ID
+   * from the intent type and parameters when no explicit programId field is present.
+   * Previously, returning null for these intents effectively bypassed any configured
+   * program allowlists, allowing transfers and swaps through programs that an operator
+   * explicitly intended to block.
    *
-   * If the programId field is absent from a swap/transfer intent, program checks
-   * are skipped for that intent (the chain adapter is trusted to use the correct program).
+   * Program ID inference:
+   * - transfer with token "SOL" -> System Program (native SOL transfer)
+   * - transfer with any other token -> Token Program (SPL token transfer)
+   * - swap -> Jupiter v6 (the DEX aggregator used by the Solana adapter)
+   * - custom -> uses explicit programId from params
+   *
+   * If the intent includes an explicit programId field, that takes precedence over
+   * the inferred value (defense-in-depth: the explicit value may differ from the
+   * default if a different program variant is used).
    */
   private extractProgramId(intent: TransactionIntent): string | null {
     const params = intent.params as unknown as Record<string, unknown>;
+
+    // Explicit programId in params always takes precedence
     if ("programId" in params && typeof params.programId === "string") {
       return params.programId;
     }
+
+    // HIGH-24 fix: Infer program ID for standard intent types
+    if (intent.type === "transfer") {
+      // Determine if this is a native SOL transfer or SPL token transfer
+      if ("token" in params && typeof params.token === "string") {
+        const token = params.token.toUpperCase().trim();
+        if (token === "SOL") {
+          return SOLANA_SYSTEM_PROGRAM;
+        }
+        return SOLANA_TOKEN_PROGRAM;
+      }
+      // Fallback: if no token field, assume System Program (SOL transfer)
+      return SOLANA_SYSTEM_PROGRAM;
+    }
+
+    if (intent.type === "swap") {
+      // Swaps go through Jupiter DEX aggregator
+      return JUPITER_V6_PROGRAM;
+    }
+
     return null;
   }
 

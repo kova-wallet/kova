@@ -51,6 +51,14 @@ const MAX_COMBINED_KEY_LENGTH = 1024;
 /** STORE-016 fix: Allowed prefix characters — alphanumeric, underscore, hyphen, colon */
 const PREFIX_PATTERN = /^[a-zA-Z0-9_\-:]+$/;
 
+/**
+ * DATA-013 SECURITY NOTE: The `__hmac` key blocking in validateCombinedKeyLength()
+ * prevents callers from directly accessing HMAC entries through PrefixedStore. However,
+ * the `increment()` method delegates to the inner store which writes `{prefix}|{key}:__hmac`
+ * internally. Anyone retaining a reference to the inner store can bypass prefix isolation
+ * and access HMAC keys for any prefix. DO NOT share or expose the inner store reference
+ * after wrapping it with PrefixedStore.
+ */
 export class PrefixedStore implements Store {
   private readonly inner: Store;
   private readonly prefix: string;
@@ -155,11 +163,19 @@ export class PrefixedStore implements Store {
   }
 
   async set(key: string, value: string, ttlSeconds?: number): Promise<void> {
+    // MED-08 fix: Validate ttlSeconds before delegating to inner store.
+    if (ttlSeconds !== undefined && (!Number.isFinite(ttlSeconds) || ttlSeconds <= 0)) {
+      throw new Error(`PrefixedStore.set: ttlSeconds must be a positive finite number, got ${ttlSeconds}`);
+    }
     const combinedKey = this.validateCombinedKeyLength(key);
     return this.inner.set(combinedKey, value, ttlSeconds);
   }
 
   async setIfNotExists(key: string, value: string, ttlSeconds?: number): Promise<boolean> {
+    // MED-08 fix: Validate ttlSeconds before delegating to inner store.
+    if (ttlSeconds !== undefined && (!Number.isFinite(ttlSeconds) || ttlSeconds <= 0)) {
+      throw new Error(`PrefixedStore.setIfNotExists: ttlSeconds must be a positive finite number, got ${ttlSeconds}`);
+    }
     const combinedKey = this.validateCombinedKeyLength(key);
     return this.inner.setIfNotExists(combinedKey, value, ttlSeconds);
   }

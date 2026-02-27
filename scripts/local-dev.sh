@@ -238,6 +238,25 @@ else
       echo "  Install manually: https://docs.solanalabs.com/cli/install"
       exit 1
     fi
+    # LOW-20 fix: Verify SHA256 checksum of the downloaded installer before execution.
+    # Without this verification, a compromised CDN or MITM could serve a malicious
+    # script that the previous code would execute blindly. To update this hash:
+    #   1. Download the installer: curl -sSfL "$SOLANA_INSTALL_URL" -o /tmp/install.sh
+    #   2. Compute hash: shasum -a 256 /tmp/install.sh
+    #   3. Verify from multiple networks/machines and update the value below.
+    SOLANA_INSTALL_SHA256="e1b1ba08ea0c8f31d8038197ee3e045aa2a6f705fe0ecbe031e54fea7ee9a6e6"
+    ACTUAL_SHA256=$(shasum -a 256 "$SOLANA_INSTALLER" | awk '{print $1}')
+    if [[ "$ACTUAL_SHA256" != "$SOLANA_INSTALL_SHA256" ]]; then
+      error "SHA256 checksum mismatch for Solana installer!"
+      echo "  Expected: $SOLANA_INSTALL_SHA256"
+      echo "  Actual:   $ACTUAL_SHA256"
+      echo "  This could indicate a compromised or updated installer."
+      echo "  If Solana released a new version, update SOLANA_INSTALL_VERSION and"
+      echo "  SOLANA_INSTALL_SHA256 in this script after verifying the new hash."
+      rm -f "$SOLANA_INSTALLER"
+      exit 1
+    fi
+    success "SHA256 checksum verified for Solana installer."
     # Verify the downloaded script looks like a valid shell installer
     if ! head -1 "$SOLANA_INSTALLER" | grep -qE '^#!.*(bash|sh)'; then
       error "Downloaded installer does not appear to be a valid shell script."

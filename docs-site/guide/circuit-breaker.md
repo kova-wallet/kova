@@ -25,7 +25,7 @@ The `CircuitBreakerConfig` interface controls the breaker's behavior:
 // These settings determine how quickly the breaker trips and how long
 // it stays open before auto-resetting.
 interface CircuitBreakerConfig {
-  /** Number of consecutive denials before circuit opens. Must be >= 1. Default: 5 */
+  /** Number of consecutive denials before circuit opens. Must be >= 1. Default: 10 */
   // If the agent receives this many DENY decisions in a row (without any
   // ALLOW in between), the circuit opens and blocks all further transactions.
   // Lower values are more aggressive (trip faster), higher values are more lenient.
@@ -39,8 +39,9 @@ interface CircuitBreakerConfig {
 
 | Parameter | Default | Description |
 |---|---|---|
-| `threshold` | `5` | Number of consecutive `DENY` decisions before the circuit opens |
+| `threshold` | `10` | Number of consecutive `DENY` decisions before the circuit opens |
 | `cooldownMs` | `300000` (5 min) | How long the circuit stays open before auto-resetting |
+| `intentTypes` | `["transfer", "swap", "stake", "custom"]` | Intent types to track. Maximum 20 entries. |
 
 ## State Machine
 
@@ -98,6 +99,25 @@ The circuit breaker persists its state using two store keys:
 
 This means the circuit breaker state survives process restarts (as long as the store is persistent). If you use `MemoryStore`, the state is lost on restart and the breaker resets.
 
+## Per-Agent Isolation
+
+When the `AgentWallet` is constructed with an `agentId`, the circuit breaker tracks consecutive denials per agent. This prevents one misbehaving agent from tripping the circuit breaker for all agents sharing the same wallet.
+
+```typescript
+const wallet = new AgentWallet({
+  signer,
+  chain,
+  policy: engine,
+  store,
+  agentId: "agent-billing",  // Circuit breaker isolated to this agent
+  circuitBreaker: { threshold: 10, cooldownMs: 300_000 },
+});
+```
+
+::: tip
+Without `agentId`, a single circuit breaker is shared across all callers. A malicious agent could deliberately trigger 10 denials to block legitimate agents. Use `agentId` in multi-agent deployments.
+:::
+
 ## Configuring via AgentWallet
 
 The simplest way to configure the circuit breaker is through the `AgentWallet` constructor:
@@ -115,7 +135,10 @@ import {
 
 // Create a shared store for the SDK to persist state.
 const store = new MemoryStore({ dangerouslyAllowInProduction: true });
-// Create a signer from a Keypair. In production, use MpcSigner.
+// ⚠️ SECURITY WARNING: Environment variables are NOT safe for private keys in production.
+// Keys in env vars are exposed via /proc/[pid]/environ, `ps e`, shell history, and logging systems.
+// Use MpcSigner with a hardware-backed provider (e.g., Turnkey, Fireblocks) or a secrets manager instead.
+// This pattern is acceptable ONLY for local development and testing.
 import { Keypair } from "@solana/web3.js";
 import bs58 from "bs58";
 const keypair = Keypair.fromSecretKey(bs58.decode(process.env.WALLET_PRIVATE_KEY!));
@@ -133,7 +156,7 @@ const rules = [
 const engine = new PolicyEngine(rules, store);
 
 // Custom circuit breaker: trip after 3 consecutive denials, with a 60-second cooldown.
-// This is more aggressive than the default (5 denials, 5-minute cooldown),
+// This is more aggressive than the default (10 denials, 5-minute cooldown),
 // meaning the wallet locks faster but also recovers faster.
 const wallet = new AgentWallet({
   signer,
@@ -144,7 +167,7 @@ const wallet = new AgentWallet({
 });
 ```
 
-If you omit the `circuitBreaker` option, the default configuration is used (`threshold: 5`, `cooldownMs: 300000`).
+If you omit the `circuitBreaker` option, the default configuration is used (`threshold: 10`, `cooldownMs: 300000`).
 
 ## Disabling the Circuit Breaker
 
@@ -166,6 +189,10 @@ const wallet = new AgentWallet({
 
 ::: danger
 Disabling the circuit breaker removes the safety net against runaway agents. Without it, an agent can attempt unlimited denied transactions. Only disable this if you have an alternative mechanism (e.g., external rate limiting at the API layer) to prevent abuse.
+:::
+
+::: warning Setting cooldownMs to 0
+Setting `cooldownMs` to `0` makes the circuit breaker trip and immediately reset, effectively making it a no-op. This is generally a configuration error. Either use a meaningful cooldown or disable the circuit breaker with `circuitBreaker: false`.
 :::
 
 ## Internal Management
@@ -266,7 +293,7 @@ kova has **two** circuit breakers that serve different purposes:
 | **Class** | `CircuitBreaker` | Built into `AuditLogger` |
 | **Trigger** | Consecutive policy denials | Consecutive audit write failures |
 | **Purpose** | Stop runaway agent behavior | Protect audit trail integrity |
-| **Default threshold** | 5 consecutive denials | 3 consecutive failures |
+| **Default threshold** | 10 consecutive denials | 3 consecutive failures |
 | **Cooldown** | Configurable (`cooldownMs`) | None -- stays open until `resetFailureCount()` |
 | **Auto-reset** | Yes, after cooldown expires | No -- requires manual reset |
 | **Error code** | `CIRCUIT_BREAKER_OPEN` | `STORE_ERROR` |

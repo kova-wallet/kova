@@ -315,6 +315,10 @@ export class PolicyBuilder {
     if (config.timeout !== undefined && (typeof config.timeout !== "number" || !Number.isFinite(config.timeout) || config.timeout <= 0)) {
       throw new Error("Approval gate timeout must be a positive finite number (milliseconds)");
     }
+    // HIGH-08 fix: Validate cumulativeWindow is a positive finite number (seconds)
+    if (config.cumulativeWindow !== undefined && (typeof config.cumulativeWindow !== "number" || !Number.isFinite(config.cumulativeWindow) || config.cumulativeWindow <= 0)) {
+      throw new Error("Approval gate cumulativeWindow must be a positive finite number (seconds)");
+    }
   }
 
   private static validateRateLimit(config: RateLimitConfig): void {

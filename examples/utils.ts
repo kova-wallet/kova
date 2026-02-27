@@ -19,6 +19,12 @@ const MIN_BALANCE_SOL = 0.1;
 /**
  * Loads a persistent devnet keypair from disk, or generates one and saves it.
  * All examples share the same keypair so airdrop SOL is not wasted.
+ *
+ * WARNING: This function stores the full secret key as a JSON file on disk.
+ * It is intended for local development and devnet examples ONLY.
+ * DO NOT use this in production. Production deployments should use
+ * hardware security modules (HSMs), secure enclaves, or dedicated
+ * key management services (KMS) for private key storage.
  */
 export function loadOrCreateKeypair(): Keypair {
   const keypairPath = process.env.LOCAL_KEYPAIR_PATH

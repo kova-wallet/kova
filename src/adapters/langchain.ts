@@ -83,7 +83,10 @@ export function createLangChainTools(
         const message = "An internal error occurred while processing the tool call.";
         if (err instanceof Error && process.env.NODE_ENV === "test") {
           // Only expose details in test environment for debugging
-          console.error(`[kova] Tool ${tool.name} error:`, err.message);
+          process.emitWarning(
+            `Tool processing error in ${tool.name}`,
+            { code: "KOVA_TOOL_ERROR" },
+          );
         }
         return sanitizeToolResponse(tool.name, { success: false, error: message });
       }

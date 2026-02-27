@@ -407,9 +407,11 @@ describe("Adversarial Tests", () => {
       const confirmed = results.filter((r) => r.status === "confirmed").length;
       const denied = results.filter((r) => r.status === "denied").length;
 
-      // Mutex serializes: first 5 pass, remaining 5 are denied
-      expect(confirmed).toBe(5);
-      expect(denied).toBe(5);
+      // Mutex serializes: first 4 pass (projected totals 1,2,3,4 < 5), then the
+      // 5th is denied because projected total (5) >= limit (5) — HIGH-21 off-by-one fix
+      // changed the boundary check from > to >= for correct enforcement.
+      expect(confirmed).toBe(4);
+      expect(denied).toBe(6);
     });
 
     it("should correctly enforce rate limit under rapid-fire concurrent requests", async () => {

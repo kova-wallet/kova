@@ -82,22 +82,37 @@ function sanitizeReason(reason: string | undefined): string | undefined {
  * the policy engine operates on an immutable snapshot that cannot be mutated by the
  * caller during async approval flows.
  *
- * POLICY-018: JSON.stringify is used here to serialize the intent for hashing. Key
- * ordering in JSON.stringify is deterministic in V8/Node.js for non-integer string
- * keys (they follow insertion order per the ECMAScript spec). Since TransactionIntent
- * objects are constructed with consistent key ordering (type, chain, params), the
- * hash output is stable. Integer-keyed properties (e.g., array indices) are always
- * enumerated first in numeric order, which is also deterministic. If cross-engine
- * determinism is ever required, consider using a canonical JSON serialization library.
+ * CRYPTO-002 fix: Use canonical JSON serialization (sorted keys) for intent hashing
+ * instead of raw JSON.stringify, which depends on V8's property enumeration order.
+ * This ensures hash stability even if intents are round-tripped through JSON
+ * (deserialized objects may have different key ordering than the originals).
  */
+function canonicalJsonStringify(value: unknown): string {
+  if (value === null || value === undefined) return JSON.stringify(value);
+  if (typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return "[" + value.map(canonicalJsonStringify).join(",") + "]";
+  }
+  const obj = value as Record<string, unknown>;
+  const DANGEROUS_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+  const sortedKeys = Object.keys(obj).filter((k) => !DANGEROUS_KEYS.has(k)).sort();
+  const entries = sortedKeys.map(
+    (key) => JSON.stringify(key) + ":" + canonicalJsonStringify(obj[key]),
+  );
+  return "{" + entries.join(",") + "}";
+}
+
 function computeIntentHash(intent: TransactionIntent): string {
-  const payload = JSON.stringify({
+  const payload = canonicalJsonStringify({
     type: intent.type,
     chain: intent.chain,
     params: intent.params,
   });
   return createHash("sha256").update(payload).digest("hex");
 }
+
+/** HIGH-08 fix: Store key prefix for cumulative spending tracker */
+const CUMULATIVE_STORE_KEY_PREFIX = "approval-gate:cumulative:";
 
 export class ApprovalGateRule implements PolicyRule {
   readonly name = "approval-gate";
@@ -107,6 +122,12 @@ export class ApprovalGateRule implements PolicyRule {
     // MED-34 fix: Validate limit amounts at construction time
     parseAndValidateLimitAmount(config.above.amount, "ApprovalGate above");
     if (config.aboveUSD) parseAndValidateLimitAmount(config.aboveUSD.amount, "ApprovalGate aboveUSD");
+    // HIGH-08 fix: Validate cumulativeWindow at construction time
+    if (config.cumulativeWindow !== undefined) {
+      if (typeof config.cumulativeWindow !== "number" || !Number.isFinite(config.cumulativeWindow) || config.cumulativeWindow <= 0) {
+        throw new Error("ApprovalGate cumulativeWindow must be a positive finite number (seconds)");
+      }
+    }
     this.config = config;
   }
 
@@ -122,6 +143,13 @@ export class ApprovalGateRule implements PolicyRule {
     // require approval (or deny if no approval channel). This prevents custom and
     // mint intents from bypassing the approval gate entirely.
     if (amount === null) {
+      // CRIT-10 fix: During dry-run (Phase 1), skip the actual approval request to
+      // prevent duplicate approval messages. Phase 2 will send the real request.
+      // Return ALLOW to let Phase 1 proceed to subsequent rules for validation.
+      if (context.dryRun) {
+        return { decision: "ALLOW" };
+      }
+
       if (!context.approval) {
         return {
           decision: "DENY",
@@ -204,7 +232,23 @@ export class ApprovalGateRule implements PolicyRule {
     }
 
     const threshold = parseFloat(this.config.above.amount);
-    if (amount <= threshold) {
+    // POLICY-004 fix: Use strict < instead of <= so that transactions at EXACTLY
+    // the threshold still require approval. Previously, amount == threshold bypassed
+    // the approval gate, allowing transfers at the exact limit without human review.
+    if (amount < threshold) {
+      // HIGH-08 fix: Even though the individual transaction is below the threshold,
+      // check if the cumulative amount within the rolling window exceeds the threshold.
+      // This prevents fragmentation attacks (splitting a large transfer into many small ones).
+      if (this.config.cumulativeWindow) {
+        const cumulativeResult = await this.checkCumulativeThreshold(
+          amount, token, threshold, intent, context,
+        );
+        if (cumulativeResult) {
+          return cumulativeResult;
+        }
+        // Cumulative check passed — record this transaction amount and allow
+        await this.recordCumulativeAmount(amount, token, context);
+      }
       return { decision: "ALLOW" };
     }
 
@@ -233,6 +277,14 @@ export class ApprovalGateRule implements PolicyRule {
     token: string,
     denyReason: string,
   ): Promise<PolicyDecision> {
+    // CRIT-10 fix: During dry-run (Phase 1), the threshold check has already determined
+    // that this transaction requires approval. Skip sending the actual approval request
+    // to prevent duplicate messages. Return ALLOW so Phase 1 continues evaluating
+    // subsequent rules; Phase 2 will send the real approval request.
+    if (context.dryRun) {
+      return { decision: "ALLOW" };
+    }
+
     if (!context.approval) {
       return {
         decision: "DENY",
@@ -275,6 +327,10 @@ export class ApprovalGateRule implements PolicyRule {
                 `Original ${originalIntentHash.slice(0, 16)}..., re-computed ${recomputedHash.slice(0, 16)}...`,
             };
           }
+        }
+        // HIGH-08 fix: Record approved transaction in cumulative tracker
+        if (this.config.cumulativeWindow) {
+          await this.recordCumulativeAmount(amount, token, context);
         }
         return { decision: "ALLOW" };
       }
@@ -368,6 +424,79 @@ export class ApprovalGateRule implements PolicyRule {
       // HIGH-05 fix: Cryptographically bind approval to exact transaction parameters
       intentHash: computeIntentHash(intent),
     };
+  }
+
+  /**
+   * HIGH-08 fix: Check if the cumulative amount (including this transaction) within
+   * the rolling window exceeds the approval threshold. Returns a PolicyDecision if
+   * approval is required/denied, or null if the cumulative check passes.
+   *
+   * The cumulative tracker stores individual transaction amounts with timestamps
+   * in the store using append(). On each evaluation, it reads recent entries from
+   * the store, filters to those within the rolling window, and sums them.
+   */
+  private async checkCumulativeThreshold(
+    amount: number,
+    token: string,
+    threshold: number,
+    intent: TransactionIntent,
+    context: PolicyContext,
+  ): Promise<PolicyDecision | null> {
+    const windowSeconds = this.config.cumulativeWindow!;
+    const storeKey = `${CUMULATIVE_STORE_KEY_PREFIX}${normalizeTokenId(token)}`;
+    const now = context.now;
+    const windowStart = now - (windowSeconds * 1000); // Convert seconds to ms
+
+    // Read recent cumulative entries from the store
+    // Use a generous count to cover the window; old entries are filtered by timestamp
+    const recentRaw = await context.store.getRecent(storeKey, 1000);
+    let cumulativeTotal = 0;
+
+    for (const raw of recentRaw) {
+      try {
+        const entry = JSON.parse(raw) as { timestamp: number; amount: number };
+        if (
+          typeof entry.timestamp === "number" &&
+          typeof entry.amount === "number" &&
+          entry.timestamp >= windowStart
+        ) {
+          cumulativeTotal += entry.amount;
+        }
+      } catch {
+        // Skip corrupted entries
+      }
+    }
+
+    // Check if adding this transaction would exceed the threshold
+    const projectedTotal = cumulativeTotal + amount;
+    if (projectedTotal >= threshold) {
+      const reason =
+        `Cumulative spending of ${projectedTotal.toFixed(4)} ${token} ` +
+        `(including this ${amount} ${token} transaction) exceeds approval threshold ` +
+        `of ${threshold} ${this.config.above.token} within rolling ${windowSeconds}s window`;
+
+      return this.requestApprovalOrDeny(intent, context, amount, token, reason);
+    }
+
+    return null; // Cumulative check passed
+  }
+
+  /**
+   * HIGH-08 fix: Record a transaction amount in the cumulative tracker store.
+   * Called after a transaction is allowed (either below threshold or approved).
+   * During dry-run (Phase 1), skip recording to avoid double-counting.
+   */
+  private async recordCumulativeAmount(
+    amount: number,
+    token: string,
+    context: PolicyContext,
+  ): Promise<void> {
+    // Skip recording during dry-run to avoid double-counting in two-phase evaluation
+    if (context.dryRun) return;
+
+    const storeKey = `${CUMULATIVE_STORE_KEY_PREFIX}${normalizeTokenId(token)}`;
+    const entry = JSON.stringify({ timestamp: context.now, amount });
+    await context.store.append(storeKey, entry);
   }
 
   /**

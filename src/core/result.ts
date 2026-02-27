@@ -93,6 +93,8 @@ export type TransactionErrorCode =
   | "CHAIN_ERROR"
   | "STORE_ERROR"
   | "CIRCUIT_BREAKER_OPEN"
+  | "WALLET_DRAINING"
+  | "AUTH_FAILED"
   | "UNKNOWN_ERROR";
 
 export interface TokenBalance {
