@@ -32,14 +32,52 @@ Give your AI agents the ability to transact on Solana — with guardrails. kova 
 
 - Node.js 20+
 - npm
+- Git
 
-### Install
+### Clone and install
+
+```bash
+git clone https://github.com/0xKeyserSoze/kova.git
+cd kova
+npm install
+```
+
+### Verify the build
+
+```bash
+npm run lint        # 0 errors, 0 warnings
+npm run typecheck   # clean
+npx vitest run      # 1147 tests pass
+npm run build       # compile
+```
+
+### Run the examples
+
+Examples use Solana devnet — no real funds needed.
+
+```bash
+cp .env.example .env                             # fill in RPC URL if needed (defaults to devnet)
+npx tsx examples/basic-transfer/index.ts         # generates a keypair, airdrops SOL, sends a transfer
+```
+
+The `claude-agent` example requires an `ANTHROPIC_API_KEY` in `.env`.
+
+### Run the dashboard
+
+```bash
+cd dashboard
+npm install
+npx tsx wallet/generate.ts    # one-time: generates a devnet keypair
+npm run dev                   # starts at http://localhost:3000
+```
+
+Fund the wallet at [faucet.solana.com](https://faucet.solana.com) using the address printed by `generate.ts`. The dashboard auto-loads the keypair on startup with a default policy (0.01 SOL per-tx, 1 SOL daily, 5 txns/min rate limit).
+
+### Use kova in your own project
 
 ```bash
 npm install kova
 ```
-
-### Quick Start
 
 ```typescript
 import { Keypair } from "@solana/web3.js";
@@ -224,49 +262,6 @@ const stricter = Policy.extend(policy, "strict").spendingLimit({ ... }).build();
 | [telegram-approval](examples/telegram-approval/) | Human-in-the-loop approval via Telegram |
 | [policy-playground](examples/policy-playground/) | Interactive policy testing |
 | [dashboard](dashboard/) | Admin UI for devnet testing and policy management |
-
-Run any example:
-
-```bash
-cp .env.example .env    # copy the template and fill in your RPC URL, keys, etc.
-npx tsx examples/basic-transfer/index.ts   # run any example with tsx
-```
-
-The `claude-agent` example requires an `ANTHROPIC_API_KEY` in `.env`.
-
-## Development
-
-### Clone and verify
-
-```bash
-git clone https://github.com/0xKeyserSoze/kova.git
-cd kova
-npm install
-npm run lint        # 0 errors, 0 warnings
-npm run typecheck   # clean
-npx vitest run      # 1147 tests pass
-npm run build       # compile
-```
-
-### Run the examples
-
-Examples use Solana devnet — no real funds needed.
-
-```bash
-cp .env.example .env                             # fill in RPC URL if needed (defaults to devnet)
-npx tsx examples/basic-transfer/index.ts         # generates a keypair, airdrops SOL, sends a transfer
-```
-
-### Run the dashboard
-
-```bash
-cd dashboard
-npm install
-npx tsx wallet/generate.ts    # one-time: generates a devnet keypair
-npm run dev                   # starts at http://localhost:3000
-```
-
-Fund the wallet at [faucet.solana.com](https://faucet.solana.com) using the address printed by `generate.ts`. The dashboard auto-loads the keypair on startup with a default policy (0.01 SOL per-tx, 1 SOL daily, 5 txns/min rate limit).
 
 ## Security
 
