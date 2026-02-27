@@ -49,6 +49,7 @@ export function verifyTokenRegistry(): boolean {
   for (const [symbol, expectedMint] of Object.entries(expectedMints)) {
     const entry = TOKEN_MINTS[symbol];
     if (!entry || entry.mint !== expectedMint) {
+      // eslint-disable-next-line no-console
       console.error(
         `[KOVA CRITICAL] Token registry integrity check failed for ${symbol}. ` +
         `Expected mint: ${expectedMint}, got: ${entry?.mint ?? "missing"}. ` +
@@ -436,7 +437,6 @@ export function deriveATA(wallet: PublicKey, mint: PublicKey): PublicKey {
  * that could mislead operators reviewing audit logs or transaction descriptions.
  */
 export function stripControlChars(value: string): string {
-  // eslint-disable-next-line no-control-regex
   return value.replace(/[\x00-\x1F\x7F-\x9F]/g, "");
 }
 

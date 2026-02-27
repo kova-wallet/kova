@@ -215,7 +215,12 @@ export class CircuitBreaker {
         // Overwrite with our ID (we're taking over, but with a warning logged)
         await this.store.set(INSTANCE_KEY, this.instanceId, INSTANCE_TTL_SECONDS);
       }
-    } catch {
+    } catch (err: unknown) {
+      // Re-throw multi-instance errors when failOnMultiInstance is true —
+      // they must not be swallowed by the store-error catch block.
+      if (this.config.failOnMultiInstance && err instanceof Error && err.message.includes("[KOVA CRITICAL]")) {
+        throw err;
+      }
       // HIGH-25 fix: Use process.emitWarning instead of console.error to avoid leaking
       // error details to stderr. The error message may contain store connection info.
       process.emitWarning(

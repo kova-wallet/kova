@@ -684,7 +684,7 @@ describe("Fail-Closed Behavior Verification", () => {
       const wallet = createWallet({ policy, store });
 
       const result = await wallet.execute({
-        type: "delete_everything" as any,
+        type: "delete_everything" as unknown as TransactionIntent["type"],
         chain: "solana",
         params: { to: "addr", amount: "1", token: "SOL" },
       });
@@ -706,7 +706,7 @@ describe("Fail-Closed Behavior Verification", () => {
 
       const result = await wallet.execute({
         type: "transfer",
-        chain: "dogecoin" as any,
+        chain: "dogecoin" as unknown as TransactionIntent["chain"],
         params: { to: "DAddr123", amount: "1000", token: "DOGE" },
       });
 

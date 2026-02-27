@@ -872,12 +872,12 @@ export class AuditLogger {
     this.destroyed = true;
     if (this.hmacKey) {
       this.hmacKey.fill(0);
-      this.hmacKey = null as any;
+      this.hmacKey = undefined;
     }
     // CRIT-08 fix: Zero encryption key material on destroy to prevent leakage
     if (this.encryptionKey) {
       this.encryptionKey.fill(0);
-      this.encryptionKey = null as any;
+      this.encryptionKey = undefined;
     }
   }
 

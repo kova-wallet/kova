@@ -497,7 +497,7 @@ describe("Adversarial Tests", () => {
         id: "invalid-zero",
       };
       const invalidIntent2 = {
-        type: "bogus" as any,
+        type: "bogus" as unknown as TransactionIntent["type"],
         chain: "solana" as const,
         params: { to: "addr", amount: "1", token: "SOL" },
         id: "invalid-type",
@@ -563,7 +563,7 @@ describe("Adversarial Tests", () => {
       const result = await wallet.execute({
         type: "transfer",
         chain: "solana",
-        params: { to: 12345 as any, amount: "1.0", token: "SOL" },
+        params: { to: 12345 as unknown as string, amount: "1.0", token: "SOL" },
       });
 
       expect(result.status).toBe("failed");
@@ -580,7 +580,7 @@ describe("Adversarial Tests", () => {
         params: {
           to: "GsbwXfJraMomNxBcjYLcG3mxkBUiyWXAB32fGbSQQRre",
           amount: "1.0",
-          token: ["SOL", "USDC"] as any,
+          token: ["SOL", "USDC"] as unknown as string,
         },
       });
 
@@ -594,7 +594,7 @@ describe("Adversarial Tests", () => {
       const result = await wallet.execute({
         type: "transfer",
         chain: "solana",
-        params: { to: null as any, amount: "1.0", token: "SOL" },
+        params: { to: null as unknown as string, amount: "1.0", token: "SOL" },
       });
 
       expect(result.status).toBe("failed");
@@ -607,7 +607,7 @@ describe("Adversarial Tests", () => {
       const result = await wallet.execute({
         type: "transfer",
         chain: "solana",
-        params: { to: undefined as any, amount: "1.0", token: "SOL" },
+        params: { to: undefined as unknown as string, amount: "1.0", token: "SOL" },
       });
 
       expect(result.status).toBe("failed");
@@ -623,7 +623,7 @@ describe("Adversarial Tests", () => {
         chain: "solana",
         params: {
           to: "GsbwXfJraMomNxBcjYLcG3mxkBUiyWXAB32fGbSQQRre",
-          amount: evilAmount as any,
+          amount: evilAmount as unknown as string,
           token: "SOL",
         },
       });
@@ -640,7 +640,7 @@ describe("Adversarial Tests", () => {
         type: "transfer",
         chain: "solana",
         params: {
-          to: true as any,
+          to: true as unknown as string,
           amount: "1.0",
           token: "SOL",
         },
@@ -656,7 +656,7 @@ describe("Adversarial Tests", () => {
       const result = await wallet.execute({
         type: "transfer",
         chain: "solana",
-        params: ["to", "RecipientAddr", "amount", "1.0", "token", "SOL"] as any,
+        params: ["to", "RecipientAddr", "amount", "1.0", "token", "SOL"] as unknown as TransactionIntent["params"],
       });
 
       // Arrays pass typeof === "object" but isTransferIntent checks for specific
@@ -673,7 +673,7 @@ describe("Adversarial Tests", () => {
       const result = await wallet.execute({
         type: "transfer",
         chain: "solana",
-        params: null as any,
+        params: null as unknown as TransactionIntent["params"],
       });
 
       expect(result.status).toBe("failed");
@@ -684,7 +684,7 @@ describe("Adversarial Tests", () => {
     it("should reject type as number", async () => {
       const wallet = createWallet();
       const result = await wallet.execute({
-        type: 42 as any,
+        type: 42 as unknown as TransactionIntent["type"],
         chain: "solana",
         params: { to: "GsbwXfJraMomNxBcjYLcG3mxkBUiyWXAB32fGbSQQRre", amount: "1.0", token: "SOL" },
       });
@@ -698,7 +698,7 @@ describe("Adversarial Tests", () => {
       const wallet = createWallet();
       const result = await wallet.execute({
         type: "transfer",
-        chain: { name: "solana" } as any,
+        chain: { name: "solana" } as unknown as TransactionIntent["chain"],
         params: { to: "GsbwXfJraMomNxBcjYLcG3mxkBUiyWXAB32fGbSQQRre", amount: "1.0", token: "SOL" },
       });
 

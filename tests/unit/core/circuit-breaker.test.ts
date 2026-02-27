@@ -370,7 +370,7 @@ describe("CircuitBreaker", () => {
 
       // Attempting to mutate should throw in strict mode / be silently ignored
       expect(() => {
-        (config as any).threshold = 999;
+        (config as unknown as Record<string, unknown>).threshold = 999;
       }).toThrow();
     });
 
