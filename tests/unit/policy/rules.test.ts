@@ -5,9 +5,9 @@ import { RateLimitRule } from "../../../src/policy/rules/rate-limit.js";
 import { TimeWindowRule } from "../../../src/policy/rules/time-window.js";
 import { ApprovalGateRule } from "../../../src/policy/rules/approval-gate.js";
 import { MemoryStore } from "../../../src/stores/memory.js";
-import type { TransactionIntent } from "../../../src/core/intent.js";
+import type { TransactionIntent, CustomParams } from "../../../src/core/intent.js";
 import type { PolicyContext } from "../../../src/policy/types.js";
-import type { ApprovalChannel, ApprovalResult } from "../../../src/approval/interface.js";
+import type { ApprovalChannel, ApprovalRequest, ApprovalResult } from "../../../src/approval/interface.js";
 
 function makeIntent(overrides?: Partial<TransactionIntent>): TransactionIntent {
   return {
@@ -101,7 +101,7 @@ describe("AllowlistRule", () => {
     });
     const intent = makeIntent({
       type: "custom",
-      params: { programId: "BadProgram123", data: "abc", accounts: [] } as any,
+      params: { programId: "BadProgram123", data: "abc", accounts: [] } as CustomParams,
     });
     const result = await rule.evaluate(intent, makeContext());
     expect(result.decision).toBe("DENY");
@@ -113,7 +113,7 @@ describe("AllowlistRule", () => {
     });
     const intent = makeIntent({
       type: "custom",
-      params: { programId: "OtherProgram", data: "abc", accounts: [] } as any,
+      params: { programId: "OtherProgram", data: "abc", accounts: [] } as CustomParams,
     });
     const result = await rule.evaluate(intent, makeContext());
     expect(result.decision).toBe("DENY");
@@ -125,7 +125,7 @@ describe("AllowlistRule", () => {
     });
     const intent = makeIntent({
       type: "custom",
-      params: { programId: "GoodProgram123", data: "abc", accounts: [] } as any,
+      params: { programId: "GoodProgram123", data: "abc", accounts: [] } as CustomParams,
     });
     const result = await rule.evaluate(intent, makeContext());
     expect(result.decision).toBe("ALLOW");
@@ -258,7 +258,7 @@ describe("SpendingLimitRule", () => {
     });
     const intent = makeIntent({
       type: "custom",
-      params: { programId: "prog", data: "abc", accounts: [] } as any,
+      params: { programId: "prog", data: "abc", accounts: [] } as CustomParams,
     });
     const result = await rule.evaluate(intent, makeContext());
     // CRIT-01 fix: can't determine cost → DENY
@@ -584,7 +584,7 @@ describe("ApprovalGateRule", () => {
     });
     const intent = makeIntent({
       type: "custom",
-      params: { programId: "prog", data: "abc", accounts: [] } as any,
+      params: { programId: "prog", data: "abc", accounts: [] } as CustomParams,
     });
     const result = await rule.evaluate(intent, makeContext());
     // CRIT-01 fix: can't determine amount → DENY (no approval channel)
@@ -880,7 +880,7 @@ describe("AllowlistRule — Edge Cases", () => {
     });
     const intent = makeIntent({
       type: "custom",
-      params: { programId: "Prog123", data: "abc", accounts: [] } as any,
+      params: { programId: "Prog123", data: "abc", accounts: [] } as CustomParams,
     });
     const result = await rule.evaluate(intent, makeContext());
     // denyAddresses catches it first via extractTargetAddress (which checks programId)
@@ -1202,7 +1202,7 @@ describe("ApprovalGateRule — Edge Cases", () => {
   });
 
   it("should build correct approval request fields", async () => {
-    let capturedRequest: any = null;
+    let capturedRequest: ApprovalRequest = null!;
     const channel: ApprovalChannel = {
       name: "capture",
       requestApproval: async (req) => {
@@ -1250,7 +1250,7 @@ describe("ApprovalGateRule — Edge Cases", () => {
   });
 
   it("should use default timeout of 5 minutes when not configured", async () => {
-    let capturedRequest: any = null;
+    let capturedRequest: ApprovalRequest = null!;
     const channel: ApprovalChannel = {
       name: "capture",
       requestApproval: async (req) => {
@@ -1277,7 +1277,7 @@ describe("ApprovalGateRule — Edge Cases", () => {
   });
 
   it("should extract reason from metadata when params has no reason", async () => {
-    let capturedRequest: any = null;
+    let capturedRequest: ApprovalRequest = null!;
     const channel: ApprovalChannel = {
       name: "capture",
       requestApproval: async (req) => {
@@ -1303,7 +1303,7 @@ describe("ApprovalGateRule — Edge Cases", () => {
   });
 
   it("should extract agentId from intent metadata in approval request", async () => {
-    let capturedRequest: any = null;
+    let capturedRequest: ApprovalRequest = null!;
     const channel: ApprovalChannel = {
       name: "capture",
       requestApproval: async (req) => {
@@ -1326,7 +1326,7 @@ describe("ApprovalGateRule — Edge Cases", () => {
   });
 
   it("should generate UUID for approval request when intent has no id", async () => {
-    let capturedRequest: any = null;
+    let capturedRequest: ApprovalRequest = null!;
     const channel: ApprovalChannel = {
       name: "capture",
       requestApproval: async (req) => {
@@ -1341,7 +1341,7 @@ describe("ApprovalGateRule — Edge Cases", () => {
 
     const intent = makeIntent(); // has id: "test-intent-1" from makeIntent
     // Override to remove id
-    delete (intent as any).id;
+    delete (intent as unknown as Record<string, unknown>).id;
 
     await rule.evaluate(intent, makeContext({ approval: channel }));
 
@@ -1351,7 +1351,7 @@ describe("ApprovalGateRule — Edge Cases", () => {
   });
 
   it("should extract target from swap intent (no 'to' field, falls back to 'unknown')", async () => {
-    let capturedRequest: any = null;
+    let capturedRequest: ApprovalRequest = null!;
     const channel: ApprovalChannel = {
       name: "capture",
       requestApproval: async (req) => {
@@ -1441,7 +1441,7 @@ describe("ApprovalGateRule — Edge Cases", () => {
   });
 
   it("should extract target from stake intent (validator field) in approval request", async () => {
-    let capturedRequest: any = null;
+    let capturedRequest: ApprovalRequest = null!;
     const channel: ApprovalChannel = {
       name: "capture",
       requestApproval: async (req) => {
@@ -1499,7 +1499,7 @@ describe("ApprovalGateRule — Edge Cases", () => {
   });
 
   it("should use configured timeout value in approval request expiresAt", async () => {
-    let capturedRequest: any = null;
+    let capturedRequest: ApprovalRequest = null!;
     const channel: ApprovalChannel = {
       name: "capture",
       requestApproval: async (req) => {
@@ -1523,7 +1523,7 @@ describe("ApprovalGateRule — Edge Cases", () => {
   });
 
   it("should handle timeout config of 0 (immediate expiry in approval request)", async () => {
-    let capturedRequest: any = null;
+    let capturedRequest: ApprovalRequest = null!;
     const channel: ApprovalChannel = {
       name: "capture",
       requestApproval: async (req) => {
@@ -1551,7 +1551,7 @@ describe("ApprovalGateRule — Edge Cases", () => {
       above: { amount: "0.5", token: "UNKNOWN" },
     });
     const intent = makeIntent({
-      params: { to: "addr", amount: "10" } as any,
+      params: { to: "addr", amount: "10" } as unknown as TransactionIntent["params"],
     });
     // Token is "UNKNOWN", threshold is also "UNKNOWN", so they match
     // Amount 10 > 0.5 -> needs approval -> DENY (no channel)

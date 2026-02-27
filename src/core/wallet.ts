@@ -136,7 +136,6 @@ const MAX_ACCOUNTS_JSON_LENGTH = 65_536; // 64KB
  * that could mislead operators reviewing audit logs.
  */
 function stripControlChars(value: string): string {
-  // eslint-disable-next-line no-control-regex
   return value.replace(/[\x00-\x1F\x7F-\x9F]/g, "");
 }
 
@@ -1258,6 +1257,7 @@ export class AgentWallet {
         // Logging intent IDs and types to stderr could leak operational metadata.
         if (process.env.NODE_ENV === "test" || process.env.KOVA_AUDIT_STDERR === "1") {
           try {
+            // eslint-disable-next-line no-console
             console.error("[KOVA AUDIT FALLBACK]", JSON.stringify({
               intentId,
               type: normalizedIntent.type,
@@ -2227,14 +2227,16 @@ export class AgentWallet {
           // Now we use a best-effort approach: re-query the price oracle if available,
           // and only skip if unavailable. Incorrect rollback values could over-count
           // remaining budget (unsafe), so we only rollback if we can get a current price.
-          if (this.chain && typeof (this.chain as any).getValueInUSD === "function") {
+          const chainWithUsd = this.chain as Record<string, unknown>;
+          if (this.chain && typeof chainWithUsd.getValueInUSD === "function") {
             const usdWindowKeys: Array<{ window: string }> = [];
             if (config.dailyUSD) usdWindowKeys.push({ window: "daily" });
             if (config.weeklyUSD) usdWindowKeys.push({ window: "weekly" });
             if (config.monthlyUSD) usdWindowKeys.push({ window: "monthly" });
             if (usdWindowKeys.length > 0) {
               try {
-                const usdValue = await (this.chain as any).getValueInUSD(token, String(amount));
+                const getValueInUSD = chainWithUsd.getValueInUSD as (token: string, amount: string) => Promise<number>;
+                const usdValue = await getValueInUSD(token, String(amount));
                 if (typeof usdValue === "number" && Number.isFinite(usdValue) && usdValue > 0) {
                   for (const { window } of usdWindowKeys) {
                     const usdKey = `${keyPrefix}${window}:USD`;
@@ -2258,6 +2260,7 @@ export class AgentWallet {
     // Log rollback failures for operational awareness (non-fatal)
     if (rollbackErrors.length > 0 && (process.env.NODE_ENV === "test" || process.env.KOVA_AUDIT_STDERR === "1")) {
       try {
+        // eslint-disable-next-line no-console
         console.error(`[KOVA] Spending rollback partial failure (${rollbackErrors.length} errors): ${rollbackErrors.join("; ")}`);
       } catch { /* non-fatal */ }
     }

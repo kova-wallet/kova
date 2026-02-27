@@ -3,11 +3,12 @@ import { AgentWallet } from "../../../src/core/wallet.js";
 import { PolicyEngine } from "../../../src/policy/engine.js";
 import { MemoryStore } from "../../../src/stores/memory.js";
 import { ApprovalGateRule } from "../../../src/policy/rules/approval-gate.js";
+import type { AuditLogger } from "../../../src/logging/audit.js";
 import type { AgentWalletConfig } from "../../../src/core/wallet.js";
 import type { PolicyRule, PolicyDecision } from "../../../src/policy/types.js";
 import type { Signer, UnsignedTransaction, SignedTransaction } from "../../../src/signers/interface.js";
 import type { ChainAdapter } from "../../../src/chains/interface.js";
-import type { TransactionIntent } from "../../../src/core/intent.js";
+import type { TransactionIntent, CustomParams } from "../../../src/core/intent.js";
 import type { TokenBalance } from "../../../src/core/result.js";
 import type { ApprovalChannel, ApprovalResult, ApprovalRequest } from "../../../src/approval/interface.js";
 
@@ -116,7 +117,7 @@ describe("AgentWallet", () => {
         log: async () => {},
         getRecent: async () => [],
       };
-      const wallet = createWallet({ logger: mockLogger as any });
+      const wallet = createWallet({ logger: mockLogger as unknown as AuditLogger });
       expect(wallet).toBeDefined();
     });
   });
@@ -1261,7 +1262,7 @@ describe("AgentWallet", () => {
       const slowRule: PolicyRule = {
         name: "slow-rule",
         evaluate: async (intent) => {
-          const id = (intent as any).id ?? "unknown";
+          const id = intent.id ?? "unknown";
           executionOrder.push(`start:${id}`);
           // Simulate async work
           await new Promise((r) => setTimeout(r, 20));
@@ -1420,7 +1421,7 @@ describe("AgentWallet", () => {
     it("should reject invalid intent type", async () => {
       const wallet = createWallet();
       const result = await wallet.execute({
-        type: "invalid_type" as any,
+        type: "invalid_type" as unknown as TransactionIntent["type"],
         chain: "solana",
         params: { to: "addr", amount: "1", token: "SOL" },
       });
@@ -1436,7 +1437,7 @@ describe("AgentWallet", () => {
       const wallet = createWallet();
       const result = await wallet.execute({
         type: "transfer",
-        chain: "bitcoin" as any,
+        chain: "bitcoin" as unknown as TransactionIntent["chain"],
         params: { to: "addr", amount: "1", token: "BTC" },
       });
 
@@ -1451,7 +1452,7 @@ describe("AgentWallet", () => {
       const result = await wallet.execute({
         type: "transfer",
         chain: "solana",
-        params: null as any,
+        params: null as unknown as TransactionIntent["params"],
       });
 
       expect(result.status).toBe("failed");
@@ -1686,7 +1687,7 @@ describe("AgentWallet", () => {
       const result = await wallet.execute({
         type: "custom",
         chain: "solana",
-        params: { programId: VALID_SOL_ADDRESS_2, data: 12345 as any, accounts: [] },
+        params: { programId: VALID_SOL_ADDRESS_2, data: 12345 as unknown as string, accounts: [] },
       });
 
       expect(result.status).toBe("failed");
@@ -1699,7 +1700,7 @@ describe("AgentWallet", () => {
       const result = await wallet.execute({
         type: "custom",
         chain: "solana",
-        params: { programId: VALID_SOL_ADDRESS_2, data: "abc", accounts: "not-an-array" as any },
+        params: { programId: VALID_SOL_ADDRESS_2, data: "abc", accounts: "not-an-array" as unknown as CustomParams["accounts"] },
       });
 
       expect(result.status).toBe("failed");
@@ -1778,7 +1779,7 @@ describe("AgentWallet", () => {
     it("should return 'unknown' as intentId when validation fails and no id provided", async () => {
       const wallet = createWallet();
       const result = await wallet.execute({
-        type: "bogus" as any,
+        type: "bogus" as unknown as TransactionIntent["type"],
         chain: "solana",
         params: { to: "addr", amount: "1", token: "SOL" },
       });
@@ -1791,7 +1792,7 @@ describe("AgentWallet", () => {
       const result = await wallet.execute({
         id: "my-failed-intent",
         type: "transfer",
-        chain: "polygon" as any,
+        chain: "polygon" as unknown as TransactionIntent["chain"],
         params: { to: "addr", amount: "1", token: "SOL" },
       });
 
@@ -1830,9 +1831,9 @@ describe("AgentWallet", () => {
 
       // Fire off multiple invalid intents concurrently — should all return quickly
       const results = await Promise.all([
-        wallet.execute({ type: "bad" as any, chain: "solana", params: { to: "a", amount: "1", token: "SOL" } }),
-        wallet.execute({ type: "bad" as any, chain: "solana", params: { to: "a", amount: "1", token: "SOL" } }),
-        wallet.execute({ type: "bad" as any, chain: "solana", params: { to: "a", amount: "1", token: "SOL" } }),
+        wallet.execute({ type: "bad" as unknown as TransactionIntent["type"], chain: "solana", params: { to: "a", amount: "1", token: "SOL" } }),
+        wallet.execute({ type: "bad" as unknown as TransactionIntent["type"], chain: "solana", params: { to: "a", amount: "1", token: "SOL" } }),
+        wallet.execute({ type: "bad" as unknown as TransactionIntent["type"], chain: "solana", params: { to: "a", amount: "1", token: "SOL" } }),
       ]);
 
       results.forEach((r) => {
