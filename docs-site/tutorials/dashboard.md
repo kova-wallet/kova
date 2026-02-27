@@ -154,7 +154,7 @@ The dashboard uses its own `DashboardApprovalChannel` implementation instead of 
 The dashboard persists wallet keypairs to `dashboard/wallet/keypair.json`:
 
 - **On create**: The keypair bytes are written to `keypair.json` as a JSON array.
-- **On server start**: If `keypair.json` exists, the dashboard auto-loads it and initializes the wallet with a default policy (10 SOL per-tx, 50 SOL daily, 5 txns/min rate limit).
+- **On server start**: If `keypair.json` exists, the dashboard auto-loads it and initializes the wallet with a default policy (0.01 SOL per-tx, 1 SOL daily, 5 txns/min rate limit).
 - **On destroy**: The in-memory state is cleared, but `keypair.json` remains on disk.
 
 This means the same devnet wallet address and SOL balance persist across dashboard restarts, even though the `MemoryStore` state (spending counters, audit logs, transaction history) resets.

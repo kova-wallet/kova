@@ -77,8 +77,8 @@ autoLoadKeypair();
 function buildDefaultPolicyConfig(): PolicyConfig {
   return Policy.create("default")
     .spendingLimit({
-      perTransaction: { amount: "10", token: "SOL" },
-      daily: { amount: "50", token: "SOL" },
+      perTransaction: { amount: "0.01", token: "SOL" },
+      daily: { amount: "1", token: "SOL" },
     })
     .rateLimit({ maxTransactionsPerMinute: 5 })
     .build()
