@@ -123,7 +123,7 @@ export default defineConfig({
     },
 
     editLink: {
-      pattern: 'https://github.com/0xKeyserSoze/kova/edit/master/docs-site/:path',
+      pattern: 'https://github.com/0xKeyserSoze/kova/edit/prod/docs-site/:path',
       text: 'Edit this page on GitHub',
     },
   },
