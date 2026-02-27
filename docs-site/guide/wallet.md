@@ -45,8 +45,17 @@ import type { AgentWalletConfig } from "kova";
 | `store` | `Store` | Yes | The store for persisting spending counters and tx logs (the database that remembers how much has been spent today) |
 | `approval` | `ApprovalChannel` | No | Optional approval channel for human-in-the-loop (e.g., a Telegram bot that messages a human for approval) |
 | `logger` | `AuditLogger` | No | Optional audit logger. If not provided, one is created using the store |
-| `circuitBreaker` | `Partial<CircuitBreakerConfig> \| false` | No | Circuit breaker config. Set to `false` to disable. Default: `{ threshold: 5, cooldownMs: 300000 }` |
+| `circuitBreaker` | `Partial<CircuitBreakerConfig> \| false` | No | Circuit breaker config. Set to `false` to disable. Default: `{ threshold: 10, cooldownMs: 300000 }` |
 | `onAuditFailure` | `AuditFailureCallback` | No | Callback invoked when an audit log write fails |
+| `idempotencyTtl` | `number` | No | TTL for idempotency cache entries in seconds. Determines how long a duplicate intent ID returns a cached result instead of re-executing. Default: `86400` (24 hours) |
+| `idempotencyHmacKey` | `string \| Buffer` | No | HMAC-SHA256 key for verifying authenticity of cached idempotency entries. Prevents an attacker with store write access from forging cached "confirmed" results. Generate with `crypto.randomBytes(32).toString('hex')` and store securely -- not in the database |
+| `storePrefix` | `string` | No | Key prefix for multi-wallet store isolation. When multiple AgentWallet instances share a Store backend, each must use a unique prefix to prevent cross-wallet interference in spending limits, rate counters, and audit logs |
+| `mutexTimeoutMs` | `number` | No | Timeout in milliseconds for acquiring the execute mutex. If the mutex cannot be acquired within this period, the call fails instead of blocking indefinitely. Default: `30000` (30 seconds) |
+| `enabledTools` | `ReadonlySet<string>` | No | Set of tool names enabled for `handleToolCall()`. Defaults to read-only tools only (`wallet_get_balance`, `wallet_get_transaction_history`). Write tools require explicit opt-in. See [Tool Access Control](#tool-access-control) |
+| `dangerouslyAllowAutoHmacKey` | `boolean` | No | When `true`, allows auto-generation of the idempotency HMAC key. Auto-generated keys do not survive process restarts, risking duplicate transactions. For production, provide a persistent `idempotencyHmacKey` instead |
+| `authToken` | `string` | No | Capability token for caller authentication. When set, `execute()` and `handleToolCall()` require this token; calls without it are rejected with `AUTH_FAILED` |
+| `requireAuth` | `boolean` | No | When `true`, the constructor throws if `authToken` is not provided, enforcing that all wallet instances have caller authentication. Default: `false` |
+| `agentId` | `string` | No | Wallet-level agent identifier. Used for circuit breaker isolation and per-agent rate limiting instead of the self-reported `agentId` in intent metadata, which is untrusted |
 
 ::: tip What is a circuit breaker?
 A circuit breaker is a safety mechanism borrowed from electrical engineering. If too many transactions are denied in a row (suggesting a bug or runaway loop), the circuit breaker "trips" and blocks ALL transactions for a cooldown period. This prevents a misbehaving agent from hammering the system with doomed requests.
@@ -450,6 +459,66 @@ if (result.success) {
 }
 ```
 
+## Tool Access Control
+
+By default, only read-only tools are enabled for `handleToolCall()`. This prevents an AI agent from executing transactions unless your code explicitly opts in.
+
+### Default Enabled Tools (read-only)
+
+| Tool Name | Description |
+|-----------|-------------|
+| `wallet_get_balance` | Query the wallet's token balance |
+| `wallet_get_transaction_history` | Retrieve recent audit log entries |
+
+### Opt-in Write Tools
+
+To allow the AI agent to execute transactions, list the tools explicitly in `enabledTools`:
+
+```typescript
+// Import the main AgentWallet class.
+import { AgentWallet } from "kova";
+
+const wallet = new AgentWallet({
+  signer,
+  chain,
+  policy: engine,
+  store,
+  // Explicitly enable transfer and swap tools alongside the defaults.
+  enabledTools: new Set([
+    "wallet_get_balance",
+    "wallet_get_transaction_history",
+    "wallet_get_policy",
+    "wallet_transfer",
+    "wallet_swap",
+  ]),
+});
+```
+
+| Tool Name | Category | Description |
+|-----------|----------|-------------|
+| `wallet_transfer` | Write | Execute a token transfer |
+| `wallet_swap` | Write | Execute a token swap via Jupiter |
+| `wallet_mint` | Write | Mint an NFT |
+| `wallet_stake` | Write | Stake tokens to a validator |
+| `wallet_execute_custom` | Write (dangerous) | Execute an arbitrary custom transaction |
+| `wallet_get_policy` | Read | View policy summary (opt-in to prevent policy reconnaissance) |
+
+::: warning
+`wallet_execute_custom` is the most dangerous tool because it allows arbitrary program interactions. Only enable it when your policy rules are strict enough to prevent abuse.
+:::
+
+### Built-in Rate Limits
+
+The SDK enforces hardcoded rate limits on tool calls regardless of your policy configuration:
+
+| Category | Limit | Purpose |
+|----------|-------|---------|
+| Write tools | 30 per minute per wallet | Prevents a runaway agent from draining funds even with misconfigured policy rules |
+| Read tools | 60 per minute per wallet | Prevents reconnaissance abuse and resource exhaustion |
+| Per-agent writes | 15 per minute per agent | Ensures fair sharing when multiple agents share a wallet |
+
+These limits are floors -- they cannot be disabled via configuration. Your policy rules provide additional, more granular limits on top of these.
+
 ### toAnthropicTools()
 
 Get tool definitions formatted for the Anthropic (Claude) API. These definitions tell Claude what wallet operations are available and how to call them.
@@ -569,6 +638,9 @@ The `error.code` field in `TransactionResult` uses one of the following `Transac
 | `STORE_ERROR` | Store operation failed (e.g., audit logging is broken) |
 | `CIRCUIT_BREAKER_OPEN` | Circuit breaker is blocking transactions after consecutive denials |
 | `UNKNOWN_ERROR` | Unexpected error |
+| `CHAIN_MISMATCH` | Transaction chain does not match the signer's configured chain |
+| `WALLET_DRAINING` | Wallet is shutting down via `drain()`; no new transactions accepted |
+| `AUTH_FAILED` | Invalid or missing authentication token |
 
 ::: danger
 When `STORE_ERROR` is returned with "audit logging circuit breaker is open", **all transactions are blocked** until audit logging is restored. This is a safety feature -- the SDK refuses to process transactions without a functioning audit trail.

@@ -264,8 +264,30 @@ export function toSmallestUnit(amount: string, decimals: number): bigint {
   const parts = amount.split(".");
   const whole = parts[0] ?? "0";
   const rawFractional = parts[1] ?? "";
+  // CHAIN-019 fix: Warn when excess decimal precision is truncated.
+  // If the input has more decimal places than the token supports, the excess
+  // digits are silently dropped. This is correct behavior (round-down), but
+  // callers should be aware that precision was lost.
+  if (rawFractional.length > decimals && rawFractional.slice(decimals).replace(/0+$/, "").length > 0) {
+    process.emitWarning(
+      `Amount has ${rawFractional.length} decimal places but token supports ${decimals}. ` +
+      `Excess precision truncated (round-down). Use exact precision to avoid this warning.`,
+      "KovaPrecisionWarning",
+    );
+  }
   const fractional = rawFractional.padEnd(decimals, "0").slice(0, decimals);
   const result = BigInt(whole + fractional);
+
+  // CHAIN-003 fix: Reject amounts exceeding Solana's u64 maximum.
+  // Solana uses u64 for lamport amounts; values above 2^64 - 1 would produce
+  // malformed transaction data that would be signed before failing at simulation.
+  const U64_MAX = BigInt("18446744073709551615");
+  if (result > U64_MAX) {
+    throw new SolanaAdapterError(
+      "INVALID_AMOUNT",
+      "Amount exceeds maximum u64 value (2^64 - 1)",
+    );
+  }
 
   // M-25 fix: Detect sub-precision amounts that would silently truncate to zero.
   // If the input is non-zero (e.g., "0.0000000001" with 6 decimals) but the
@@ -418,6 +440,17 @@ export function stripControlChars(value: string): string {
   return value.replace(/[\x00-\x1F\x7F-\x9F]/g, "");
 }
 
+/**
+ * MED-18 fix: Sanitize token names/symbols by restricting to ASCII printable characters.
+ * Token names from on-chain data or user input may contain Unicode control characters,
+ * RTL override characters (U+202E), zero-width joiners, or homoglyph characters that
+ * could mislead approvers in swap descriptions/summaries. This replaces any character
+ * outside the ASCII printable range (0x20-0x7E) with "?" to make manipulation visible.
+ */
+export function sanitizeTokenName(value: string): string {
+  return value.replace(/[^\x20-\x7E]/g, "?");
+}
+
 // ── Error Types ──────────────────────────────────────────────────
 
 export class SolanaAdapterError extends Error {
@@ -446,4 +479,49 @@ export function isDevnetUrl(rpcUrl: string): boolean {
     "DeprecationWarning",
   );
   return rpcUrl.includes("devnet");
+}
+
+// ── SSRF Protection — Shared IP Validation ────────────────────────────
+
+/**
+ * CHAIN-005 fix: Shared IPv4 private range check used by both validateRpcUrl()
+ * (adapter.ts) and validateFetchTarget() (swaps.ts). Consolidating into a single
+ * function prevents divergence where one location blocks a range but the other doesn't.
+ *
+ * Blocked ranges: RFC 1918, link-local (169.254), CGNAT (100.64/10), loopback (127), unspecified (0).
+ */
+export function isPrivateIPv4(ip: string): boolean {
+  const parts = ip.split(".");
+  if (parts.length !== 4 || !parts.every((p) => /^\d{1,3}$/.test(p))) return false;
+  const octets = parts.map(Number);
+  const [o0, o1] = octets;
+  return (
+    o0 === 10 ||
+    (o0 === 172 && o1! >= 16 && o1! <= 31) ||
+    (o0 === 192 && o1 === 168) ||
+    (o0 === 169 && o1 === 254) ||
+    (o0 === 100 && o1! >= 64 && o1! <= 127) ||
+    o0 === 127 || o0 === 0
+  );
+}
+
+/**
+ * CHAIN-005 fix: Shared IPv6 private/reserved range check. Covers:
+ * - Unspecified (::), Loopback (::1)
+ * - ULA (fc00::/7), Link-local (fe80::/10)
+ * - IPv4-mapped (::ffff:), 6to4 (2002::/16), Teredo (2001:0000::/32)
+ * - Documentation (2001:db8::/32), Discard (100::/64)
+ */
+export function isPrivateIPv6(ip: string): boolean {
+  const lower = ip.toLowerCase();
+  if (lower === "::" || lower === "0:0:0:0:0:0:0:0") return true;
+  if (lower === "::1" || lower === "0:0:0:0:0:0:0:1") return true;
+  if (lower.startsWith("fc") || lower.startsWith("fd")) return true;
+  if (/^fe[89ab]/i.test(lower)) return true;
+  if (lower.startsWith("::ffff:")) return true;
+  if (lower.startsWith("100:")) return true;
+  if (lower.startsWith("2001:db8:") || lower.startsWith("2001:0db8:")) return true;
+  if (lower.startsWith("2002:")) return true;
+  if (lower.startsWith("2001:0000:") || lower.startsWith("2001:0:") || lower.startsWith("2001::")) return true;
+  return false;
 }

@@ -71,6 +71,36 @@ export interface ChainAdapter {
   isValidAddress(address: string): boolean;
 
   /**
+   * CRIT-06 fix: Capture a pre-swap balance snapshot for post-swap verification.
+   * Call before broadcasting a swap transaction to record the output token balance.
+   * Optional — only applicable to chain adapters that support swap verification.
+   */
+  getPreSwapSnapshot?(ownerAddress: string, outputToken: string): Promise<{
+    outputToken: string; preBalance: bigint; snapshotTimestamp: number;
+  }>;
+
+  /**
+   * CRIT-06 fix: Verify that a swap produced the expected minimum output amount.
+   * Call after broadcast + confirmation to detect sandwich attacks and partial fills.
+   */
+  verifySwapOutput?(
+    ownerAddress: string,
+    preSwapSnapshot: { outputToken: string; preBalance: bigint; snapshotTimestamp: number },
+    minimumExpectedOut: bigint,
+    quotedOutAmount?: bigint,
+  ): Promise<{
+    passed: boolean; actualReceived: bigint; minimumExpected: bigint;
+    quotedAmount?: bigint; deficit?: bigint; warning?: string;
+  }>;
+
+  /**
+   * CRIT-07 fix: Refresh the blockhash on an unsigned transaction.
+   * Call after approval delays (which may exceed Solana's ~60-90s blockhash expiry)
+   * and before signing to prevent broadcast failures from stale blockhashes.
+   */
+  refreshBlockhash?(unsignedTx: UnsignedTransaction): Promise<UnsignedTransaction>;
+
+  /**
    * MED-T2-06 fix: Clean up resources held by this adapter.
    * Implementations should release any cached state (DNS entries, connections,
    * timers) that would otherwise persist for the process lifetime.

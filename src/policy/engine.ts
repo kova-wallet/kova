@@ -46,10 +46,29 @@ function sanitizeErrorForExternalResult(_errorMsg: string): string {
   return "Policy evaluation error: a rule failed during evaluation";
 }
 
+/**
+ * MED-34 fix: Default timeout (in ms) for PolicyEngine mutex acquisition.
+ * If the lock isn't acquired within this period (e.g., a rule hangs waiting for
+ * approval), the evaluation is rejected with a timeout error rather than blocking
+ * all subsequent transactions indefinitely.
+ */
+const DEFAULT_POLICY_MUTEX_TIMEOUT_MS = 30_000;
+
 export class PolicyEngine {
   private readonly rules: PolicyRule[];
   private readonly store: Store;
   private readonly approval?: ApprovalChannel;
+  /**
+   * POLICY-001 fix: Internal mutex to serialize evaluate() calls. Prevents the
+   * Phase 2 TOCTOU gap where two concurrent evaluations both pass Phase 1 dry-run
+   * (each seeing sufficient budget) and then both commit in Phase 2 (double-spend).
+   * Previously, the mutex lived in the wallet's execute() method, but direct callers
+   * of PolicyEngine.evaluate() could bypass it. Making it internal ensures all
+   * evaluation paths are serialized regardless of the caller.
+   */
+  private evaluateLock: Promise<void> = Promise.resolve();
+  /** MED-34 fix: Configurable timeout for mutex acquisition */
+  private readonly mutexTimeoutMs: number;
   /**
    * CRIT-03 fix: Optional function to convert token amounts to USD.
    * Injected by the wallet from the chain adapter, enabling USD-normalized spending limits.
@@ -76,6 +95,8 @@ export class PolicyEngine {
     store: Store,
     approval?: ApprovalChannel,
     getValueInUSD?: (token: string, amount: string) => Promise<number>,
+    /** MED-34 fix: Configurable mutex timeout in ms. Default: 30 000 */
+    mutexTimeoutMs?: number,
   ) {
     if (rules.length === 0) {
       throw new Error(
@@ -90,6 +111,7 @@ export class PolicyEngine {
     this.store = store;
     this.approval = approval;
     this.getValueInUSD = getValueInUSD;
+    this.mutexTimeoutMs = mutexTimeoutMs ?? DEFAULT_POLICY_MUTEX_TIMEOUT_MS;
   }
 
   /**
@@ -112,6 +134,62 @@ export class PolicyEngine {
    * Returns the first DENY or PENDING decision, or ALLOW if all rules pass.
    */
   async evaluate(
+    intent: TransactionIntent,
+    now?: number,
+  ): Promise<PolicyEvaluationResult> {
+    // POLICY-001 fix: Acquire the internal mutex to serialize evaluations.
+    // This closes the TOCTOU gap between Phase 1 (dry-run) and Phase 2 (commit)
+    // for ALL callers, not just those going through the wallet's execute mutex.
+    let releaseLock: () => void;
+    const previousLock = this.evaluateLock;
+    this.evaluateLock = new Promise<void>((resolve) => { releaseLock = resolve; });
+
+    // MED-34 fix: Add a configurable timeout to mutex acquisition. If the lock
+    // isn't acquired within the timeout (e.g., due to a hung rule or approval wait),
+    // reject with a timeout error rather than blocking all subsequent evaluations.
+    // MED-37 fix: clearTimeout is called when the lock is acquired normally to prevent
+    // a dangling timer that could fire after the lock is released.
+    let timeoutId: ReturnType<typeof setTimeout> | undefined;
+    const timeoutPromise = new Promise<"timeout">((resolve) => {
+      timeoutId = setTimeout(() => resolve("timeout"), this.mutexTimeoutMs);
+    });
+
+    const lockResult = await Promise.race([
+      previousLock.then(() => "acquired" as const),
+      timeoutPromise,
+    ]);
+
+    // MED-37 fix: Clear the timeout timer regardless of outcome to prevent
+    // dangling timers. This is especially important on the "acquired" path
+    // where the timer would otherwise fire after the lock has been acquired
+    // and potentially released.
+    clearTimeout(timeoutId);
+
+    if (lockResult === "timeout") {
+      // Release our slot in the lock chain so subsequent callers aren't permanently blocked
+      releaseLock!();
+      return {
+        decision: {
+          decision: "DENY",
+          rule: "PolicyEngine",
+          reason: `Policy evaluation mutex acquisition timed out after ${this.mutexTimeoutMs}ms. A previous evaluation may be hung.`,
+        },
+        ruleAudits: [],
+        totalEvaluationTimeMs: this.mutexTimeoutMs,
+      };
+    }
+
+    try {
+      return await this.evaluateInternal(intent, now);
+    } finally {
+      releaseLock!();
+    }
+  }
+
+  /**
+   * POLICY-001 fix: Internal implementation of evaluate, called under mutex.
+   */
+  private async evaluateInternal(
     intent: TransactionIntent,
     now?: number,
   ): Promise<PolicyEvaluationResult> {
@@ -166,14 +244,28 @@ export class PolicyEngine {
 
     // --- Phase 1: Dry-run evaluation (no side effects) ---
     const dryRunStore = new DryRunStore(this.store);
-    // LOW-T4-05 fix: Freeze the context object to prevent a malicious custom rule
-    // from mutating context properties (e.g., replacing store, changing now, removing
-    // approval) that would affect subsequent rules in the evaluation chain.
+    // POLICY-013 fix: Deep-freeze the context by wrapping the store in a frozen
+    // method-bound object. Shallow Object.freeze on the context only prevents
+    // reassignment of `context.store`, but a malicious custom rule could still
+    // monkey-patch `context.store.increment = () => 0` to disable all subsequent
+    // rules' counter logic. Binding and freezing the methods prevents this.
+    const frozenDryRunStore: Store = Object.freeze({
+      get: dryRunStore.get.bind(dryRunStore),
+      set: dryRunStore.set.bind(dryRunStore),
+      increment: dryRunStore.increment.bind(dryRunStore),
+      setIfNotExists: dryRunStore.setIfNotExists.bind(dryRunStore),
+      append: dryRunStore.append.bind(dryRunStore),
+      getRecent: dryRunStore.getRecent.bind(dryRunStore),
+    });
     const dryRunContext: PolicyContext = Object.freeze({
-      store: dryRunStore,
+      store: frozenDryRunStore,
       approval: this.approval,
       now: effectiveNow,
       getValueInUSD: this.getValueInUSD,
+      // CRIT-10 fix: Signal to rules with external side effects (e.g., ApprovalGateRule)
+      // that this is a dry-run evaluation. Rules should skip side effects (sending approval
+      // requests) and defer them to Phase 2, preventing duplicate approval requests.
+      dryRun: true,
     });
 
     for (const rule of this.rules) {
@@ -236,9 +328,18 @@ export class PolicyEngine {
     // earlier rules and warn about them. The TrackingStore also enables rollback
     // of increments for counters that were modified before the denial.
     const trackingStore = new Phase2TrackingStore(this.store);
-    // LOW-T4-05 fix: Freeze commit context too — same rationale as dryRunContext above.
+    // POLICY-013 fix: Same frozen method-binding as dryRunContext to protect
+    // the commit phase store from monkey-patching by custom rules.
+    const frozenTrackingStore: Store = Object.freeze({
+      get: trackingStore.get.bind(trackingStore),
+      set: trackingStore.set.bind(trackingStore),
+      increment: trackingStore.increment.bind(trackingStore),
+      setIfNotExists: trackingStore.setIfNotExists.bind(trackingStore),
+      append: trackingStore.append.bind(trackingStore),
+      getRecent: trackingStore.getRecent.bind(trackingStore),
+    });
     const commitContext: PolicyContext = Object.freeze({
-      store: trackingStore,
+      store: frozenTrackingStore,
       approval: this.approval,
       now: effectiveNow,
       getValueInUSD: this.getValueInUSD,
@@ -402,22 +503,39 @@ class DryRunStore implements Store {
 
   async getRecent(key: string, count: number): Promise<string[]> {
     // Combine real store entries with dry-run overlay entries
-    const realEntries = await this.real.getRecent(key, count);
     const overlayEntries = this.listOverlay.get(key) ?? [];
+    // POLICY-003 fix: Request additional entries from the real store to account for
+    // overlay entries that will be combined. Without this, combining `count` real entries
+    // with N overlay entries and then slicing to `count` could evict still-valid real
+    // entries, causing under-counting of prior spending in high-volume scenarios.
+    const realCount = count + overlayEntries.length;
+    const realEntries = await this.real.getRecent(key, realCount);
     const combined = [...realEntries, ...overlayEntries];
+    // MED-31 fix: Filter out entries with unparseable timestamps before sorting.
+    // Previously, malformed entries would receive timestamp 0 via `|| 0`, silently
+    // including them in the sliding window with the earliest possible timestamp.
+    // This could cause incorrect spending totals (over- or under-counting) if
+    // store corruption produced malformed entries.
+    const validEntries = combined.filter((entry) => {
+      const colonIdx = entry.indexOf(":");
+      if (colonIdx <= 0) return false; // No colon or colon at start — malformed
+      const tsStr = entry.slice(0, colonIdx);
+      const ts = parseInt(tsStr, 10);
+      return Number.isFinite(ts) && ts > 0;
+    });
     // MED-T3-05 fix: Sort combined entries by timestamp in chronological order before
     // applying the count limit. Real store and overlay entries may not be in chronological
     // order when combined, which could cause incorrect sliding window totals during dry-run.
-    combined.sort((a, b) => {
-      const tsA = parseInt(a.slice(0, a.indexOf(":")), 10) || 0;
-      const tsB = parseInt(b.slice(0, b.indexOf(":")), 10) || 0;
+    validEntries.sort((a, b) => {
+      const tsA = parseInt(a.slice(0, a.indexOf(":")), 10);
+      const tsB = parseInt(b.slice(0, b.indexOf(":")), 10);
       return tsA - tsB;
     });
     // MED-T4-05 fix: Return in reverse chronological order (newest first) to match
     // MemoryStore.getRecent() which uses .slice(-count).reverse(). Without this,
     // the ordering mismatch between DryRunStore and MemoryStore could cause
     // inconsistent behavior between Phase 1 (dry-run) and Phase 2 (commit).
-    return combined.slice(-count).reverse();
+    return validEntries.slice(-count).reverse();
   }
 }
 
@@ -441,6 +559,14 @@ class Phase2TrackingStore implements Store {
   /** Track increments for rollback: key -> total amount incremented */
   private readonly incrementedKeys: Map<string, number> = new Map();
   /**
+   * HIGH-23 fix: Track set() operations for rollback. Stores the previous value
+   * (or null if the key did not exist) so we can restore it on rollback.
+   * Without this, set() writes directly to the real store and cannot be undone
+   * if a later rule denies during Phase 2, leaving stale or attacker-influenced
+   * values in the store.
+   */
+  private readonly setKeys: Map<string, { previousValue: string | null; previousTtl?: number }> = new Map();
+  /**
    * CRIT-T3-01 fix: Buffer append() operations during Phase 2 instead of writing
    * directly to the real store. Appends are only flushed to the real store after
    * all rules pass (via commitAppends()). If a later rule denies during Phase 2,
@@ -462,6 +588,13 @@ class Phase2TrackingStore implements Store {
   }
 
   async set(key: string, value: string, ttlSeconds?: number): Promise<void> {
+    // HIGH-23 fix: Capture the previous value before overwriting so we can restore
+    // it on rollback. Only capture the first write per key — subsequent writes to
+    // the same key should still roll back to the original pre-Phase-2 value.
+    if (!this.setKeys.has(key)) {
+      const previousValue = await this.real.get(key);
+      this.setKeys.set(key, { previousValue });
+    }
     return this.real.set(key, value, ttlSeconds);
   }
 
@@ -487,12 +620,32 @@ class Phase2TrackingStore implements Store {
   async getRecent(key: string, count: number): Promise<string[]> {
     // CRIT-T3-01 fix: Include buffered (pending) appends in getRecent results
     // so that rules evaluated later in Phase 2 see entries from earlier rules.
-    const realEntries = await this.real.getRecent(key, count);
     const pendingForKey = this.pendingAppends
       .filter((p) => p.key === key)
       .map((p) => p.value);
+    // POLICY-007 fix: Request extra entries from real store to account for pending
+    // entries, matching the DryRunStore approach (POLICY-003 fix).
+    const realCount = count + pendingForKey.length;
+    const realEntries = await this.real.getRecent(key, realCount);
     const combined = [...realEntries, ...pendingForKey];
-    return combined.slice(-count);
+    // MED-31 fix: Filter out entries with unparseable timestamps before sorting,
+    // matching the defensive parsing in DryRunStore.getRecent().
+    const validEntries = combined.filter((entry) => {
+      const colonIdx = entry.indexOf(":");
+      if (colonIdx <= 0) return false;
+      const tsStr = entry.slice(0, colonIdx);
+      const ts = parseInt(tsStr, 10);
+      return Number.isFinite(ts) && ts > 0;
+    });
+    // POLICY-007 fix: Sort by timestamp to ensure consistent ordering between
+    // Phase 1 (DryRunStore) and Phase 2 (Phase2TrackingStore). Without sorting,
+    // the two phases may include/exclude different entries at window boundaries.
+    validEntries.sort((a, b) => {
+      const tsA = parseInt(a.slice(0, a.indexOf(":")), 10);
+      const tsB = parseInt(b.slice(0, b.indexOf(":")), 10);
+      return tsA - tsB;
+    });
+    return validEntries.slice(-count).reverse();
   }
 
   /**
@@ -507,8 +660,9 @@ class Phase2TrackingStore implements Store {
   }
 
   /**
-   * Roll back all increments that were persisted during Phase 2.
+   * Roll back all increments and set() operations that were persisted during Phase 2.
    * CRIT-T3-01 fix: Also discards all buffered appends (no flush needed on denial).
+   * HIGH-23 fix: Also rolls back set() operations by restoring previous values.
    * Best-effort: individual rollback failures are swallowed (safe direction:
    * counters remain inflated, which means under-counting remaining budget).
    */
@@ -528,5 +682,26 @@ class Phase2TrackingStore implements Store {
       }
     }
     this.incrementedKeys.clear();
+
+    // HIGH-23 fix: Roll back set() operations by restoring previous values.
+    // If the previous value was null (key did not exist), we cannot delete the key
+    // via the Store interface (no delete method), so we set it to an empty string.
+    // This is best-effort — the key will exist with an empty value rather than
+    // being absent, but this is the safe direction (subsequent reads will see
+    // an empty/zero value rather than an attacker-influenced value).
+    for (const [key, { previousValue }] of this.setKeys) {
+      try {
+        if (previousValue !== null) {
+          await this.real.set(key, previousValue);
+        } else {
+          // Key did not exist before Phase 2. Set to "0" as a safe default
+          // since set() is primarily used for counter values in this context.
+          await this.real.set(key, "0");
+        }
+      } catch {
+        // Best-effort rollback — failure is safe direction
+      }
+    }
+    this.setKeys.clear();
   }
 }

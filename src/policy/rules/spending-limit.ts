@@ -52,6 +52,22 @@ const WINDOW_SECONDS = {
 const MAX_WINDOW_ENTRIES = 10_000;
 
 /**
+ * CRIT-12 fix: Garbage collection constants for sliding window entry lists.
+ * Without GC, expired "timestamp:amount" entries accumulate indefinitely in store
+ * lists until they hit MAX_LIST_SIZE (100,000), wasting memory/disk and degrading
+ * getRecent() performance as it scans through stale entries.
+ *
+ * GC is throttled per log key to avoid rewriting the list on every evaluation:
+ * - GC_THROTTLE_MS: Minimum interval between GC runs for the same log key (5 minutes).
+ * - GC_MIN_ENTRIES: Skip GC when list has fewer than this many entries (not worth the cost).
+ * - GC_EXPIRED_RATIO: Only rewrite the list when at least this fraction of entries are expired.
+ *   This avoids unnecessary clear+re-append cycles when most entries are still valid.
+ */
+const GC_THROTTLE_MS = 5 * 60 * 1000; // 5 minutes
+const GC_MIN_ENTRIES = 100;
+const GC_EXPIRED_RATIO = 0.3; // 30% expired triggers GC
+
+/**
  * SEC: Precision-safe decimal math to avoid IEEE 754 floating-point drift.
  * HIGH-03 fix: Uses BigInt to prevent overflow for large amounts (> ~9 billion).
  * The old approach (Math.round(value * 10^9)) overflowed Number.MAX_SAFE_INTEGER
@@ -90,6 +106,13 @@ export class SpendingLimitRule implements PolicyRule {
    */
   private readonly keyPrefix: string;
 
+  /**
+   * CRIT-12 fix: Tracks the last garbage collection time per log key.
+   * Used to throttle GC so it doesn't run on every sliding window evaluation,
+   * avoiding unnecessary clear+re-append cycles that would degrade performance.
+   */
+  private readonly lastGcTimestamp = new Map<string, number>();
+
   constructor(config: SpendingLimitConfig) {
     // MED-34 fix: Validate all limit amounts at construction time.
     // Catches NaN, Infinity, negative, and zero values that would silently disable limits.
@@ -101,6 +124,19 @@ export class SpendingLimitRule implements PolicyRule {
     if (config.dailyUSD) parseAndValidateLimitAmount(config.dailyUSD.amount, "SpendingLimit dailyUSD");
     if (config.weeklyUSD) parseAndValidateLimitAmount(config.weeklyUSD.amount, "SpendingLimit weeklyUSD");
     if (config.monthlyUSD) parseAndValidateLimitAmount(config.monthlyUSD.amount, "SpendingLimit monthlyUSD");
+
+    // LOW-25 fix: Warn when no limits are configured, making the rule a no-op that always allows.
+    const hasAnyLimit = !!(
+      config.perTransaction || config.daily || config.weekly || config.monthly ||
+      config.perTransactionUSD || config.dailyUSD || config.weeklyUSD || config.monthlyUSD
+    );
+    if (!hasAnyLimit) {
+      process.emitWarning(
+        "SpendingLimitRule has no limits configured (no perTransaction, daily, weekly, monthly, " +
+        "or USD-denominated limits). The rule will have no effect and all transactions will be allowed.",
+        { code: "KOVA_SPENDING_LIMIT_EMPTY" },
+      );
+    }
 
     // =========================================================================
     // POLICY-003 WARNING — NO PER-TRANSACTION CAP FOR TOKENS WITH ONLY AGGREGATE LIMITS
@@ -148,7 +184,15 @@ export class SpendingLimitRule implements PolicyRule {
 
     this.config = config;
     // MED-T4-01 fix: Use configurable key prefix, defaulting to "spending:" for backward compatibility
-    this.keyPrefix = config.keyPrefix ?? DEFAULT_KEY_PREFIX;
+    const keyPrefix = config.keyPrefix ?? DEFAULT_KEY_PREFIX;
+    // POLICY-010 fix: Validate keyPrefix at construction time to prevent cross-wallet
+    // counter collision. Only allow alphanumeric, dash, underscore, and colon characters.
+    if (!/^[a-zA-Z0-9_\-:]+$/.test(keyPrefix)) {
+      throw new Error(
+        `SpendingLimitRule: keyPrefix must contain only alphanumeric, dash, underscore, and colon characters. Got: "${keyPrefix.slice(0, 50)}"`,
+      );
+    }
+    this.keyPrefix = keyPrefix;
   }
 
   /** Get the spending limit configuration (for policy introspection) */
@@ -331,7 +375,11 @@ export class SpendingLimitRule implements PolicyRule {
 
     // Retrieve recent transaction records and sum amounts within the sliding window
     const recentEntries = await context.store.getRecent(logKey, MAX_WINDOW_ENTRIES);
-    let windowTotal = 0;
+    // POLICY-002 fix: Accumulate in BigInt space to prevent floating-point drift.
+    // Previously, repeated `windowTotal += amt` caused IEEE 754 drift (e.g., summing
+    // 10,000 entries of 0.1 yields ~999.9999 instead of 1000.0). By scaling each entry
+    // to BigInt before summing, we get exact arithmetic with zero drift.
+    let windowTotalBi = 0n;
     for (const entry of recentEntries) {
       const colonIdx = entry.indexOf(":");
       if (colonIdx === -1) continue;
@@ -341,14 +389,24 @@ export class SpendingLimitRule implements PolicyRule {
       // Corrupted or tampered store entries with negative values would reduce windowTotal,
       // effectively granting additional spending budget.
       if (ts >= windowStartMs && Number.isFinite(amt) && amt >= 0) {
-        windowTotal += amt;
+        windowTotalBi += toBigIntScaled(amt);
       }
     }
 
-    const projectedTotal = windowTotal + amount;
+    // CRIT-12 fix: Garbage-collect expired entries from the sliding window log.
+    // This runs after computing windowTotal (so it doesn't affect current evaluation)
+    // and before appending the new entry. GC is throttled and only rewrites the list
+    // when a significant fraction of entries are expired.
+    await this.garbageCollectWindow(context, logKey, windowStartMs);
 
-    // SEC: Use precision-safe comparison to avoid float drift in accumulated totals
-    if (safeGt(projectedTotal, limit)) {
+    const projectedTotalBi = windowTotalBi + toBigIntScaled(amount);
+    const limitBi = toBigIntScaled(limit);
+
+    // POLICY-002 fix: Compare entirely in BigInt space — no float conversion needed
+    // HIGH-21 fix: Use >= instead of > to deny transactions that would bring the total
+    // exactly to the limit. The previous > comparison allowed one extra transaction that
+    // hit the limit precisely, creating an off-by-one bypass.
+    if (projectedTotalBi >= limitBi) {
       // M-61 FIX: Sanitized denial message — does not reveal window type or token details
       return {
         decision: "DENY",
@@ -357,12 +415,17 @@ export class SpendingLimitRule implements PolicyRule {
       };
     }
 
-    // Record this transaction in the sliding window log
-    await context.store.append(logKey, `${now}:${amount}`);
-    // Also maintain the atomic counter for backwards compatibility
+    // POLICY-005 fix: Increment counter BEFORE appending to the sliding window log.
+    // Previously, the append happened first. If increment() failed, the log entry
+    // persisted as a phantom entry that would inflate windowTotal in future evaluations,
+    // gradually reducing available budget (DoS-like). By incrementing first, a failure
+    // in append() leaves the counter incremented (safe direction: over-counting budget
+    // usage, which is conservative) without a phantom log entry.
     await this.ensureKeyWithTTL(context, counterKey, windowSeconds);
     await context.store.increment(counterKey, amount);
     incrementedKeys.push({ key: counterKey, amount, ttl: windowSeconds });
+    // Record this transaction in the sliding window log (after successful increment)
+    await context.store.append(logKey, `${now}:${amount}`);
 
     return null;
   }
@@ -391,6 +454,87 @@ export class SpendingLimitRule implements PolicyRule {
         // Best-effort rollback — failure here means a slight under-count (safe direction)
       }
     }
+  }
+
+  /**
+   * CRIT-12 fix: Garbage-collect expired entries from a sliding window log list.
+   *
+   * The sliding window implementation appends "timestamp:amount" entries to store lists
+   * but never removes them once they fall outside the window. Over time, this causes
+   * lists to grow unboundedly until they hit MAX_LIST_SIZE (100,000), wasting memory/disk
+   * and degrading getRecent() scan performance.
+   *
+   * This method:
+   * 1. Checks if GC is due for this key (throttled to once per GC_THROTTLE_MS per key).
+   * 2. Retrieves all recent entries (up to MAX_WINDOW_ENTRIES).
+   * 3. Filters to only entries within the current window.
+   * 4. If the expired ratio exceeds GC_EXPIRED_RATIO and there are at least GC_MIN_ENTRIES,
+   *    rewrites the list by clearing it and re-appending only the valid entries.
+   *
+   * The clear+re-append is NOT atomic, but this is safe because:
+   * - The AgentWallet.execute() mutex ensures only one evaluation runs at a time.
+   * - A concurrent append during GC would be from the same evaluation (which calls GC
+   *   before appending), so no data loss occurs.
+   * - If clearList is not available on the store, GC is silently skipped (the MAX_LIST_SIZE
+   *   eviction in the store acts as a fallback safety net).
+   */
+  private async garbageCollectWindow(
+    context: PolicyContext,
+    logKey: string,
+    windowStartMs: number,
+  ): Promise<void> {
+    const now = context.now;
+
+    // Throttle: skip if GC ran recently for this key
+    const lastGc = this.lastGcTimestamp.get(logKey) ?? 0;
+    if (now - lastGc < GC_THROTTLE_MS) {
+      return;
+    }
+
+    // Retrieve all entries to assess how many are expired
+    const allEntries = await context.store.getRecent(logKey, MAX_WINDOW_ENTRIES);
+    if (allEntries.length < GC_MIN_ENTRIES) {
+      // Not enough entries to justify GC overhead
+      this.lastGcTimestamp.set(logKey, now);
+      return;
+    }
+
+    // Partition entries into valid (within window) and expired (outside window)
+    const validEntries: string[] = [];
+    for (const entry of allEntries) {
+      const colonIdx = entry.indexOf(":");
+      if (colonIdx === -1) continue; // Malformed entry — drop it during GC
+      const ts = parseInt(entry.slice(0, colonIdx), 10);
+      if (Number.isFinite(ts) && ts >= windowStartMs) {
+        validEntries.push(entry);
+      }
+    }
+
+    const expiredCount = allEntries.length - validEntries.length;
+    const expiredRatio = expiredCount / allEntries.length;
+
+    if (expiredRatio < GC_EXPIRED_RATIO) {
+      // Not enough expired entries to justify rewrite
+      this.lastGcTimestamp.set(logKey, now);
+      return;
+    }
+
+    // Check if the store supports clearList (it's optional on the Store interface)
+    if (typeof context.store.clearList !== "function") {
+      // Store doesn't support clearList — rely on MAX_LIST_SIZE eviction as fallback
+      this.lastGcTimestamp.set(logKey, now);
+      return;
+    }
+
+    // Rewrite the list: clear and re-append only valid entries.
+    // validEntries are in newest-first order (from getRecent), so reverse to
+    // re-append in chronological order (oldest first) to preserve ordering.
+    await context.store.clearList(logKey);
+    for (let i = validEntries.length - 1; i >= 0; i--) {
+      await context.store.append(logKey, validEntries[i]!);
+    }
+
+    this.lastGcTimestamp.set(logKey, now);
   }
 
   /**
@@ -469,7 +613,9 @@ export class SpendingLimitRule implements PolicyRule {
 
     // Retrieve recent USD transaction records and sum within sliding window
     const recentEntries = await context.store.getRecent(logKey, MAX_WINDOW_ENTRIES);
-    let windowTotal = 0;
+    // POLICY-002 fix: Accumulate in BigInt space to prevent floating-point drift.
+    // Same rationale as slidingWindowCheckLimit — see POLICY-002 for details.
+    let windowTotalBi = 0n;
     for (const entry of recentEntries) {
       const colonIdx = entry.indexOf(":");
       if (colonIdx === -1) continue;
@@ -477,13 +623,22 @@ export class SpendingLimitRule implements PolicyRule {
       const amt = parseFloat(entry.slice(colonIdx + 1));
       // MED-T3-01 fix: Reject negative amounts (see slidingWindowCheckLimit for rationale)
       if (ts >= windowStartMs && Number.isFinite(amt) && amt >= 0) {
-        windowTotal += amt;
+        windowTotalBi += toBigIntScaled(amt);
       }
     }
 
-    const projectedTotal = windowTotal + usdValue;
+    // CRIT-12 fix: Garbage-collect expired entries from the USD sliding window log.
+    // Same rationale as slidingWindowCheckLimit — see CRIT-12 for details.
+    await this.garbageCollectWindow(context, logKey, windowStartMs);
 
-    if (safeGt(projectedTotal, limit)) {
+    const projectedTotalBi = windowTotalBi + toBigIntScaled(usdValue);
+    const limitBi = toBigIntScaled(limit);
+
+    // POLICY-002 fix: Compare entirely in BigInt space — no float conversion needed
+    // HIGH-21 fix: Use >= instead of > to deny transactions that would bring the total
+    // exactly to the limit. The previous > comparison allowed one extra transaction that
+    // hit the limit precisely, creating an off-by-one bypass.
+    if (projectedTotalBi >= limitBi) {
       // M-61 FIX: Sanitized denial message — does not reveal window type or token details
       return {
         decision: "DENY",
@@ -492,12 +647,13 @@ export class SpendingLimitRule implements PolicyRule {
       };
     }
 
-    // Record this USD transaction in the sliding window log
-    await context.store.append(logKey, `${now}:${usdValue}`);
-    // Also maintain the atomic counter for backwards compatibility
+    // POLICY-005 fix: Increment counter BEFORE appending to sliding window log.
+    // See token variant above for rationale on ordering.
     await this.ensureKeyWithTTL(context, counterKey, windowSeconds);
     await context.store.increment(counterKey, usdValue);
     incrementedKeys.push({ key: counterKey, amount: usdValue, ttl: windowSeconds });
+    // Record this USD transaction in the sliding window log (after successful increment)
+    await context.store.append(logKey, `${now}:${usdValue}`);
 
     return null;
   }
@@ -525,7 +681,10 @@ export class SpendingLimitRule implements PolicyRule {
       const usdValue = await context.getValueInUSD(token, amount);
 
       // H-04 FIX: Reject non-finite, negative, or zero USD values
-      if (!Number.isFinite(usdValue) || usdValue < 0) {
+      // POLICY-012 fix: Reject zero USD values in addition to negative. A zero USD
+      // value means the oracle returned $0 for a non-zero token amount, which is
+      // either an oracle error or manipulation. Allowing zero bypasses USD spending limits.
+      if (!Number.isFinite(usdValue) || usdValue <= 0) {
         return null;
       }
 
@@ -590,6 +749,19 @@ export class SpendingLimitRule implements PolicyRule {
         }
       }
 
+      // POLICY-017 fix: Reject amounts with leading zeros (e.g., "007", "00.5").
+      // Leading zeros can cause ambiguity (octal interpretation in some parsers) and
+      // may indicate malformed input intended to bypass limit comparisons.
+      // Exception: "0" and "0.xxx" are valid (single leading zero before decimal point).
+      if (/^0\d/.test(params.amount)) {
+        process.emitWarning(
+          `Amount "${params.amount}" has leading zeros, which is ambiguous. ` +
+          `Rejecting to prevent potential parsing inconsistencies.`,
+          "KovaAmountWarning",
+        );
+        return null;
+      }
+
       // POLICY-010 fix: BigInt-based amount extraction for integer amounts.
       // If the amount string represents a pure integer (no decimal point), parse as
       // BigInt first for precision, then convert to number with a safety check.
@@ -603,9 +775,10 @@ export class SpendingLimitRule implements PolicyRule {
             // via CRIT-01), but the silent failure could mask upstream bugs that produce
             // invalid amounts. The warning aids debugging without changing behavior.
             if (bigAmount < 0n) {
-              console.warn(
-                `[kova:SpendingLimitRule] Negative integer amount "${params.amount}" encountered in extractAmount. ` +
-                `This is treated as unquantifiable (DENY). Investigate upstream intent construction.`,
+              process.emitWarning(
+                "Negative integer amount encountered in extractAmount. " +
+                "This is treated as unquantifiable (DENY). Investigate upstream intent construction.",
+                { code: "KOVA_SPENDING_LIMIT_WARNING" },
               );
             }
             return null;
@@ -634,9 +807,10 @@ export class SpendingLimitRule implements PolicyRule {
         // Fail-closed: negative amounts are treated as 0 spend (returns null -> DENY),
         // but imprecise diagnostics could mask bugs in upstream intent construction.
         if (Number.isFinite(parsed) && parsed < 0) {
-          console.warn(
-            `[kova:SpendingLimitRule] Negative decimal amount "${params.amount}" encountered in extractAmount. ` +
-            `This is treated as unquantifiable (DENY). Investigate upstream intent construction.`,
+          process.emitWarning(
+            "Negative decimal amount encountered in extractAmount. " +
+            "This is treated as unquantifiable (DENY). Investigate upstream intent construction.",
+            { code: "KOVA_SPENDING_LIMIT_WARNING" },
           );
         }
         return null;

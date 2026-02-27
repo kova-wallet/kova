@@ -43,6 +43,14 @@ export interface PolicyContext {
    * Enables USD-normalized spending limits that prevent cross-token evasion.
    */
   getValueInUSD?: (token: string, amount: string) => Promise<number>;
+  /**
+   * CRIT-10 fix: When true, indicates this is a Phase 1 dry-run evaluation.
+   * Rules with external side effects (e.g., ApprovalGateRule sending approval
+   * requests to humans) should skip the side effect and return ALLOW, deferring
+   * the actual side effect to Phase 2 (commit). This prevents duplicate approval
+   * requests caused by the two-phase evaluation pattern (H-09/M-01).
+   */
+  dryRun?: boolean;
 }
 
 /**
@@ -147,6 +155,19 @@ export interface ApprovalGateConfig {
   channel?: "telegram" | "slack" | "custom";
   /** Timeout in milliseconds. Defaults to 300_000 (5 min) */
   timeout?: number;
+  /**
+   * HIGH-08 fix: Rolling window (in seconds) for cumulative amount tracking.
+   * When configured, the approval gate tracks cumulative spending within this window
+   * and requires approval when the cumulative total exceeds the threshold — even if
+   * each individual transaction is below the per-transaction threshold. This prevents
+   * fragmentation attacks where an agent splits a large transfer into many small ones
+   * to avoid triggering the approval gate.
+   *
+   * Example: cumulativeWindow: 3600 (1 hour) with above: { amount: "10", token: "SOL" }
+   * means that if cumulative SOL transfers within the past hour exceed 10 SOL,
+   * approval is required even if each individual transfer is below 10 SOL.
+   */
+  cumulativeWindow?: number;
 }
 
 /** Cooldown configuration */

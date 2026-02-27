@@ -111,6 +111,11 @@ import {
 import { Keypair } from "@solana/web3.js";
 import bs58 from "bs58";
 const store = new MemoryStore({ dangerouslyAllowInProduction: true });
+// ⚠️ SECURITY WARNING: Environment variables are NOT safe for private keys in production.
+// Keys in env vars are exposed via /proc/[pid]/environ, `ps e`, shell history, and logging systems.
+// Use MpcSigner with a hardware-backed provider (e.g., Turnkey, Fireblocks) or a secrets manager instead.
+// See the MPC Signing tutorial: /tutorials/turnkey-mpc
+// This pattern is acceptable ONLY for local development and testing.
 const keypair = Keypair.fromSecretKey(bs58.decode(process.env.WALLET_PRIVATE_KEY!));
 const signer = new LocalSigner(keypair, { dangerouslyAllowInProduction: true });
 const chain = new SolanaAdapter({ rpcUrl: process.env.SOLANA_RPC_URL! });
@@ -187,6 +192,11 @@ import {
 
 // --- Wallet setup ---
 const store = new MemoryStore({ dangerouslyAllowInProduction: true });
+// ⚠️ SECURITY WARNING: Environment variables are NOT safe for private keys in production.
+// Keys in env vars are exposed via /proc/[pid]/environ, `ps e`, shell history, and logging systems.
+// Use MpcSigner with a hardware-backed provider (e.g., Turnkey, Fireblocks) or a secrets manager instead.
+// See the MPC Signing tutorial: /tutorials/turnkey-mpc
+// This pattern is acceptable ONLY for local development and testing.
 const keypair = Keypair.fromSecretKey(bs58.decode(process.env.WALLET_PRIVATE_KEY!));
 const signer = new LocalSigner(keypair, { dangerouslyAllowInProduction: true });
 const chain = new SolanaAdapter({ rpcUrl: process.env.SOLANA_RPC_URL! });

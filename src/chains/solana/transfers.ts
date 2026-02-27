@@ -579,11 +579,18 @@ export async function addPriorityFee(
       }),
     );
   } catch (err) {
-    // LOW-07 fix: Only catch network/fetch errors; re-throw unexpected errors.
-    // Previously, all errors were silently caught, which could mask programming
-    // errors, serialization issues, or other bugs unrelated to RPC connectivity.
-    const message = err instanceof Error ? err.message.toLowerCase() : String(err).toLowerCase();
-    if (!message.includes("fetch") && !message.includes("network")) {
+    // CHAIN-006 fix: Improved error classification for priority fee estimation failures.
+    // Previously used fragile string matching ("fetch"/"network") which could miss
+    // legitimate network errors with different messages or catch false positives.
+    // Now uses a structured approach: check error codes and types first, then fall
+    // back to string matching with an expanded keyword set.
+    const isNetworkError =
+      (err instanceof TypeError && (err as Error).message.includes("fetch")) || // Node.js fetch TypeError
+      (err instanceof Error && "code" in err && typeof (err as Record<string, unknown>).code === "string" &&
+        ["ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "ENOTFOUND", "EAI_AGAIN", "EPIPE", "EHOSTUNREACH"].includes(
+          (err as Record<string, unknown>).code as string)) ||
+      (err instanceof Error && err.message.toLowerCase().match(/\b(fetch|network|timeout|econnrefused|dns|socket|abort)\b/) !== null);
+    if (!isNetworkError) {
       throw err;
     }
 

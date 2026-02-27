@@ -93,6 +93,7 @@ export default defineConfig({
             { text: 'Portfolio Rebalancer', link: '/tutorials/portfolio-rebalancer' },
             { text: 'Tipping Bot', link: '/tutorials/tipping-bot' },
             { text: 'DeFi Agent', link: '/tutorials/defi-agent' },
+            { text: 'Kova Dashboard', link: '/tutorials/dashboard' },
             { text: 'Production Deployment', link: '/tutorials/production' },
           ],
         },

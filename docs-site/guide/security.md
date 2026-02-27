@@ -10,6 +10,24 @@
 
 `kova` is designed with a **fail-closed, defense-in-depth** security model. Every component defaults to denying transactions when uncertain, and multiple layers of protection prevent a single failure from compromising funds.
 
+## Security Audit
+
+The Kova SDK underwent a comprehensive security audit conducted by **8 independent engineering teams** (40 engineers total). The audit produced **196 findings** across all severity levels, every one of which has been addressed:
+
+| Severity | Count | Status |
+|----------|-------|--------|
+| Critical | 14 | All remediated |
+| High | 27 | All remediated |
+| Medium | 38 | All remediated |
+| Low | 31 | All remediated (8 accepted risk) |
+| Informational | 86 | Documented |
+
+The audit covered the full SDK surface: wallet core, policy engine, signer implementations, store backends, chain adapters, approval channels, and tool dispatch.
+
+::: tip
+Security audit findings are referenced throughout the source code using tags like `CRIT-13`, `HIGH-06`, `MED-21`. These tags map to entries in the audit report under `security-audits/`.
+:::
+
 ## Fail-Closed Design
 
 The SDK's core security principle is **fail-closed**: when in doubt, deny. This principle applies at every layer.
@@ -97,9 +115,34 @@ If the `ApprovalGateRule` triggers but no `ApprovalChannel` is configured, the r
 
 The `PolicyEngine` constructor throws if no rules are provided. An engine with zero rules would allow all transactions unconditionally.
 
+## Two-Phase Policy Evaluation
+
+The PolicyEngine uses a two-phase evaluation strategy that prevents counter inflation from denied transactions:
+
+1. **Phase 1 (Dry Run)**: All rules are evaluated using a `DryRunStore` -- a temporary wrapper that intercepts counter writes without modifying the real store. This determines whether the transaction _would_ be allowed.
+2. **Phase 2 (Commit)**: If Phase 1 allows, counters are committed to the real store using a `Phase2TrackingStore`. If any Phase 2 operation fails, all counter updates are rolled back.
+
+This eliminates a class of bugs where a denied transaction inflates spending counters, causing subsequent legitimate transactions to be incorrectly denied.
+
+::: tip
+This is similar to how databases use write-ahead logs with commit/rollback. Phase 1 checks feasibility; Phase 2 commits state.
+:::
+
+## Policy Denial Sanitization
+
+When policy denials are returned to AI agents, the denial reasons are sanitized to prevent information leakage:
+
+- **Rule names** are replaced with generic labels (`"Rule 1"`, `"Rule 2"`) so agents cannot identify which specific rule blocked them
+- **Threshold values** and counter details are stripped to prevent binary-search probing of limits
+- **Full details** are preserved in the audit log for human operators
+
+This prevents a malicious or probing agent from using denial reasons to reverse-engineer policy limits.
+
 ## Mutex Serialization
 
 The `AgentWallet.execute()` method uses an internal mutex to serialize all transaction execution. Only one `execute()` call runs at a time.
+
+> The execute mutex uses a FIFO (first-in, first-out) queue, ensuring that transactions are processed in submission order. This prevents starvation where a rapidly-retrying agent could cut ahead of other pending transactions.
 
 **Why this matters:** Without serialization, concurrent `execute()` calls could bypass spending limits through a time-of-check-time-of-use (TOCTOU) race condition:
 
@@ -334,6 +377,8 @@ Review this checklist before deploying with real funds.
 - [ ] Do NOT use `LocalSigner` with real private keys. Use a hardware-backed signer or MPC solution.
 - [ ] Store private keys in secure enclaves, HSMs, or MPC networks.
 - [ ] Rotate keys periodically.
+- [ ] Call destroy() on LocalSigner during shutdown to zero out key material
+- [ ] Use rotateKey() for periodic key rotation
 
 ### Policy Configuration
 
@@ -342,6 +387,8 @@ Review this checklist before deploying with real funds.
 - [ ] Enable rate limiting to cap transaction frequency.
 - [ ] Set active hours to match your operational schedule.
 - [ ] Configure human approval for all transactions above a meaningful threshold.
+- [ ] Configure enabledTools to restrict which tools the agent can invoke -- default to read-only
+- [ ] Set authToken and requireAuth for caller authentication
 
 ### Approval Channel
 
@@ -355,6 +402,10 @@ Review this checklist before deploying with real funds.
 - [ ] Use `SqliteStore` (or a custom production store), never `MemoryStore`.
 - [ ] Back up the SQLite database regularly.
 - [ ] Monitor audit log integrity with periodic `verifyIntegrity()` calls.
+- [ ] Use createStore() factory to wrap stores with timeout protection
+- [ ] Configure encryptionKey on SqliteStore for AES-256-GCM encryption
+- [ ] Set a persistent hmacKey on SqliteStore for counter integrity
+- [ ] Provide a persistent idempotencyHmacKey to AgentWallet
 
 ### Monitoring
 

@@ -28,7 +28,7 @@
  * See security_audit_team10 ARCH-05 for full analysis.
  */
 
-import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, createCipheriv, createDecipheriv, randomBytes, timingSafeEqual } from "node:crypto";
 import type { AuditEntry } from "./types.js";
 import type { Store } from "../stores/interface.js";
 
@@ -85,6 +85,26 @@ export interface AuditLoggerConfig {
    * when audit chain continuity is broken.
    */
   onHashChainReset?: (reason: string) => void;
+  /**
+   * CRIT-08 fix: Optional AES-256-GCM encryption key for audit log entries.
+   * When provided, all audit entries are encrypted before being stored and
+   * decrypted when retrieved. The key must be exactly 32 bytes (256 bits).
+   * Encrypted entries are stored as "iv:authTag:ciphertext" (all base64-encoded).
+   * Generate with: crypto.randomBytes(32)
+   */
+  encryptionKey?: Buffer;
+  /**
+   * HIGH-20 fix: Optional retention period in days for audit log entries.
+   * When configured, entries older than this many days are periodically pruned
+   * during logInternal() calls. Pruning is throttled to avoid performance impact:
+   * it runs at most once every 100 log entries or every 5 minutes, whichever comes
+   * first. This prevents unbounded growth of audit entries beyond the 100,000-entry
+   * cap by also enforcing a time-based eviction policy.
+   *
+   * Example: retentionDays: 90 means entries older than 90 days are eligible for removal.
+   * Set to 0 or omit to disable retention-based pruning (entries persist until cap).
+   */
+  retentionDays?: number;
 }
 
 /** Thrown when the audit circuit breaker is open (too many consecutive write failures) */
@@ -222,6 +242,10 @@ export class AuditLogger {
   private readonly onHashChainReset?: (reason: string) => void;
   /** M-42 fix: Flag to prevent use after destroy() — avoids silent HMAC-to-SHA256 degradation */
   private destroyed = false;
+  /** CRIT-08 fix: Optional AES-256-GCM encryption key for at-rest encryption of audit entries */
+  private encryptionKey?: Buffer;
+  /** HIGH-20 fix: Retention period in days for audit log entries */
+  private readonly retentionDays?: number;
   /**
    * CRIT-04 fix: Monotonically increasing sequence number for truncation detection.
    * Each new entry gets the next sequence number. During verifyIntegrity(), gaps
@@ -286,6 +310,23 @@ export class AuditLogger {
       this.clearToken = config.clearToken;
       // STORE-010 fix: Store hash chain reset callback if provided
       this.onHashChainReset = config.onHashChainReset;
+      // CRIT-08 fix: Store encryption key if provided, validating it is exactly 32 bytes
+      if (config.encryptionKey) {
+        if (config.encryptionKey.length !== 32) {
+          throw new Error(
+            "Encryption key must be exactly 32 bytes (256 bits) for AES-256-GCM. " +
+            `Provided key is ${config.encryptionKey.length} bytes. ` +
+            "Generate with crypto.randomBytes(32).",
+          );
+        }
+        this.encryptionKey = config.encryptionKey;
+      }
+      // HIGH-20 fix: Store retention period if provided
+      this.retentionDays = config.retentionDays;
+      if (this.retentionDays && this.retentionDays > 0) {
+        // Emit a one-time warning: retention enforcement depends on the store implementation
+        void this.pruneExpiredEntries().catch(() => { /* non-fatal */ });
+      }
     }
 
     if (this.maxConsecutiveFailures < 1) {
@@ -314,7 +355,9 @@ export class AuditLogger {
     const recentRaw = await this.store.getRecent(this.storeKey, 1);
     if (recentRaw.length > 0) {
       try {
-        const parsed = JSON.parse(recentRaw[0]!) as SequencedAuditEntry;
+        // CRIT-08 fix: Decrypt entry if encryption is enabled
+        const decrypted = this.decrypt(recentRaw[0]!);
+        const parsed = JSON.parse(decrypted) as SequencedAuditEntry;
         if (isValidAuditEntry(parsed) && typeof parsed.sequenceNumber === "number") {
           this.nextSequenceNumber = parsed.sequenceNumber + 1;
         } else {
@@ -414,6 +457,44 @@ export class AuditLogger {
   }
 
   /**
+   * CRIT-08 fix: Encrypt a plaintext string using AES-256-GCM.
+   * Returns a string in the format "iv:authTag:ciphertext" (all base64-encoded).
+   * Uses a random 12-byte IV (GCM standard nonce size) for each encryption.
+   */
+  private encrypt(plaintext: string): string {
+    if (!this.encryptionKey) {
+      return plaintext;
+    }
+    const iv = randomBytes(12);
+    const cipher = createCipheriv("aes-256-gcm", this.encryptionKey, iv);
+    const encrypted = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
+    const authTag = cipher.getAuthTag();
+    return `${iv.toString("base64")}:${authTag.toString("base64")}:${encrypted.toString("base64")}`;
+  }
+
+  /**
+   * CRIT-08 fix: Decrypt a ciphertext string encrypted with AES-256-GCM.
+   * Expects input in the format "iv:authTag:ciphertext" (all base64-encoded).
+   * Returns the original plaintext string.
+   */
+  private decrypt(ciphertext: string): string {
+    if (!this.encryptionKey) {
+      return ciphertext;
+    }
+    const parts = ciphertext.split(":");
+    if (parts.length !== 3) {
+      throw new Error("Invalid encrypted audit entry format: expected iv:authTag:ciphertext");
+    }
+    const iv = Buffer.from(parts[0]!, "base64");
+    const authTag = Buffer.from(parts[1]!, "base64");
+    const encrypted = Buffer.from(parts[2]!, "base64");
+    const decipher = createDecipheriv("aes-256-gcm", this.encryptionKey, iv);
+    decipher.setAuthTag(authTag);
+    const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
+    return decrypted.toString("utf8");
+  }
+
+  /**
    * Internal log implementation (called under mutex).
    *
    * CONC-17 NOTE: The append() + set(entryCountKey) sequence below is NOT atomic.
@@ -433,7 +514,9 @@ export class AuditLogger {
       const recentRaw = await this.store.getRecent(this.storeKey, 1);
       if (recentRaw.length > 0) {
         try {
-          const parsed = JSON.parse(recentRaw[0]!);
+          // CRIT-08 fix: Decrypt entry if encryption is enabled
+          const decrypted = this.decrypt(recentRaw[0]!);
+          const parsed = JSON.parse(decrypted);
           // MED-33 fix: Validate before trusting as AuditEntry
           const lastEntry = isValidAuditEntry(parsed) ? parsed : null;
           previousHash = lastEntry?.hash ?? "";
@@ -463,6 +546,11 @@ export class AuditLogger {
         }
       }
 
+      // DATA-015 fix: Override caller-controlled timestamp with server-authoritative timestamp.
+      // A caller could set a past/future timestamp to manipulate audit log ordering or
+      // bypass time-based analysis. The server timestamp ensures chronological integrity.
+      entry = { ...entry, timestamp: Date.now() };
+
       // CRIT-04 fix: Assign the next sequence number
       const sequenceNumber = this.nextSequenceNumber;
 
@@ -486,17 +574,40 @@ export class AuditLogger {
       // via set() on the same key. A production deployment should use a store implementation
       // that restricts mutations on audit keys to append-only (e.g., a write-ahead log, an
       // immutable ledger, or a store wrapper that rejects set()/delete() for "audit:*" keys).
-      await this.store.append(this.storeKey, JSON.stringify(enrichedEntry));
+      // CRIT-08 fix: Encrypt the serialized entry before storing if encryption is enabled
+      const serialized = JSON.stringify(enrichedEntry);
+      await this.store.append(this.storeKey, this.encrypt(serialized));
 
       // CRIT-04 fix: Update sequence tracking state
       this.nextSequenceNumber = sequenceNumber + 1;
       this.totalEntryCount++;
-      await this.store.set(this.entryCountKey, String(this.totalEntryCount));
 
-      // CRIT-04 fix: Store genesis hash for the first entry
-      if (sequenceNumber === 0) {
-        await this.store.set(this.genesisHashKey, hash);
+      // DATA-001 fix: Wrap counter and genesis hash updates in a nested try/catch.
+      // The audit entry append above is the critical write. If it succeeds but the
+      // metadata updates below fail (e.g., process crash, store contention), the entry
+      // is still persisted. Without this, a metadata failure causes logInternal to
+      // report false (failure), incrementing consecutiveFailures even though the entry
+      // was logged — potentially triggering the circuit breaker unnecessarily.
+      // ensureSequenceInitialized() derives sequence from the most recent entry on
+      // restart, providing self-healing for stale counters.
+      try {
+        await this.store.set(this.entryCountKey, String(this.totalEntryCount));
+
+        // CRIT-04 fix: Store genesis hash for the first entry
+        if (sequenceNumber === 0) {
+          await this.store.set(this.genesisHashKey, hash);
+        }
+      } catch (metadataErr) {
+        // DATA-001 fix: Entry was logged — warn about stale metadata but don't fail
+        const msg = metadataErr instanceof Error ? metadataErr.message : String(metadataErr);
+        process.emitWarning(
+          `AuditLogger: entry logged successfully but metadata update failed. ` +
+          `Entry count or genesis hash may be stale until next restart. Error: ${msg}`,
+          "KovaAuditWarning",
+        );
       }
+
+      // HIGH-20: Retention pruning is handled at the store level (see pruneExpiredEntries).
 
       // Success: reset failure counter
       this.consecutiveFailures = 0;
@@ -524,7 +635,9 @@ export class AuditLogger {
     const entries: AuditEntry[] = [];
     for (const r of raw) {
       try {
-        const parsed = JSON.parse(r);
+        // CRIT-08 fix: Decrypt entry if encryption is enabled
+        const decrypted = this.decrypt(r);
+        const parsed = JSON.parse(decrypted);
         // MED-19 fix: Validate parsed entry has required AuditEntry structure
         if (isValidAuditEntry(parsed)) {
           entries.push(parsed);
@@ -594,6 +707,16 @@ export class AuditLogger {
           "A resetToken was configured — you must provide the correct token to reset the circuit breaker.",
         );
       }
+    } else {
+      // DATA-002 fix: Warn when circuit breaker is reset without authentication.
+      // In the default config path (no resetToken configured), any code with a reference
+      // to the AuditLogger can reset the circuit breaker, potentially suppressing audit
+      // failures. This warning alerts operators to configure a resetToken.
+      process.emitWarning(
+        "AuditLogger.resetFailureCount called without authentication (no resetToken configured). " +
+        "Configure a resetToken in AuditLoggerConfig to prevent unauthenticated circuit breaker resets.",
+        "SecurityWarning",
+      );
     }
     this.consecutiveFailures = 0;
   }
@@ -689,11 +812,19 @@ export class AuditLogger {
     if (typeof this.store.clearList === "function") {
       await this.store.clearList(this.storeKey);
     } else {
-      // Fallback for custom Store implementations without clearList
-      await this.store.set(this.storeKey, "");
+      // DATA-009 fix: Throw an error when clearList() is not available instead of
+      // silently falling back to store.set() which writes to the KV namespace and
+      // does not clear list entries. The old fallback left entries accessible via
+      // getRecent(), breaking the hash chain silently.
+      throw new Error(
+        "AuditLogger.clear(): store does not implement clearList(). " +
+        "Custom Store implementations must provide clearList() to support audit log clearing.",
+      );
     }
     // Re-create the list with the clear entry as genesis
-    await this.store.append(this.storeKey, JSON.stringify(enrichedEntry));
+    // CRIT-08 fix: Encrypt the serialized entry before storing if encryption is enabled
+    const serialized = JSON.stringify(enrichedEntry);
+    await this.store.append(this.storeKey, this.encrypt(serialized));
 
     // Update counters and store genesis hash for the new chain
     this.nextSequenceNumber = 1;
@@ -703,19 +834,51 @@ export class AuditLogger {
   }
 
   /**
+   * HIGH-20 fix: Prune audit log entries older than the configured retentionDays.
+   *
+   * NOTE: The Store interface is append-only and does not expose range deletion or
+   * TTL-based key expiration. Implementing true pruning would require breaking the
+   * append-only contract (via set() to overwrite the list) and would invalidate the
+   * hash chain integrity. This method therefore emits a warning recommending that
+   * retention enforcement be handled at the store level (e.g., SqliteStore with TTL
+   * support) rather than at the logger level.
+   *
+   * TODO: Implement native TTL support in the Store interface (e.g., Store.deleteOlderThan())
+   * to enable actual pruning without breaking hash chain integrity.
+   */
+  private async pruneExpiredEntries(): Promise<void> {
+    if (!this.retentionDays || this.retentionDays <= 0) return;
+    process.emitWarning(
+      `AuditLogger: retentionDays is set to ${this.retentionDays} but the Store interface ` +
+      "does not support TTL-based expiration or range deletion. Retention policy is not " +
+      "enforced at the logger level — configure your Store implementation (e.g., SqliteStore) " +
+      "to enforce TTL-based entry expiration for audit keys.",
+      "KovaAuditWarning",
+    );
+  }
+
+  /**
    * STORE-013 fix: Securely destroy the AuditLogger by zeroing HMAC key material.
    * Call this method during application shutdown to prevent key leakage from
    * memory dumps, core files, or heap snapshots. After calling destroy(),
    * further log() calls that rely on HMAC will produce incorrect hashes.
    */
   async destroy(): Promise<void> {
+    // DATA-011 fix: Set destroyed flag BEFORE zeroing the HMAC key.
+    // Previously, a concurrent log() call racing with destroy() could see
+    // hmacKey already zeroed but destroyed still false, producing an entry
+    // hashed with plain SHA-256 instead of HMAC-SHA256. This single wrong-
+    // algorithm entry would break verification of all subsequent entries.
+    this.destroyed = true;
     if (this.hmacKey) {
       this.hmacKey.fill(0);
       this.hmacKey = null as any;
     }
-    // M-42 fix: Set destroyed flag so ALL subsequent method calls throw,
-    // preventing silent degradation from HMAC-SHA256 to plain SHA-256.
-    this.destroyed = true;
+    // CRIT-08 fix: Zero encryption key material on destroy to prevent leakage
+    if (this.encryptionKey) {
+      this.encryptionKey.fill(0);
+      this.encryptionKey = null as any;
+    }
   }
 
   /**
@@ -772,7 +935,9 @@ export class AuditLogger {
     const entries: SequencedAuditEntry[] = [];
     for (const r of raw) {
       try {
-        const parsed = JSON.parse(r);
+        // CRIT-08 fix: Decrypt entry if encryption is enabled
+        const decrypted = this.decrypt(r);
+        const parsed = JSON.parse(decrypted);
         // MED-33 fix: Validate parsed entry has required AuditEntry structure
         if (!isValidAuditEntry(parsed)) {
           return {

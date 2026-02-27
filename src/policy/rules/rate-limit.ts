@@ -113,6 +113,12 @@ export class RateLimitRule implements PolicyRule {
         const key = `${this.scopedKeyPrefix}minute`;
         await this.ensureKeyWithTTL(context, key, TTL.minute);
         const newCount = await context.store.increment(key, 1);
+        // HIGH-22 fix: Re-apply TTL after increment to close the race where the TTL
+        // expires between setIfNotExists and increment. If that happens, increment()
+        // creates a new counter without a TTL that never expires, permanently blocking
+        // the rate limit. By unconditionally re-setting with the TTL, we ensure the
+        // counter always expires even if the initial TTL was lost.
+        await this.reapplyTTLIfNeeded(context, key, String(newCount), TTL.minute);
         incrementedKeys.push({ key, ttl: TTL.minute });
 
         if (newCount > this.config.maxTransactionsPerMinute) {
@@ -133,6 +139,8 @@ export class RateLimitRule implements PolicyRule {
         const key = `${this.scopedKeyPrefix}hour`;
         await this.ensureKeyWithTTL(context, key, TTL.hour);
         const newCount = await context.store.increment(key, 1);
+        // HIGH-22 fix: Re-apply TTL after increment (see minute block comment above)
+        await this.reapplyTTLIfNeeded(context, key, String(newCount), TTL.hour);
         incrementedKeys.push({ key, ttl: TTL.hour });
 
         if (newCount > this.config.maxTransactionsPerHour) {
@@ -162,7 +170,14 @@ export class RateLimitRule implements PolicyRule {
   ): Promise<void> {
     for (const { key } of incrementedKeys) {
       try {
-        await context.store.increment(key, -1);
+        // POLICY-006 fix: Clamp to zero after decrement to prevent negative counters.
+        // If the counter's TTL expires between increment and rollback, the counter
+        // resets to 0 and decrementing produces -1, which would grant one extra
+        // transaction beyond the configured rate limit.
+        const newValue = await context.store.increment(key, -1);
+        if (newValue < 0) {
+          await context.store.set(key, "0");
+        }
       } catch {
         // Best-effort rollback — failure here means a slight under-count (safe direction)
       }
@@ -176,5 +191,35 @@ export class RateLimitRule implements PolicyRule {
    */
   private async ensureKeyWithTTL(context: PolicyContext, key: string, ttl: number): Promise<void> {
     await context.store.setIfNotExists(key, "0", ttl);
+  }
+
+  /**
+   * HIGH-22 fix: Re-apply TTL on a counter key after increment to close the race
+   * where the TTL set by setIfNotExists expires before increment() runs. In that
+   * scenario, increment() creates a new counter entry without a TTL, causing the
+   * counter to persist indefinitely and permanently block the rate limit once it
+   * reaches the threshold. By checking whether the counter lost its TTL (via get()
+   * returning a value that was just incremented from zero with no prior key), we
+   * unconditionally re-set the value with the TTL to ensure expiration.
+   *
+   * This uses set() which overwrites the value with TTL. It is safe because:
+   * 1. The wallet's execute mutex serializes all evaluations (no concurrent increment)
+   * 2. We use the value returned by increment() so no data is lost
+   * 3. The TTL is always the full window duration (not remaining time), which at
+   *    worst extends the window slightly — the safe direction for rate limiting
+   */
+  private async reapplyTTLIfNeeded(
+    context: PolicyContext,
+    key: string,
+    value: string,
+    ttl: number,
+  ): Promise<void> {
+    // If the counter was just created by increment() (value is 1 after our increment
+    // of 1), the TTL from setIfNotExists may have expired. Re-apply to be safe.
+    // For higher counts, the key already existed with a TTL, so this is a no-op
+    // in terms of correctness (it refreshes the TTL, which is the safe direction).
+    // We always re-apply rather than checking, because checking would introduce
+    // another TOCTOU window.
+    await context.store.set(key, value, ttl);
   }
 }

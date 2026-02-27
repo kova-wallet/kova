@@ -133,22 +133,22 @@ describe("Agent Demo — E2E Workflow", () => {
 
       const summary = await wallet.getPolicy();
 
-      // Spending limits — HIGH-T3-01: amounts are redacted
+      // Spending limits — HIGH-T3-01 + MED-38: amounts and tokens are redacted
       expect(summary.spendingLimits.perTransaction).toEqual({
         amount: "[redacted]",
-        token: "SOL",
+        token: "[redacted]",
       });
       expect(summary.spendingLimits.daily).toBeDefined();
       expect(summary.spendingLimits.daily!.amount).toBe("[redacted]");
-      expect(summary.spendingLimits.daily!.token).toBe("SOL");
+      expect(summary.spendingLimits.daily!.token).toBe("[redacted]");
 
       // Rate limits — HIGH-T3-01: thresholds are redacted
       expect(summary.rateLimits).toBeDefined();
       expect(summary.rateLimits!.maxPerMinute).toBe("[redacted]" as unknown as number);
       expect(summary.rateLimits!.maxPerHour).toBe("[redacted]" as unknown as number);
 
-      // Allowlist count
-      expect(summary.allowlistedAddresses).toBe(2);
+      // Allowlist count — MED-38: counts are redacted to -1
+      expect(summary.allowlistedAddresses).toBe(-1);
     });
 
     it("getAddress() returns the mock signer address", async () => {
@@ -421,8 +421,8 @@ describe("Agent Demo — E2E Workflow", () => {
 
       expect(result.status).toBe("confirmed");
       expect(result.txId).toBeDefined();
-      // Two-phase evaluation: approval is requested in both dry-run and commit phases
-      expect(mockApproval.requestApproval).toHaveBeenCalledTimes(2);
+      // CRIT-10 fix: Approval is now only requested in Phase 2 (commit), not Phase 1 (dry-run)
+      expect(mockApproval.requestApproval).toHaveBeenCalledTimes(1);
     });
 
     it("denies when the approval channel returns rejected", async () => {

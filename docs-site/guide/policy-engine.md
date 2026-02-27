@@ -100,6 +100,14 @@ The PolicyEngine uses a **two-phase evaluation** strategy to prevent counter inf
 
 This prevents a subtle bug: if a rule increments a spending counter during evaluation, but a later rule denies the transaction, the counter would be inflated even though no money was actually spent. The two-phase approach ensures counters are only updated when the transaction actually proceeds.
 
+### How Two-Phase Evaluation Works
+
+1. **Phase 1 (Dry-Run)**: All rules are evaluated using a `DryRunStore` -- a temporary overlay that intercepts counter writes (spending increments, rate limit bumps) and records them without modifying the real store. This determines whether the transaction _would_ be allowed without side effects.
+2. **Phase 2 (Commit)**: If Phase 1 returns ALLOW, the engine re-evaluates and commits counter updates to the real store using a `Phase2TrackingStore`. If any rule fails during Phase 2, all counter updates are rolled back to maintain consistency.
+3. **Exception Handling**: If a rule throws an exception during evaluation, the result is automatically `DENY` (fail-closed). The error is captured in the audit trail but sanitized before reaching the agent.
+
+This prevents counter inflation: if rule A increments a spending counter but rule B denies the transaction, the counter would be inflated even though no money was actually spent. The two-phase approach ensures counters are only updated when the transaction proceeds.
+
 ### Sequential Rule Evaluation
 
 1. For each rule, call `rule.evaluate(intent, context)`.
@@ -241,6 +249,16 @@ interface PolicyRuleAudit {
   evaluationTimeMs: number;
 }
 ```
+
+### Denial Reason Sanitization
+
+When a policy denial is returned to an AI agent via `handleToolCall()`, the denial reason is sanitized:
+
+- Rule names are replaced with generic labels (e.g., `"Rule 1"`, `"Rule 2"`) so the agent cannot learn which specific rule blocked it
+- Counter values and threshold details are stripped
+- The full, unsanitized reason is preserved in the audit log for human operators
+
+This prevents a malicious or probing agent from reverse-engineering policy limits by analyzing denial messages.
 
 ## Engine Introspection
 

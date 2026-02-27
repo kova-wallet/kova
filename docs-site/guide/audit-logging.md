@@ -385,7 +385,11 @@ import {
 // Create a shared store for all SDK components.
 const store = new MemoryStore({ dangerouslyAllowInProduction: true });
 
-// Create a signer from a Keypair. In production, use MpcSigner.
+// ⚠️ SECURITY WARNING: Environment variables are NOT safe for private keys in production.
+// Keys in env vars are exposed via /proc/[pid]/environ, `ps e`, shell history, and logging systems.
+// Use MpcSigner with a hardware-backed provider (e.g., Turnkey, Fireblocks) or a secrets manager instead.
+// See the MPC Signing tutorial: /tutorials/turnkey-mpc
+// This pattern is acceptable ONLY for local development and testing.
 import { Keypair } from "@solana/web3.js";
 import bs58 from "bs58";
 const keypair = Keypair.fromSecretKey(bs58.decode(process.env.WALLET_PRIVATE_KEY!));

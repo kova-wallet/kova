@@ -148,6 +148,14 @@ export class TelegramApprovalBot implements ApprovalChannel {
       );
     }
 
+    // CRYPTO-005 SECURITY NOTE: The bot token is stored as an immutable JS string.
+    // Unlike Buffer/Uint8Array, strings cannot be zeroed after use because they are
+    // interned and managed by the V8 garbage collector. The token will persist in
+    // process memory until GC reclaims it. Mitigations: (1) apiBase is cleared on
+    // destroy(), (2) hmacSecret (Buffer) is zeroed on destroy(), (3) the token itself
+    // remains accessible via this.token until the instance is GC'd. For environments
+    // requiring memory-safe secret handling, consider a native addon that allocates
+    // the token in mlock'd memory outside the V8 heap.
     this.token = config.token;
     this.chatId = config.chatId;
     this.defaultTimeout = config.defaultTimeout ?? DEFAULT_TIMEOUT_MS;
@@ -171,6 +179,14 @@ export class TelegramApprovalBot implements ApprovalChannel {
     // CRIT-04 fix: Derive a proper HMAC key from the bot token using SHA-256
     // with a domain-separation prefix. This avoids using the raw bot token
     // (which is authentication material) directly as cryptographic key material.
+    //
+    // CRYPTO-004 SECURITY NOTE: This uses a single SHA-256 pass for key derivation.
+    // While adequate for Telegram bot tokens (~46 bytes of entropy), a standards-based
+    // KDF like HKDF (RFC 5869) would be more robust: it provides proper extract-expand
+    // separation, explicit salt/info parameters, and is resistant to related-key attacks.
+    // Consider upgrading to: crypto.hkdfSync("sha256", token, salt, "kova-callback-hmac", 32)
+    // if Node.js >=16 is guaranteed. This is LOW risk because the input entropy is high
+    // and the domain-separation prefix prevents collision with other SHA-256 uses.
     this.hmacSecret = createHash("sha256").update("kova-callback-hmac:" + this.token).digest();
 
     // HIGH-06 fix: Require explicit opt-in when allowedUserIds is not configured.
@@ -308,10 +324,21 @@ export class TelegramApprovalBot implements ApprovalChannel {
       throw new Error("TelegramApprovalBot has been destroyed and can no longer process requests");
     }
     // MED-18 fix: Limit concurrent/pending approval requests to prevent channel flooding
-    // HIGH-20 fix: Prune entries older than PROCESSED_REQUEST_TTL_MS (10 minutes)
+    // HIGH-20 fix: Prune entries older than PROCESSED_REQUEST_TTL_MS
     const now = Date.now();
     for (const [id, timestamp] of this.processedRequests) {
       if (now - timestamp > PROCESSED_REQUEST_TTL_MS) {
+        this.processedRequests.delete(id);
+      }
+    }
+    // INPUT-011 fix: Cap processedRequests map size to prevent unbounded growth.
+    // Even with TTL pruning, a burst of requests within the TTL window could grow
+    // the map significantly. Evict oldest entries when the cap is exceeded.
+    const MAX_PROCESSED_REQUESTS = 10_000;
+    if (this.processedRequests.size > MAX_PROCESSED_REQUESTS) {
+      const entries = [...this.processedRequests.entries()].sort((a, b) => a[1] - b[1]);
+      const toRemove = entries.slice(0, this.processedRequests.size - MAX_PROCESSED_REQUESTS);
+      for (const [id] of toRemove) {
         this.processedRequests.delete(id);
       }
     }
@@ -539,9 +566,14 @@ export class TelegramApprovalBot implements ApprovalChannel {
           // Repeated unauthorized attempts could indicate an attack in progress
           // (e.g., a compromised chat member trying to approve transactions).
           try {
+            // LOW-28 fix: Redact user identity to prevent leaking Telegram user IDs and
+            // usernames in warning messages. Show only last 4 digits of user ID, redact name entirely.
+            const redactedUserId = String(from.id).length > 4
+              ? "..." + String(from.id).slice(-4)
+              : String(from.id);
             process.emitWarning(
-              `Unauthorized approval attempt for request ${requestId} by Telegram user ${from.id} ` +
-              `(${from.first_name || "unknown"}). User is not in allowedUserIds list.`,
+              `Unauthorized approval attempt for request ${requestId} by Telegram user ${redactedUserId} ` +
+              `([redacted]). User is not in allowedUserIds list.`,
               "KovaUnauthorizedApprovalAttempt",
             );
           } catch { /* non-fatal */ }

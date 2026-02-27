@@ -59,6 +59,19 @@ import type { Store } from "../stores/interface.js";
 /** CRIT-02: Key used to detect multiple instances sharing the same store */
 const INSTANCE_KEY = "__kova_instance_id__";
 
+/** MED-33 fix: Maximum length for agentId to prevent key bloat and abuse */
+const MAX_AGENT_ID_LENGTH = 64;
+
+/** MED-33 fix: Regex for valid agentId characters (alphanumeric, hyphens, underscores) */
+const VALID_AGENT_ID_REGEX = /^[a-zA-Z0-9_-]+$/;
+
+/**
+ * MED-33 fix: Threshold for unique agentIds before emitting an abuse warning.
+ * If more than this many distinct agentIds are seen, it suggests an agent may be
+ * rotating IDs to bypass per-agent circuit breaker isolation.
+ */
+const MAX_UNIQUE_AGENT_IDS = 100;
+
 /** CRIT-02: How often (in ms) to refresh the instance heartbeat */
 const INSTANCE_HEARTBEAT_INTERVAL_MS = 15_000;
 
@@ -132,6 +145,14 @@ export class CircuitBreaker {
   private heartbeatInterval: ReturnType<typeof setInterval> | undefined;
   /** CRIT-02: Whether initialize() has been called */
   private initialized = false;
+  /**
+   * MED-33 fix: Track unique agentIds to detect potential abuse via ID rotation.
+   * If an agent rotates IDs to bypass per-agent circuit breaker isolation, the
+   * growing set size triggers a warning at MAX_UNIQUE_AGENT_IDS.
+   */
+  private readonly seenAgentIds: Set<string> = new Set();
+  /** MED-33 fix: Whether the agent ID abuse warning has already been emitted */
+  private agentIdAbuseWarned = false;
 
   constructor(store: Store, config?: Partial<CircuitBreakerConfig>) {
     this.store = store;
@@ -183,21 +204,35 @@ export class CircuitBreaker {
           if (this.config.failOnMultiInstance) {
             throw new Error(message);
           }
-          console.error(message);
+          process.emitWarning(
+            "Multiple instances detected sharing the same store. " +
+            "This breaks security guarantees including mutex serialization, idempotency, " +
+            "spending limits, and audit hash chains. Use a single instance or implement " +
+            "distributed locking.",
+            { code: "KOVA_MULTI_INSTANCE_WARNING" },
+          );
         }
         // Overwrite with our ID (we're taking over, but with a warning logged)
         await this.store.set(INSTANCE_KEY, this.instanceId, INSTANCE_TTL_SECONDS);
       }
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : "Unknown error";
-      console.error(`[KOVA WARNING] Failed to perform multi-instance detection: ${message}`);
+    } catch {
+      // HIGH-25 fix: Use process.emitWarning instead of console.error to avoid leaking
+      // error details to stderr. The error message may contain store connection info.
+      process.emitWarning(
+        "Failed to perform multi-instance detection",
+        { code: "KOVA_INTERNAL_WARNING" },
+      );
     }
 
     // Refresh instance ID periodically so the TTL doesn't expire while running
     this.heartbeatInterval = setInterval(() => {
-      void this.store.set(INSTANCE_KEY, this.instanceId, INSTANCE_TTL_SECONDS).catch((err: unknown) => {
-        const message = err instanceof Error ? err.message : "Unknown error";
-        console.error(`[KOVA WARNING] Failed to refresh instance heartbeat: ${message}`);
+      void this.store.set(INSTANCE_KEY, this.instanceId, INSTANCE_TTL_SECONDS).catch((_err: unknown) => {
+        // HIGH-25 fix: Use process.emitWarning instead of console.error to avoid
+        // leaking store error details to stderr.
+        process.emitWarning(
+          "Failed to refresh instance heartbeat",
+          { code: "KOVA_INTERNAL_WARNING" },
+        );
       });
     }, INSTANCE_HEARTBEAT_INTERVAL_MS);
 
@@ -219,6 +254,66 @@ export class CircuitBreaker {
   }
 
   /**
+   * MED-33 fix: Sanitize and validate an agentId. Enforces:
+   * - Maximum length of MAX_AGENT_ID_LENGTH (64) characters
+   * - Only alphanumeric characters, hyphens, and underscores
+   * - Tracks unique agentIds and emits a warning if too many are seen
+   *
+   * Returns the sanitized agentId, or undefined if the input was undefined.
+   * Throws if the agentId is invalid (wrong characters or too long).
+   */
+  private sanitizeAgentId(agentId: string | undefined): string | undefined {
+    if (agentId === undefined) return undefined;
+
+    if (agentId.length > MAX_AGENT_ID_LENGTH) {
+      throw new Error(
+        `CircuitBreaker: agentId exceeds maximum length of ${MAX_AGENT_ID_LENGTH} characters (got ${agentId.length})`,
+      );
+    }
+    if (!VALID_AGENT_ID_REGEX.test(agentId)) {
+      throw new Error(
+        `CircuitBreaker: agentId contains invalid characters. Only alphanumeric, hyphens, and underscores are allowed.`,
+      );
+    }
+
+    // Track unique agentIds for abuse detection
+    this.seenAgentIds.add(agentId);
+    if (this.seenAgentIds.size >= MAX_UNIQUE_AGENT_IDS && !this.agentIdAbuseWarned) {
+      this.agentIdAbuseWarned = true;
+      process.emitWarning(
+        `CircuitBreaker: ${this.seenAgentIds.size} unique agentIds detected. This may indicate ` +
+        `an agent rotating IDs to bypass per-agent circuit breaker isolation. ` +
+        `Consider enforcing agentId at the application layer.`,
+        { code: "KOVA_AGENT_ID_ABUSE_WARNING" },
+      );
+    }
+
+    return agentId;
+  }
+
+  /**
+   * CRIT-11 fix: Resolve the store key for the dedicated atomic denial counter.
+   * Uses store.increment() for atomic counting, avoiding the TOCTOU race in the
+   * previous getState()+setState() pattern where concurrent calls could both read
+   * the same denial count and write count+1, losing an increment.
+   *
+   * The key follows the pattern: circuit:denials:{agentId}:{intentType}
+   * Sanitization matches stateKey() to prevent key injection via `:` separators.
+   */
+  private denialCountKey(intentType?: string, agentId?: string): string {
+    let key = "circuit:denials";
+    if (agentId) {
+      const sanitizedAgentId = agentId.replace(/:/g, "_");
+      key = `${key}:${sanitizedAgentId}`;
+    }
+    if (intentType) {
+      const sanitizedIntentType = intentType.replace(/:/g, "_");
+      key = `${key}:${sanitizedIntentType}`;
+    }
+    return key;
+  }
+
+  /**
    * CORE-011 fix: Resolve the store key for circuit breaker state.
    * When an intentType is provided, uses a per-intent-type key (e.g., "circuit:state:transfer")
    * to isolate circuit breaker state per intent type. Falls back to the global key when
@@ -232,10 +327,16 @@ export class CircuitBreaker {
   private stateKey(intentType?: string, agentId?: string): string {
     let key = CIRCUIT_STATE_KEY;
     if (agentId) {
-      key = `${key}:agent:${agentId}`;
+      // POLICY-009 fix: Sanitize agentId to prevent key injection via `:` separators.
+      // An agentId containing `:` could collide with another agent's key space
+      // (e.g., agentId "foo:agent:bar" would produce a key overlapping with agent "bar").
+      const sanitizedAgentId = agentId.replace(/:/g, "_");
+      key = `${key}:agent:${sanitizedAgentId}`;
     }
     if (intentType) {
-      key = `${key}:${intentType}`;
+      // POLICY-009 fix: Also sanitize intentType for consistency.
+      const sanitizedIntentType = intentType.replace(/:/g, "_");
+      key = `${key}:${sanitizedIntentType}`;
     }
     return key;
   }
@@ -264,20 +365,24 @@ export class CircuitBreaker {
         // M-39: Parsed successfully but shape is invalid — fail-CLOSED.
         // Treat corrupted/unexpected shape as circuit open to deny transactions
         // rather than silently allowing them through.
-        console.error(
-          "[KOVA SECURITY] Circuit breaker state has unexpected shape — failing CLOSED (blocking). " +
-            "This is a safety measure: corrupted state denies transactions rather than allowing them."
+        // HIGH-25 fix: Use process.emitWarning instead of console.error
+        process.emitWarning(
+          "Circuit breaker state has unexpected shape — failing CLOSED (blocking). " +
+          "This is a safety measure: corrupted state denies transactions rather than allowing them.",
+          { code: "KOVA_SECURITY_WARNING" },
         );
         return { denialCount: Infinity, cooldownUntil: Infinity };
-      } catch (err: unknown) {
+      } catch {
         // M-39 fix: FAIL-CLOSED on corrupted/unparseable state.
         // Previously this fell through to the default (open/allow) state, meaning
         // corrupted state would silently disable the circuit breaker. Now we treat
         // parse failures as circuit-open (deny) to maintain safety invariants.
-        const message = err instanceof Error ? err.message : "Unknown error";
-        console.error(
-          `[KOVA SECURITY] Circuit breaker state corrupted (${message}) — failing CLOSED (blocking). ` +
-            "This is a safety measure: corrupted state denies transactions rather than allowing them."
+        // HIGH-25 fix: Use process.emitWarning instead of console.error to avoid
+        // leaking corrupted state details to stderr.
+        process.emitWarning(
+          "Circuit breaker state corrupted — failing CLOSED (blocking). " +
+          "This is a safety measure: corrupted state denies transactions rather than allowing them.",
+          { code: "KOVA_SECURITY_WARNING" },
         );
         return { denialCount: Infinity, cooldownUntil: Infinity };
       }
@@ -345,17 +450,19 @@ export class CircuitBreaker {
    * checks the circuit breaker state for that specific agent, preventing cross-agent DoS.
    */
   async check(now?: number, intentType?: string, agentId?: string): Promise<string | null> {
+    // MED-33 fix: Sanitize agentId to prevent key injection and detect ID rotation abuse
+    const sanitizedAgentId = this.sanitizeAgentId(agentId);
     const currentTime = this.clampTime(now);
-    const state = await this.getState(intentType, agentId);
+    const state = await this.getState(intentType, sanitizedAgentId);
 
     if (state.cooldownUntil > 0) {
       if (currentTime < state.cooldownUntil) {
         const remainingMs = state.cooldownUntil - currentTime;
-        const agentInfo = agentId ? ` (agent: ${agentId})` : "";
+        const agentInfo = sanitizedAgentId ? ` (agent: ${sanitizedAgentId})` : "";
         return `Circuit breaker open${agentInfo}: ${Math.ceil(remainingMs / 1000)}s cooldown remaining after ${this.config.threshold} consecutive denials`;
       }
       // Cooldown expired — reset
-      await this.reset(intentType, agentId);
+      await this.reset(intentType, sanitizedAgentId);
     }
 
     return null;
@@ -375,20 +482,25 @@ export class CircuitBreaker {
    * malicious agent from triggering circuit breaker cooldown for all agents.
    */
   async recordOutcome(decision: "ALLOW" | "DENY" | "PENDING", now?: number, intentType?: string, agentId?: string): Promise<void> {
-    // CONC-05 cross-reference: This TOCTOU between check() and recordOutcome() is
+    // MED-33 fix: Sanitize agentId to prevent key injection and detect ID rotation abuse
+    const sanitizedAgentId = this.sanitizeAgentId(agentId);
+    // CONC-05 cross-reference: The TOCTOU between check() and recordOutcome() is
     // documented in CRIT-10 (class header) and mitigated by the wallet's execute mutex
     // for single-instance deployments. For multi-instance, use store-level atomic
     // compare-and-swap or Redis Lua scripts. See security_audit_team9 CONC-05.
     //
-    // MED-T4-03 NOTE: The getState() + setState() sequence below is NOT atomic.
-    // In a multi-instance deployment, concurrent calls to recordOutcome() could both
-    // read the same denial count and write count+1, losing an increment. For single-
-    // instance deployments this is mitigated by the wallet's execute mutex, which
-    // serializes all transaction processing (and thus all recordOutcome calls).
-    // See CRIT-10 in the class header for full details and multi-instance recommendations.
+    // CRIT-11 fix: The denial counter increment is now atomic via store.increment()
+    // on a dedicated counter key. The previous getState() + setState() pattern was a
+    // classic TOCTOU where concurrent calls could both read the same denialCount and
+    // write count+1, losing an increment. store.increment() is atomic in both
+    // MemoryStore (synchronous single-threaded JS) and SqliteStore (SQLite transaction).
     if (decision === "ALLOW") {
-      // Success resets the counter
-      await this.setState({ denialCount: 0, cooldownUntil: 0 }, intentType, agentId);
+      // CRIT-11 fix: Reset both the atomic denial counter and the JSON state.
+      // The denial counter key is reset to "0" via store.set() and the combined
+      // JSON state is cleared via setState(). Both must be reset to prevent stale
+      // counter values from persisting across ALLOW resets.
+      await this.store.set(this.denialCountKey(intentType, sanitizedAgentId), "0");
+      await this.setState({ denialCount: 0, cooldownUntil: 0 }, intentType, sanitizedAgentId);
       return;
     }
 
@@ -397,17 +509,27 @@ export class CircuitBreaker {
       return;
     }
 
-    // DENY: increment counter atomically with state read
-    const state = await this.getState(intentType, agentId);
-    const newCount = state.denialCount + 1;
+    // CRIT-11 fix: DENY — use store.increment() for atomic denial counting.
+    // Previously this method used getState() + setState() which is a classic TOCTOU:
+    // two concurrent calls could both read the same denialCount and write count+1,
+    // losing an increment. Now we use store.increment() on a dedicated counter key
+    // which IS atomic in both MemoryStore (synchronous JS) and SqliteStore (SQLite
+    // transaction). Only when the threshold is reached do we write cooldown metadata
+    // via setState(), which is a one-way state transition (not a read-modify-write).
+    const newCount = await this.store.increment(this.denialCountKey(intentType, sanitizedAgentId), 1);
 
     if (newCount >= this.config.threshold) {
-      // Enter cooldown
+      // Enter cooldown — this is a one-way transition, not a read-modify-write,
+      // so the TOCTOU concern does not apply to the cooldown write itself.
       const currentTime = this.clampTime(now);
       const cooldownExpiry = currentTime + this.config.cooldownMs;
-      await this.setState({ denialCount: newCount, cooldownUntil: cooldownExpiry }, intentType, agentId);
+      await this.setState({ denialCount: newCount, cooldownUntil: cooldownExpiry }, intentType, sanitizedAgentId);
     } else {
-      await this.setState({ denialCount: newCount, cooldownUntil: state.cooldownUntil }, intentType, agentId);
+      // Update denialCount in JSON state for consistency with getState() readers
+      // (e.g., isOpen() and check() which read the JSON state). Read current state
+      // to preserve any existing cooldownUntil value.
+      const state = await this.getState(intentType, sanitizedAgentId);
+      await this.setState({ denialCount: newCount, cooldownUntil: state.cooldownUntil }, intentType, sanitizedAgentId);
     }
   }
 
@@ -422,6 +544,10 @@ export class CircuitBreaker {
    * H-07: Accepts optional agentId for per-agent state isolation.
    */
   private async reset(intentType?: string, agentId?: string): Promise<void> {
+    // CRIT-11 fix: Reset both the atomic denial counter key and the JSON state.
+    // Without resetting the counter key, a stale denial count would persist and
+    // could cause the circuit breaker to re-trigger prematurely after a cooldown reset.
+    await this.store.set(this.denialCountKey(intentType, agentId), "0");
     await this.setState({ denialCount: 0, cooldownUntil: 0 }, intentType, agentId);
   }
 
@@ -434,8 +560,14 @@ export class CircuitBreaker {
    * Check if the circuit breaker is open for any intent type.
    * Checks both the global state key and per-intent-type keys for common intent types.
    * Used by getPolicy() to report circuit breaker status.
+   *
+   * POLICY-014 fix: Optionally accepts an agentId to also check per-agent keys.
+   * Without agentId, only global and per-intent-type states are checked (which may
+   * miss per-agent circuit breaks). Callers with access to the agentId should pass it.
    */
-  async isOpen(now?: number): Promise<boolean> {
+  async isOpen(now?: number, agentId?: string): Promise<boolean> {
+    // MED-33 fix: Sanitize agentId to prevent key injection and detect ID rotation abuse
+    const sanitizedAgentId = this.sanitizeAgentId(agentId);
     const currentTime = this.clampTime(now);
     // Check global state
     const globalState = await this.getState();
@@ -448,6 +580,20 @@ export class CircuitBreaker {
     for (const intentType of intentTypes) {
       const state = await this.getState(intentType);
       if (state.cooldownUntil > 0 && currentTime < state.cooldownUntil) {
+        return true;
+      }
+      // POLICY-014 fix: Also check per-agent+intent-type compound keys
+      if (sanitizedAgentId) {
+        const agentState = await this.getState(intentType, sanitizedAgentId);
+        if (agentState.cooldownUntil > 0 && currentTime < agentState.cooldownUntil) {
+          return true;
+        }
+      }
+    }
+    // POLICY-014 fix: Check per-agent global state (no intent type)
+    if (sanitizedAgentId) {
+      const agentGlobal = await this.getState(undefined, sanitizedAgentId);
+      if (agentGlobal.cooldownUntil > 0 && currentTime < agentGlobal.cooldownUntil) {
         return true;
       }
     }

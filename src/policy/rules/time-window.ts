@@ -5,8 +5,63 @@
  * outside active hours: deny or require approval.
  */
 
+import { createHash } from "node:crypto";
 import type { PolicyRule, PolicyDecision, PolicyContext, ActiveHoursConfig } from "../types.js";
 import type { TransactionIntent } from "../../core/intent.js";
+
+/**
+ * HIGH-09 fix: Canonical JSON serialization with sorted keys for deterministic hashing.
+ * This ensures the intent hash is consistent regardless of property insertion order.
+ */
+function canonicalJsonStringify(value: unknown): string {
+  if (value === null || value === undefined) return JSON.stringify(value);
+  if (typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return "[" + value.map(canonicalJsonStringify).join(",") + "]";
+  }
+  const obj = value as Record<string, unknown>;
+  const DANGEROUS_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+  const sortedKeys = Object.keys(obj).filter((k) => !DANGEROUS_KEYS.has(k)).sort();
+  const entries = sortedKeys.map(
+    (key) => JSON.stringify(key) + ":" + canonicalJsonStringify(obj[key]),
+  );
+  return "{" + entries.join(",") + "}";
+}
+
+/**
+ * HIGH-09 fix: Compute a SHA-256 hash of the intent parameters.
+ * Cryptographically binds the TimeWindowRule approval to the exact transaction,
+ * preventing TOCTOU modification of the intent after approval.
+ */
+function computeIntentHash(intent: TransactionIntent): string {
+  const payload = canonicalJsonStringify({
+    type: intent.type,
+    chain: intent.chain,
+    params: intent.params,
+  });
+  return createHash("sha256").update(payload).digest("hex");
+}
+
+/**
+ * HIGH-09 fix: Extract a human-readable amount and token from the intent params.
+ * Used to populate approval request fields with actual transaction data instead
+ * of generic "N/A" placeholders.
+ */
+function extractAmountAndToken(intent: TransactionIntent): { amount: string; token: string; target: string } {
+  const params = intent.params as unknown as Record<string, unknown>;
+  const amount = typeof params.amount === "string" ? params.amount : "N/A";
+  const token = typeof params.token === "string"
+    ? params.token
+    : typeof params.fromToken === "string"
+      ? params.fromToken
+      : "N/A";
+  const target = typeof params.to === "string"
+    ? params.to
+    : typeof params.programId === "string"
+      ? params.programId
+      : "N/A";
+  return { amount, token, target };
+}
 
 /** Map day-of-week number (0=Sun) to config day string */
 export class TimeWindowRule implements PolicyRule {
@@ -71,17 +126,35 @@ export class TimeWindowRule implements PolicyRule {
     // integrates with the ApprovalChannel to gate transactions outside active hours.
     if (this.config.outsideHoursPolicy === "require_approval") {
       if (context.approval) {
+        // HIGH-09 fix: Compute intent hash BEFORE sending the approval request
+        // to cryptographically bind the approval to the exact transaction parameters.
+        const intentHash = computeIntentHash(_intent);
+        const { amount: txAmount, token: txToken, target: txTarget } = extractAmountAndToken(_intent);
         try {
           const result = await context.approval.requestApproval({
             id: crypto.randomUUID(),
             summary: `${_intent.type} transaction outside active hours`,
-            amount: "N/A",
-            token: "N/A",
-            target: "N/A",
+            amount: txAmount,
+            token: txToken,
+            target: txTarget,
             reason: "Transaction attempted outside active hours — requires manual approval",
+            agentId: _intent.metadata?.agentId,
             expiresAt: context.now + 300_000, // 5 minute timeout
+            // HIGH-09 fix: Bind approval to the exact intent parameters
+            intentHash,
           });
           if (result.decision === "approved") {
+            // HIGH-09 fix: Re-compute the intent hash and verify it hasn't changed
+            // since the approval was requested (TOCTOU defense-in-depth).
+            const recomputedHash = computeIntentHash(_intent);
+            if (recomputedHash !== intentHash) {
+              return {
+                decision: "DENY",
+                rule: this.name,
+                reason: `Approval intent hash mismatch: the transaction was modified after approval was requested. ` +
+                  `Original ${intentHash.slice(0, 16)}..., re-computed ${recomputedHash.slice(0, 16)}...`,
+              };
+            }
             return { decision: "ALLOW" };
           }
           return {
@@ -109,7 +182,9 @@ export class TimeWindowRule implements PolicyRule {
     return {
       decision: "DENY",
       rule: this.name,
-      reason: `Transaction denied: outside active hours (timezone: ${this.config.timezone})`,
+      // POLICY-011 fix: Generic denial message without timezone details to prevent
+      // information disclosure about operator location/operational hours.
+      reason: "Transaction denied: outside active hours",
     };
   }
 
@@ -130,6 +205,13 @@ export class TimeWindowRule implements PolicyRule {
    *   repeated hour (e.g., 01:00-04:00), agents get one extra hour of access because
    *   1:00-2:00 AM occurs twice. This grants ADDITIONAL access beyond the intended
    *   window, but only for one hour per DST transition (typically twice per year).
+   *
+   * POLICY-015 SECURITY NOTE: The DST fall-back issue means an agent could execute
+   * transactions during an unintended extra hour window. For high-security deployments
+   * where time-window precision is critical (e.g., trading bots with strict market-hours
+   * constraints), use UTC timezone to eliminate DST ambiguity entirely. The risk is LOW
+   * because it only affects 1 hour, at most twice per year, and only when the active
+   * window overlaps with the DST transition hour.
    *
    * For stricter control that eliminates DST edge cases entirely, configure the
    * timezone to "UTC" and compute your desired local windows as UTC offsets. This

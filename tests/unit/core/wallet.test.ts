@@ -1893,8 +1893,8 @@ describe("AgentWallet", () => {
 
       expect(result.status).toBe("confirmed");
       expect(result.txId).toBe("mock_tx_abc123");
-      // Two-phase evaluation: approval is requested in both dry-run and commit phases
-      expect(approval.requestApproval).toHaveBeenCalledTimes(2);
+      // CRIT-10 fix: Approval is now only requested in Phase 2 (commit), not Phase 1 (dry-run)
+      expect(approval.requestApproval).toHaveBeenCalledTimes(1);
     });
 
     it("should deny transaction above threshold when human rejects", async () => {
@@ -1985,8 +1985,8 @@ describe("AgentWallet", () => {
         }),
       );
 
-      // Two-phase evaluation: approval is requested in both dry-run and commit phases
-      expect(requestSpy).toHaveBeenCalledTimes(2);
+      // CRIT-10 fix: Approval is now only requested in Phase 2 (commit), not Phase 1 (dry-run)
+      expect(requestSpy).toHaveBeenCalledTimes(1);
       const request: ApprovalRequest = requestSpy.mock.calls[0]![0];
       expect(request.amount).toBe("10");
       expect(request.token).toBe("SOL");
@@ -2029,13 +2029,14 @@ describe("AgentWallet", () => {
       });
       const wallet = createApprovalWallet(approval, { amount: "5", token: "SOL" });
 
-      // Exactly 5.0 SOL with threshold of 5 — should be allowed without approval (<=)
+      // POLICY-004 fix: Exactly 5.0 SOL with threshold of 5 — now requires approval
+      // (strict < comparison means amount >= threshold triggers approval gate).
       const result = await wallet.execute(
         createTransferIntent({ params: { to: VALID_SOL_ADDRESS, amount: "5.0", token: "SOL" } }),
       );
 
       expect(result.status).toBe("confirmed");
-      expect(approval.requestApproval).not.toHaveBeenCalled();
+      expect(approval.requestApproval).toHaveBeenCalled();
     });
 
     it("should trigger approval for amount just above threshold (5.01 > 5.0)", async () => {
@@ -2051,8 +2052,8 @@ describe("AgentWallet", () => {
       );
 
       expect(result.status).toBe("confirmed");
-      // Two-phase evaluation: approval is requested in both dry-run and commit phases
-      expect(approval.requestApproval).toHaveBeenCalledTimes(2);
+      // CRIT-10 fix: Approval is now only requested in Phase 2 (commit), not Phase 1 (dry-run)
+      expect(approval.requestApproval).toHaveBeenCalledTimes(1);
     });
 
     it("should deny USDC transfer when approval threshold is for SOL (POLICY-001 unmatched token)", async () => {
@@ -2088,8 +2089,8 @@ describe("AgentWallet", () => {
       });
 
       expect(result.status).toBe("confirmed");
-      // Two-phase evaluation: approval is requested in both dry-run and commit phases
-      expect(approval.requestApproval).toHaveBeenCalledTimes(2);
+      // CRIT-10 fix: Approval is now only requested in Phase 2 (commit), not Phase 1 (dry-run)
+      expect(approval.requestApproval).toHaveBeenCalledTimes(1);
     });
 
     it("should deny swap intent above threshold when human rejects", async () => {

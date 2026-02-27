@@ -78,12 +78,14 @@ export class LocalSigner implements Signer {
     // CRIT-T1-04 fix: Block LocalSigner in production unless explicitly opted in.
     // Mirrors the MemoryStore pattern. LocalSigner holds private keys in plaintext
     // process memory which is unsafe for production use with real funds.
-    // T6-F4 fix: Use dedicated KOVA_ALLOW_LOCAL_SIGNER env var instead of relying solely
-    // on NODE_ENV=test. Previously, setting NODE_ENV=test in production would bypass this
+    // T6-F4 fix: Use dedicated KOVA_ALLOW_LOCAL_SIGNER env var instead of relying on
+    // NODE_ENV=test. Previously, setting NODE_ENV=test in production would bypass this
     // guard entirely. A dedicated env var is harder to accidentally set.
-    const allowedByEnv = typeof process !== "undefined" && (
-      process.env.NODE_ENV === "test" || process.env.KOVA_ALLOW_LOCAL_SIGNER === "1"
-    );
+    // HIGH-02 fix: Removed NODE_ENV=test bypass entirely. The production guard now
+    // requires an explicit opt-in via dangerouslyAllowInProduction config flag or the
+    // KOVA_ALLOW_LOCAL_SIGNER=1 environment variable. NODE_ENV is not checked.
+    const allowedByEnv = typeof process !== "undefined" &&
+      process.env.KOVA_ALLOW_LOCAL_SIGNER === "1";
     if (typeof process !== "undefined" && !allowedByEnv) {
       if (!config?.dangerouslyAllowInProduction) {
         throw new Error(
@@ -274,7 +276,11 @@ export class LocalSigner implements Signer {
 
       // Step 2: If the private key seed is available (not zeroed by CRYPTO-004 fix),
       // perform a full sign+verify round-trip to detect key corruption or mismatch.
-      const seed = this.keypair.secretKey.slice(0, 32);
+      // MED-02 fix: Use a Uint8Array view (subarray) instead of slice() to avoid
+      // creating an additional copy of the private key seed in memory. subarray()
+      // returns a view over the same underlying ArrayBuffer, so no new key material
+      // is allocated. The seed reference is released when this scope exits.
+      const seed = this.keypair.secretKey.subarray(0, 32);
       const seedAvailable = !seed.every((b: number) => b === 0);
       if (seedAvailable) {
         const testMessage = new Uint8Array(Buffer.from("kova:healthcheck:selftest"));

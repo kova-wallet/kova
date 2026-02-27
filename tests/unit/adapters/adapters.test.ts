@@ -398,7 +398,9 @@ describe("handleToolCall", () => {
       ],
       chain: "solana",
     });
-    expect(result.success).toBe(true);
+    // MED-09: Validation now rejects non-string accounts; object arrays fail validation
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("Validation failed");
   });
 
   it("should return error for invalid accounts JSON string", async () => {
@@ -433,7 +435,8 @@ describe("handleToolCall", () => {
 
     const result = await wallet.handleToolCall("wallet_get_policy", {});
     expect(result.success).toBe(true);
-    expect((result.data as { name: string }).name).toBe("spending-limit");
+    // MED-38: Policy name is now redacted to "custom" when rules exist
+    expect((result.data as { name: string }).name).toBe("custom");
   });
 
   it("should dispatch wallet_get_transaction_history", async () => {
@@ -459,8 +462,8 @@ describe("handleToolCall", () => {
     const wallet = createWallet();
     const result = await wallet.handleToolCall("unknown_tool", {});
     expect(result.success).toBe(false);
-    // H-06 fix: enabledTools check happens before switch, so unknown tools get "Tool not enabled"
-    expect(result.error).toContain("Tool not enabled");
+    // MED-09: Validation now catches unknown tools and returns "Validation failed" immediately
+    expect(result.error).toContain("Validation failed");
   });
 
   it("should return denied result for policy-denied transfer", async () => {
@@ -558,7 +561,8 @@ describe("getPolicy", () => {
     const wallet = createWallet({ policy, store });
 
     const summary = await wallet.getPolicy();
-    expect(summary.name).toBe("spending-limit");
+    // MED-38: Policy name is now redacted to "custom" when rules exist
+    expect(summary.name).toBe("custom");
   });
 
   it("should join multiple rule names with +", async () => {
@@ -571,7 +575,8 @@ describe("getPolicy", () => {
     const wallet = createWallet({ policy, store });
 
     const summary = await wallet.getPolicy();
-    expect(summary.name).toBe("spending-limit+rate-limit");
+    // MED-38: Policy name is now redacted to "custom" when rules exist
+    expect(summary.name).toBe("custom");
   });
 
   it("should populate per-transaction spending limit", async () => {
@@ -583,9 +588,10 @@ describe("getPolicy", () => {
     const wallet = createWallet({ policy, store });
 
     const summary = await wallet.getPolicy();
+    // MED-38: Both amount and token are now redacted in getPolicy()
     expect(summary.spendingLimits.perTransaction).toEqual({
       amount: "[redacted]",
-      token: "SOL",
+      token: "[redacted]",
     });
   });
 
@@ -601,7 +607,8 @@ describe("getPolicy", () => {
     // HIGH-09: 'used' spending counters are no longer exposed in getPolicy()
     // HIGH-T3-01: spending amounts are now redacted in getPolicy()
     expect(summary.spendingLimits.daily?.amount).toBe("[redacted]");
-    expect(summary.spendingLimits.daily?.token).toBe("SOL");
+    // MED-38: Token is now redacted in getPolicy()
+    expect(summary.spendingLimits.daily?.token).toBe("[redacted]");
     expect(summary.spendingLimits.daily?.used).toBeUndefined();
   });
 
@@ -632,10 +639,12 @@ describe("getPolicy", () => {
     // HIGH-09: 'used' spending counters are no longer exposed in getPolicy()
     // HIGH-T3-01: spending amounts are now redacted in getPolicy()
     expect(summary.spendingLimits.weekly?.amount).toBe("[redacted]");
-    expect(summary.spendingLimits.weekly?.token).toBe("SOL");
+    // MED-38: Tokens are now redacted in getPolicy()
+    expect(summary.spendingLimits.weekly?.token).toBe("[redacted]");
     expect(summary.spendingLimits.weekly?.used).toBeUndefined();
     expect(summary.spendingLimits.monthly?.amount).toBe("[redacted]");
-    expect(summary.spendingLimits.monthly?.token).toBe("SOL");
+    // MED-38: Tokens are now redacted in getPolicy()
+    expect(summary.spendingLimits.monthly?.token).toBe("[redacted]");
     expect(summary.spendingLimits.monthly?.used).toBeUndefined();
   });
 
@@ -650,7 +659,9 @@ describe("getPolicy", () => {
     const wallet = createWallet({ policy, store });
 
     const summary = await wallet.getPolicy();
-    expect(summary.allowlistedAddresses).toBe(3);
+    // MED-38: Allowlist counts are now redacted to -1 when addresses/programs exist
+    expect(summary.allowlistedAddresses).toBe(-1);
+    // No programs configured, so count stays 0
     expect(summary.allowlistedPrograms).toBe(0);
   });
 
@@ -665,7 +676,8 @@ describe("getPolicy", () => {
     const wallet = createWallet({ policy, store });
 
     const summary = await wallet.getPolicy();
-    expect(summary.allowlistedPrograms).toBe(2);
+    // MED-38: Allowlist counts are now redacted to -1
+    expect(summary.allowlistedPrograms).toBe(-1);
   });
 
   it("should populate rate limits without exposing current counters (HIGH-09)", async () => {
@@ -714,8 +726,9 @@ describe("getPolicy", () => {
 
     const summary = await wallet.getPolicy();
     // HIGH-T3-01: approval gate amounts are now redacted in getPolicy()
+    // MED-38: Both amount and token are now redacted in getPolicy()
     expect(summary.approvalRequired).toEqual({
-      above: { amount: "[redacted]", token: "SOL" },
+      above: { amount: "[redacted]", token: "[redacted]" },
     });
   });
 
@@ -736,14 +749,16 @@ describe("getPolicy", () => {
 
     const summary = await wallet.getPolicy();
     expect(summary.activeHours).toBeDefined();
-    expect(summary.activeHours!.timezone).toBe("UTC");
+    // MED-38: Timezone is now redacted in getPolicy()
+    expect(summary.activeHours!.timezone).toBe("[redacted]");
     expect(typeof summary.activeHours!.isCurrentlyActive).toBe("boolean");
   });
 
   it("should handle engine with only allow-all rule (returns defaults)", async () => {
     const wallet = createWallet();
     const summary = await wallet.getPolicy();
-    expect(summary.name).toBe("allow-all");
+    // MED-38: Policy name is now redacted to "custom" when rules exist
+    expect(summary.name).toBe("custom");
     expect(summary.spendingLimits).toEqual({});
     expect(summary.allowlistedAddresses).toBe(0);
     expect(summary.allowlistedPrograms).toBe(0);
@@ -773,12 +788,12 @@ describe("getPolicy", () => {
     const wallet = createWallet({ policy, store });
 
     const summary = await wallet.getPolicy();
-    expect(summary.name).toBe(
-      "rate-limit+time-window+allowlist+spending-limit+approval-gate",
-    );
+    // MED-38: Policy name is now redacted to "custom" when rules exist
+    expect(summary.name).toBe("custom");
     expect(summary.spendingLimits.perTransaction).toBeDefined();
     expect(summary.spendingLimits.daily).toBeDefined();
-    expect(summary.allowlistedAddresses).toBe(1);
+    // MED-38: Allowlist counts are now redacted to -1
+    expect(summary.allowlistedAddresses).toBe(-1);
     expect(summary.rateLimits).toBeDefined();
     expect(summary.activeHours).toBeDefined();
     expect(summary.approvalRequired).toBeDefined();
@@ -1012,7 +1027,8 @@ describe("handleToolCall — invalid chain values", () => {
       chain: "",
     });
     expect(result.success).toBe(false);
-    expect(result.error).toContain("Invalid");
+    // MED-09: Validation now returns "Validation failed" for invalid chain values
+    expect(result.error).toContain("Validation failed");
   });
 
   it("should fail when chain is 'bitcoin' (not supported)", async () => {
@@ -1024,7 +1040,8 @@ describe("handleToolCall — invalid chain values", () => {
       chain: "bitcoin",
     });
     expect(result.success).toBe(false);
-    expect(result.error).toContain("Invalid");
+    // MED-09: Validation now returns "Validation failed" for invalid chain values
+    expect(result.error).toContain("Validation failed");
   });
 
   it("should fail when chain is a number", async () => {
@@ -1048,7 +1065,8 @@ describe("handleToolCall — invalid chain values", () => {
       chain: "polygon",
     });
     expect(result.success).toBe(false);
-    expect(result.error).toContain("Invalid");
+    // MED-09: Validation now returns "Validation failed" for invalid chain values
+    expect(result.error).toContain("Validation failed");
   });
 
   it("should fail when mint chain is invalid", async () => {
@@ -1059,7 +1077,8 @@ describe("handleToolCall — invalid chain values", () => {
       chain: "avalanche",
     });
     expect(result.success).toBe(false);
-    expect(result.error).toContain("Invalid");
+    // MED-09: Validation now returns "Validation failed" for invalid chain values
+    expect(result.error).toContain("Validation failed");
   });
 
   it("should fail when stake chain is invalid", async () => {
@@ -1070,7 +1089,8 @@ describe("handleToolCall — invalid chain values", () => {
       chain: "cosmos",
     });
     expect(result.success).toBe(false);
-    expect(result.error).toContain("Invalid");
+    // MED-09: Validation now returns "Validation failed" for invalid chain values
+    expect(result.error).toContain("Validation failed");
   });
 });
 
@@ -1622,8 +1642,9 @@ describe("getPolicy — AllowlistRule edge cases", () => {
     const wallet = createWallet({ policy, store });
 
     const summary = await wallet.getPolicy();
-    expect(summary.allowlistedAddresses).toBe(3);
-    expect(summary.allowlistedPrograms).toBe(1);
+    // MED-38: Allowlist counts are now redacted to -1
+    expect(summary.allowlistedAddresses).toBe(-1);
+    expect(summary.allowlistedPrograms).toBe(-1);
   });
 });
 
@@ -1655,7 +1676,8 @@ describe("getPolicy — TimeWindowRule edge cases", () => {
 
     const summary = await wallet.getPolicy();
     expect(summary.activeHours).toBeDefined();
-    expect(summary.activeHours!.timezone).toBe("UTC");
+    // MED-38: Timezone is now redacted in getPolicy()
+    expect(summary.activeHours!.timezone).toBe("[redacted]");
     // No windows defined means no time matches, so should not be active
     expect(summary.activeHours!.isCurrentlyActive).toBe(false);
   });
@@ -1677,7 +1699,8 @@ describe("getPolicy — TimeWindowRule edge cases", () => {
 
     const summary = await wallet.getPolicy();
     expect(summary.activeHours).toBeDefined();
-    expect(summary.activeHours!.timezone).toBe("Asia/Tokyo");
+    // MED-38: Timezone is now redacted in getPolicy()
+    expect(summary.activeHours!.timezone).toBe("[redacted]");
     expect(typeof summary.activeHours!.isCurrentlyActive).toBe("boolean");
   });
 });
@@ -1986,8 +2009,8 @@ describe("ToolCallResult shape verification", () => {
     const result = await wallet.handleToolCall("nonexistent_tool", {});
     expect(result.success).toBe(false);
     expect(result.data).toBeUndefined();
-    // H-06 fix: enabledTools check happens before switch, so unknown tools get "Tool not enabled"
-    expect(result.error).toContain("Tool not enabled");
+    // MED-09: Validation now catches unknown tools and returns "Validation failed" immediately
+    expect(result.error).toContain("Validation failed");
   });
 
   it("successful swap result data should have TransactionResult shape with confirmed status", async () => {
@@ -2067,8 +2090,8 @@ describe("LangChain Adapter — error handling and JSON stringification", () => 
     const jsonStr = JSON.stringify(result);
     const parsed = JSON.parse(jsonStr);
     expect(parsed.success).toBe(false);
-    // H-06 fix: enabledTools check happens before switch, so unknown tools get "Tool not enabled"
-    expect(parsed.error).toContain("Tool not enabled");
+    // MED-09: Validation now catches unknown tools and returns "Validation failed" immediately
+    expect(parsed.error).toContain("Validation failed");
   });
 
   it("should properly stringify successful transfer result in sanitized format", async () => {
@@ -2102,7 +2125,8 @@ describe("LangChain Adapter — error handling and JSON stringification", () => 
     // Test via handleToolCall directly instead.
     const result = await wallet.handleToolCall("wallet_get_policy", {});
     expect(result.success).toBe(true);
-    expect(result.data.name).toBe("spending-limit+rate-limit");
+    // MED-38: Policy name is now redacted to "custom" when rules exist
+    expect(result.data.name).toBe("custom");
     expect(result.data.spendingLimits).toBeDefined();
     expect(result.data.rateLimits).toBeDefined();
   });
@@ -2227,9 +2251,9 @@ describe("handleToolCall — transaction history edge cases", () => {
     const result = await wallet.handleToolCall("wallet_get_transaction_history", {
       limit: "abc" as unknown as number,
     });
-    // limit is not a number, so handleGetHistory passes undefined to getTransactionHistory
-    expect(result.success).toBe(true);
-    expect(Array.isArray(result.data)).toBe(true);
+    // MED-09: Validation now rejects non-numeric limit values
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("Validation failed");
   });
 
   it("should handle very large limit by clamping to MAX_HISTORY_LIMIT", async () => {
@@ -2237,8 +2261,9 @@ describe("handleToolCall — transaction history edge cases", () => {
     const result = await wallet.handleToolCall("wallet_get_transaction_history", {
       limit: 999999,
     });
-    expect(result.success).toBe(true);
-    expect(Array.isArray(result.data)).toBe(true);
+    // MED-09: Validation now rejects excessively large limit values
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("Validation failed");
   });
 
   it("should handle Infinity limit gracefully", async () => {
@@ -2246,17 +2271,18 @@ describe("handleToolCall — transaction history edge cases", () => {
     const result = await wallet.handleToolCall("wallet_get_transaction_history", {
       limit: Infinity,
     });
-    expect(result.success).toBe(true);
-    expect(Array.isArray(result.data)).toBe(true);
+    // MED-09: Validation now rejects non-finite limit values
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("Validation failed");
   });
 
-  it("should handle NaN limit gracefully", async () => {
+  it("should reject NaN limit (LOW-08)", async () => {
     const wallet = createWallet();
     const result = await wallet.handleToolCall("wallet_get_transaction_history", {
       limit: NaN,
     });
-    expect(result.success).toBe(true);
-    expect(Array.isArray(result.data)).toBe(true);
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("Validation failed");
   });
 });
 
@@ -2282,7 +2308,9 @@ describe("handleToolCall — wallet_execute_custom edge cases", () => {
       accounts: [],
       chain: "solana",
     });
-    expect(result.success).toBe(true);
+    // MED-09: Validation now rejects non-string accounts; empty arrays fail validation
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("Validation failed");
   });
 
   it("should fail when accounts is a number", async () => {

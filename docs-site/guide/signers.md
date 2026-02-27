@@ -163,6 +163,23 @@ const keypair = Keypair.fromSecretKey(secretKey);
 const signer = new LocalSigner(keypair);
 ```
 
+### Production Guard
+
+`LocalSigner` throws an error at construction time in production environments:
+
+```typescript
+// In production without opt-in:
+const signer = new LocalSigner(keypair);
+// Error: "LocalSigner is not safe for production use..."
+
+// Explicit opt-in (devnet testing only -- NOT for real funds):
+const signer = new LocalSigner(keypair, { dangerouslyAllowInProduction: true });
+```
+
+::: danger
+The `dangerouslyAllowInProduction` flag exists for devnet testing in production Node.js environments. Do NOT use it with real funds. The private key is held in plaintext process memory.
+:::
+
 ### Usage
 
 ```typescript
@@ -226,6 +243,19 @@ console.log(JSON.stringify(signer));
 ::: danger SECURITY WARNING
 `LocalSigner` stores the private key in process memory as a plain `Keypair`. The key can be extracted via heap dumps, core dumps, or memory inspection tools. **Do not use `LocalSigner` in production with real funds.** Use `MpcSigner` with a secure provider or a custom hardware-backed signer for production deployments.
 :::
+
+#### rotateKey(newKeypair, config?)
+
+Create a new LocalSigner with a different keypair and destroy the old one. Returns the new signer instance.
+
+```typescript
+import { Keypair } from "@solana/web3.js";
+
+// Rotate to a new keypair. The old key material is zeroed out.
+const newKeypair = Keypair.generate();
+const newSigner = await signer.rotateKey(newKeypair);
+// signer is now destroyed. newSigner is the active signer.
+```
 
 ### Supported Transaction Formats
 
@@ -391,6 +421,10 @@ const wallet = new AgentWallet({
 | **Retry** | Retries transient provider errors up to `maxRetries` times. Non-transient errors (chain mismatch) are never retried |
 | **Timeout** | Each provider call is wrapped in a timeout. Slow providers throw `TIMEOUT` |
 | **Health check** | Delegates to provider with timeout. Returns `false` on any error (no retry) |
+
+::: tip Security note
+In error messages returned to callers, the MPC provider name is hashed and truncated (e.g., `provider-9fd6`) to prevent leaking infrastructure details. The full provider name is available in internal audit logs.
+:::
 
 ### Error Handling
 

@@ -34,6 +34,18 @@ const MAX_KEY_LENGTH = 512;
  * or serialized transaction result. Larger values likely indicate a bug or abuse. */
 const MAX_VALUE_LENGTH = 1_000_000;
 
+/**
+ * LOW-27 fix: Redact store keys in warning messages to prevent leaking sensitive
+ * information like token identifiers, agent IDs, or wallet addresses.
+ * Keys longer than 16 characters are truncated to first 8 + "..." + last 4 chars.
+ */
+function redactStoreKey(key: string): string {
+  if (key.length > 16) {
+    return key.slice(0, 8) + "..." + key.slice(-4);
+  }
+  return key;
+}
+
 /** MED-21 fix: Validate store key length and content */
 function validateKey(key: string): void {
   if (key.length > MAX_KEY_LENGTH) {
@@ -157,9 +169,14 @@ export class MemoryStore implements Store {
    * effective for the lifetime of this MemoryStore instance.
    */
   private computeCounterHmac(key: string, value: string): string {
+    // MED-01 fix: Use length-prefixed concatenation to prevent ambiguity.
+    // Previously `key + ":" + value` was used, but if key contains a colon,
+    // different key/value pairs can produce the same HMAC input (e.g.,
+    // key="a:b" value="c" vs key="a" value="b:c"). Length-prefixing the key
+    // makes the boundary unambiguous regardless of key content.
     return crypto
       .createHmac("sha256", this.hmacKey)
-      .update(`${key}:${value}`)
+      .update(`${key.length.toString(16)}:${key}:${value}`)
       .digest("hex");
   }
 
@@ -203,6 +220,11 @@ export class MemoryStore implements Store {
   /** Store a key-value pair with optional TTL in seconds. */
   async set(key: string, value: string, ttlSeconds?: number): Promise<void> {
     validateKey(key);
+    // MED-08 fix: Validate ttlSeconds is a finite positive number to prevent
+    // NaN or Infinity from causing incorrect TTL behavior (e.g., NaN * 1000 = NaN).
+    if (ttlSeconds !== undefined && (!Number.isFinite(ttlSeconds) || ttlSeconds <= 0)) {
+      throw new Error(`MemoryStore.set: ttlSeconds must be a positive finite number, got ${ttlSeconds}`);
+    }
     // MED-22 fix: Reject values exceeding maximum length to prevent memory exhaustion
     if (value.length > MAX_VALUE_LENGTH) {
       throw new Error(
@@ -223,6 +245,11 @@ export class MemoryStore implements Store {
    */
   async setIfNotExists(key: string, value: string, ttlSeconds?: number): Promise<boolean> {
     validateKey(key);
+    // MED-08 fix: Validate ttlSeconds is a finite positive number to prevent
+    // NaN or Infinity from causing incorrect TTL behavior.
+    if (ttlSeconds !== undefined && (!Number.isFinite(ttlSeconds) || ttlSeconds <= 0)) {
+      throw new Error(`MemoryStore.setIfNotExists: ttlSeconds must be a positive finite number, got ${ttlSeconds}`);
+    }
     const entry = this.data.get(key);
     if (entry) {
       if (entry.expiresAt && Date.now() > entry.expiresAt) {
@@ -300,10 +327,29 @@ export class MemoryStore implements Store {
         // counter value returned by get(). If the HMAC is missing or invalid, the counter
         // may have been tampered with — treat as corrupted and reset to 0.
         const hmacEntry = this.data.get(key + ":__hmac");
-        if (hmacEntry && !this.verifyCounterHmac(key, entry.value, hmacEntry.value)) {
+        // DATA-005 fix: Warn when HMAC entry is missing. This could indicate:
+        // (a) the counter was initialized via set() (legitimate, no HMAC created), or
+        // (b) an attacker deleted the HMAC entry to bypass integrity checks.
+        // We emit a SecurityWarning but trust the value, since set()-initialized
+        // counters legitimately lack HMAC entries. Only when an HMAC EXISTS but is
+        // INVALID do we reset to 0 (definitive evidence of tampering).
+        if (!hmacEntry) {
           try {
+            // LOW-27 fix: Redact key to prevent leaking sensitive token/agent/wallet info in warnings
             process.emitWarning(
-              `MemoryStore.increment: HMAC verification failed for key "${key}". ` +
+              `MemoryStore.increment: HMAC entry missing for key "${redactStoreKey(key)}". ` +
+              `Counter may have been tampered with (HMAC deleted), or was initialized via set().`,
+              "SecurityWarning",
+            );
+          } catch { /* non-fatal */ }
+          // Trust the value but proceed with caution — next increment will create an HMAC
+          const parsed = parseFloat(entry.value);
+          current = isNaN(parsed) ? 0 : parsed;
+        } else if (!this.verifyCounterHmac(key, entry.value, hmacEntry.value)) {
+          try {
+            // LOW-27 fix: Redact key to prevent leaking sensitive token/agent/wallet info in warnings
+            process.emitWarning(
+              `MemoryStore.increment: HMAC verification failed for key "${redactStoreKey(key)}". ` +
               `Counter value may have been tampered with. Resetting to 0.`,
               "SecurityWarning",
             );
@@ -314,8 +360,9 @@ export class MemoryStore implements Store {
           // MED-23 fix: Detect non-numeric counter values instead of silently resetting
           if (isNaN(parsed)) {
             try {
+              // LOW-27 fix: Redact key to prevent leaking sensitive token/agent/wallet info in warnings
               process.emitWarning(
-                `MemoryStore.increment: key "${key}" contains non-numeric value. ` +
+                `MemoryStore.increment: key "${redactStoreKey(key)}" contains non-numeric value. ` +
                 `Treating as 0. This may indicate data corruption or key collision.`,
                 "StoreWarning",
               );
@@ -337,7 +384,6 @@ export class MemoryStore implements Store {
     // Stored in a separate key ({key}:__hmac) so get() returns the clean counter value.
     const valueStr = String(newValue);
     const hmac = this.computeCounterHmac(key, valueStr);
-    this.data.set(key + ":__hmac", { value: hmac });
 
     const newEntry: StoreEntry = { value: valueStr };
     if (existingTtl) {
@@ -348,6 +394,14 @@ export class MemoryStore implements Store {
       newEntry.expiresAt = Date.now() + this.defaultCounterTtlSeconds * 1000;
     }
     this.data.set(key, newEntry);
+    // DATA-012 fix: Copy the counter's TTL to the HMAC entry so orphaned HMAC
+    // entries don't persist indefinitely after the counter's TTL expires.
+    // Without this, long-running processes accumulate unbounded HMAC entries.
+    const hmacEntry: StoreEntry = { value: hmac };
+    if (newEntry.expiresAt) {
+      hmacEntry.expiresAt = newEntry.expiresAt;
+    }
+    this.data.set(key + ":__hmac", hmacEntry);
     return newValue;
   }
 
@@ -369,7 +423,17 @@ export class MemoryStore implements Store {
     list.push(value);
     // CRIT-03 fix: Evict oldest entries when list exceeds max size
     if (list.length > MAX_LIST_SIZE) {
-      list.splice(0, list.length - MAX_LIST_SIZE);
+      // DATA-007 fix: Emit a warning when eviction occurs to distinguish expected
+      // eviction from unexpected truncation. Without this, verifyIntegrity() reports
+      // "truncation detected" for both cases, creating alert fatigue that masks real attacks.
+      const evicted = list.length - MAX_LIST_SIZE;
+      // LOW-27 fix: Redact key to prevent leaking sensitive token/agent/wallet info in warnings
+      process.emitWarning(
+        `MemoryStore: evicting ${evicted} oldest entries from list "${redactStoreKey(key)}" (MAX_LIST_SIZE=${MAX_LIST_SIZE}). ` +
+        `Hash chain verification may report missing entries — this is expected eviction, not tampering.`,
+        "KovaStoreEviction",
+      );
+      list.splice(0, evicted);
     }
     this.lists.set(key, list);
   }

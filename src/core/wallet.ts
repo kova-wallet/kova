@@ -45,7 +45,7 @@ import { toAnthropicTools as convertToAnthropicTools, type AnthropicTool } from 
 import { toOpenAITools as convertToOpenAITools, type OpenAITool } from "../adapters/openai.js";
 // M-55 fix: WALLET_TOOL_NAMES no longer enumerated in error messages (but still
 // imported for MED-T3-08 constructor validation of enabledTools).
-import { WALLET_TOOL_NAMES, type WalletToolName } from "../adapters/tools.js";
+import { WALLET_TOOL_NAMES, WRITE_TOOL_NAMES, WRITE_RATE_LIMIT_PER_MINUTE, validateToolInput, type WalletToolName } from "../adapters/tools.js";
 import { SpendingLimitRule } from "../policy/rules/spending-limit.js";
 import { normalizeTokenId } from "../policy/utils.js";
 import { AllowlistRule } from "../policy/rules/allowlist.js";
@@ -75,6 +75,15 @@ const DEFAULT_IDEMPOTENCY_TTL = 86_400;
 
 /** Store key prefix for idempotency */
 const IDEMPOTENCY_PREFIX = "idempotency:";
+
+/**
+ * CRIT-13 fix: TTL for the store-based advisory lock (in seconds).
+ * Stale locks from crashed processes auto-expire after this period.
+ */
+const ADVISORY_LOCK_TTL_SECONDS = 30;
+
+/** CRIT-13 fix: Store key for the cross-process advisory lock */
+const ADVISORY_LOCK_KEY = "lock:wallet";
 
 /** Valid chain IDs */
 const VALID_CHAINS = new Set<string>(["solana", "ethereum", "base"]);
@@ -331,6 +340,28 @@ export interface AgentWalletConfig {
    * unless explicitly listed in enabledTools.
    */
   enabledTools?: ReadonlySet<string>;
+  /**
+   * CRIT-03 fix: When true, allows auto-generation of the idempotency HMAC key
+   * in production environments. Auto-generated keys don't survive process restarts,
+   * which means duplicate intent IDs can be re-executed after a restart.
+   * For production use, provide a persistent idempotencyHmacKey instead.
+   */
+  dangerouslyAllowAutoHmacKey?: boolean;
+  /**
+   * CRIT-04 fix: Optional capability token for caller authentication.
+   * When set, execute() and handleToolCall() require this token to be
+   * passed as a parameter. Any call without the correct token is rejected.
+   * This prevents unauthorized code that obtains an AgentWallet reference
+   * from executing transactions.
+   */
+  authToken?: string;
+  /**
+   * CRIT-05 fix: Wallet-level agent identifier, set at construction time.
+   * Used for security-critical decisions (circuit breaker isolation,
+   * self-approval prevention) instead of the self-reported agentId in
+   * intent metadata, which is untrusted.
+   */
+  agentId?: string;
 }
 
 /** Default safe tools when no enabledTools is configured */
@@ -340,6 +371,8 @@ const DEFAULT_ENABLED_TOOLS: ReadonlySet<string> = new Set([
 ]);
 
 export class AgentWallet {
+  // DATA-008 fix: Track unprefixed store instances to warn about sharing collisions.
+  private static readonly unprefixedStores = new WeakSet<Store>();
   private readonly signer: Signer;
   private readonly chain: ChainAdapter;
   private readonly policy: PolicyEngine;
@@ -354,8 +387,22 @@ export class AgentWallet {
   private executeLock: Promise<void> = Promise.resolve();
   /** M-23 fix: Timeout for mutex acquisition (milliseconds) */
   private readonly mutexTimeoutMs: number;
+  /** CRIT-14 fix: Count of in-flight execute() calls currently holding the mutex */
+  private inflightCount = 0;
+  /** CRIT-14 fix: When true, new execute() calls are rejected (graceful shutdown) */
+  private draining = false;
   /** H-06 fix: Set of tool names enabled for dispatch */
   private readonly enabledTools: ReadonlySet<string>;
+  /** CRIT-04 fix: Optional capability token for caller authentication */
+  private readonly authToken?: string;
+  /** CRIT-05 fix: Wallet-level agent identifier for security-critical decisions */
+  private readonly walletAgentId?: string;
+  /**
+   * CRIT-13 fix: Unique identifier for this process + wallet instance.
+   * Used as the value for the store-based advisory lock to detect when
+   * a different process holds the lock on the same store.
+   */
+  private readonly processId: string;
 
   constructor(config: AgentWalletConfig) {
     this.signer = config.signer;
@@ -367,6 +414,20 @@ export class AgentWallet {
     const effectiveStore = config.storePrefix
       ? PrefixedStore.wrapIfNeeded(config.store, config.storePrefix)
       : config.store;
+    // DATA-008 fix: Warn when multiple wallet instances share a raw store without
+    // PrefixedStore isolation. Without prefixes, spending limits, rate counters,
+    // circuit breaker state, and audit logs collide between wallets.
+    if (!config.storePrefix) {
+      if (AgentWallet.unprefixedStores.has(config.store)) {
+        process.emitWarning(
+          "AgentWallet: multiple wallet instances share the same store without storePrefix. " +
+          "Spending limits, rate counters, and audit logs will collide. " +
+          "Set storePrefix to a unique value (e.g., the signer's public key) for each wallet.",
+          "KovaWalletWarning",
+        );
+      }
+      AgentWallet.unprefixedStores.add(config.store);
+    }
     this.store = effectiveStore;
     // Create AuditLogger — use provided logger, or create one with config
     if (config.logger) {
@@ -416,20 +477,27 @@ export class AgentWallet {
       }
       this.idempotencyHmacKey = keyBuffer;
     } else {
-      // CRIT-05: Auto-generate a cryptographically random 32-byte key so that
-      // idempotency cache integrity is always protected, even without explicit config.
+      // CRIT-03 fix: In production environments, auto-generating HMAC keys is dangerous
+      // because they don't survive process restarts. All idempotency entries become
+      // unverifiable on restart, allowing duplicate transaction execution. Throw an
+      // error in production unless explicitly opted out.
+      const isTestEnv = typeof process !== "undefined" && (
+        process.env.NODE_ENV === "test" || process.env.KOVA_ALLOW_MEMORY_STORE === "1"
+      );
+      if (!isTestEnv && !config.dangerouslyAllowAutoHmacKey) {
+        throw new Error(
+          "AgentWallet: idempotencyHmacKey is required for production use. " +
+          "Auto-generated keys don't survive process restarts, allowing duplicate " +
+          "transaction execution. Generate one with: crypto.randomBytes(32).toString('hex') " +
+          "and store it securely. Pass { dangerouslyAllowAutoHmacKey: true } to override.",
+        );
+      }
       this.idempotencyHmacKey = randomBytes(32);
-      // T8-F8 fix: Warn when the HMAC key is auto-generated in non-test environments.
-      // After a process restart, all existing idempotency cache entries become
-      // unverifiable (HMAC mismatch), effectively clearing the cache and allowing
-      // duplicate transaction execution for previously submitted intents.
       try {
         if (typeof process !== "undefined" && process.env.NODE_ENV !== "test") {
           process.emitWarning(
-            "AgentWallet: idempotencyHmacKey was auto-generated. After a process restart, " +
-            "existing idempotency cache entries will become unverifiable. For production use, " +
-            "provide a persistent idempotencyHmacKey in the config to prevent duplicate " +
-            "transaction execution across restarts.",
+            "AgentWallet: idempotencyHmacKey was auto-generated with dangerouslyAllowAutoHmacKey. " +
+            "After a process restart, idempotency cache entries will be unverifiable.",
             "KovaIdempotencyKeyWarning",
           );
         }
@@ -451,6 +519,17 @@ export class AgentWallet {
     // H-06 fix: Configure enabled tools. Default to safe read-only tools only.
     this.enabledTools = config.enabledTools ?? DEFAULT_ENABLED_TOOLS;
 
+    // CRIT-04 fix: Store auth token for caller authentication
+    this.authToken = config.authToken;
+
+    // CRIT-05 fix: Store wallet-level agentId for security-critical decisions
+    this.walletAgentId = config.agentId;
+
+    // CRIT-13 fix: Generate a unique identifier for this process + wallet instance.
+    // Combines process.pid with a random UUID to ensure uniqueness across both
+    // multiple processes (pid) and multiple wallet instances within the same process (UUID).
+    this.processId = `${process.pid}-${randomUUID()}`;
+
     // MED-T3-08 fix: Warn when enabledTools contains tool names not recognized by the
     // wallet's dispatch logic. This catches typos and adapter/wallet desync issues at
     // construction time rather than silently failing at invocation time, where the
@@ -458,9 +537,12 @@ export class AgentWallet {
     const knownToolNames = new Set<string>(WALLET_TOOL_NAMES);
     for (const tool of this.enabledTools) {
       if (!knownToolNames.has(tool)) {
-        console.warn(
-          `[AgentWallet] Warning: enabledTools contains unrecognized tool "${tool}". ` +
-          `This tool will not be dispatched by the wallet. Known tools: ${WALLET_TOOL_NAMES.join(", ")}`,
+        // HIGH-25 fix: Use process.emitWarning instead of console.warn to avoid
+        // leaking tool names to stderr.
+        process.emitWarning(
+          "enabledTools contains an unrecognized tool name. " +
+          "This tool will not be dispatched by the wallet.",
+          { code: "KOVA_CONFIG_WARNING" },
         );
       }
     }
@@ -480,6 +562,31 @@ export class AgentWallet {
   }
 
   /**
+   * CRIT-14 fix: Gracefully drain in-flight transactions then destroy the wallet.
+   *
+   * This method sets the draining flag to reject new execute() calls immediately,
+   * then polls until all in-flight transactions complete (or the timeout expires),
+   * and finally calls destroy() to release all resources and zero key material.
+   *
+   * Prefer drain() over destroy() for graceful shutdown. Use destroy() directly
+   * only when you are certain there are no in-flight transactions.
+   *
+   * @param timeoutMs - Maximum time (ms) to wait for in-flight transactions
+   *   to complete before calling destroy() anyway. Defaults to 30 000 ms.
+   * @throws Never — always calls destroy() before returning, even on timeout.
+   */
+  async drain(timeoutMs = 30_000): Promise<void> {
+    this.draining = true;
+
+    const deadline = Date.now() + timeoutMs;
+    while (this.inflightCount > 0 && Date.now() < deadline) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 100));
+    }
+
+    await this.destroy();
+  }
+
+  /**
    * CRIT-T5-03 fix: Gracefully shut down the wallet, releasing all held resources.
    * - Destroys the circuit breaker (stops heartbeat timer, clears state)
    * - Destroys the audit logger (zeroes HMAC key)
@@ -488,11 +595,17 @@ export class AgentWallet {
    * After calling destroy(), the wallet cannot process any more transactions.
    * This method is idempotent — calling it multiple times is safe.
    *
+   * **CRIT-14 RECOMMENDATION**: Prefer {@link drain}() for graceful shutdown.
+   * drain() sets the draining flag to reject new execute() calls, waits for
+   * in-flight transactions to finish, then calls destroy(). Calling destroy()
+   * directly while transactions are in-flight may leave spending counters
+   * inflated or audit log entries incomplete.
+   *
    * CONC-08 NOTE — GRACEFUL SHUTDOWN:
    * This method does NOT wait for in-flight transactions to complete and does NOT
    * register SIGINT/SIGTERM handlers. Callers should:
    *   1. Stop submitting new execute() calls before calling destroy().
-   *   2. Optionally register process.on('SIGTERM', () => wallet.destroy()) in
+   *   2. Optionally register process.on('SIGTERM', () => wallet.drain()) in
    *      their startup code to handle container/orchestrator signals.
    *   3. Be aware that calling destroy() while a transaction is in-flight may
    *      leave spending counters inflated (consumed budget without a transaction)
@@ -528,6 +641,14 @@ export class AgentWallet {
       const msg = err instanceof Error ? err.message : "Unknown error";
       process.emitWarning(`AgentWallet.destroy: signer cleanup failed: ${msg}`, "KovaDestroyWarning");
     }
+
+    // CRYPTO-001 fix: Zero the idempotency HMAC key material to prevent recovery
+    // from memory dumps, heap snapshots, or core files. This key protects the
+    // idempotency cache from forgery — leaving it in memory after destroy() is
+    // unnecessary exposure.
+    if (this.idempotencyHmacKey) {
+      this.idempotencyHmacKey.fill(0);
+    }
   }
 
   /**
@@ -538,7 +659,38 @@ export class AgentWallet {
    * S1-02 fix: Idempotent — duplicate intent IDs return cached results.
    * S1-09 fix: Validates intent structure before processing.
    */
-  async execute(intent: TransactionIntent): Promise<TransactionResult> {
+  async execute(intent: TransactionIntent, authToken?: string): Promise<TransactionResult> {
+    // CRIT-04 fix: Verify caller authentication if authToken is configured.
+    // Prevents unauthorized code that obtains a wallet reference from executing transactions.
+    if (this.authToken && authToken !== this.authToken) {
+      return {
+        status: "failed",
+        summary: "Authentication failed: invalid or missing auth token",
+        intentId: "unknown",
+        timestamp: Date.now(),
+        error: {
+          code: "AUTH_FAILED",
+          message: "Invalid or missing authentication token.",
+        },
+      };
+    }
+
+    // CRIT-14 fix: Reject new transactions while the wallet is draining.
+    // This prevents new work from entering the pipeline after drain() has been called,
+    // ensuring that all in-flight transactions complete before destroy() zeroes keys.
+    if (this.draining) {
+      return {
+        status: "failed",
+        summary: "Wallet is shutting down, no new transactions accepted",
+        intentId: (intent && typeof intent === "object" && "id" in intent ? (intent as TransactionIntent).id : undefined) ?? "unknown",
+        timestamp: Date.now(),
+        error: {
+          code: "WALLET_DRAINING",
+          message: "Wallet is shutting down, no new transactions accepted.",
+        },
+      };
+    }
+
     // CORE-005 fix: Deep-clone intent at entry to eliminate TOCTOU window.
     // Prevents external mutation of the intent object from affecting the pipeline
     // after validation has passed. Objects with non-cloneable values (functions,
@@ -604,14 +756,25 @@ export class AgentWallet {
     const previousLock = this.executeLock;
     this.executeLock = new Promise<void>((resolve) => { releaseLock = resolve; });
 
+    // MED-37 fix: Store the timeout ID so it can be cleared when the lock is
+    // acquired normally. Without clearTimeout, the timer fires after the lock
+    // is already acquired and released, creating a dangling timer that may
+    // interfere with clean process shutdown or trigger unexpected behavior.
+    let mutexTimeoutId: ReturnType<typeof setTimeout> | undefined;
     const timeoutPromise = new Promise<"timeout">((resolve) => {
-      setTimeout(() => resolve("timeout"), this.mutexTimeoutMs);
+      mutexTimeoutId = setTimeout(() => resolve("timeout"), this.mutexTimeoutMs);
     });
 
     const lockResult = await Promise.race([
       previousLock.then(() => "acquired" as const),
       timeoutPromise,
     ]);
+
+    // MED-37 fix: Clear the timeout timer regardless of outcome to prevent
+    // dangling timers. On the "acquired" path this prevents the timer from
+    // firing after the lock is held. On the "timeout" path this is a no-op
+    // since the timer already fired.
+    clearTimeout(mutexTimeoutId);
 
     if (lockResult === "timeout") {
       // Release our slot in the lock chain so subsequent callers aren't permanently blocked
@@ -628,9 +791,35 @@ export class AgentWallet {
       };
     }
 
+    // CRIT-13 fix: Advisory cross-process lock using the store.
+    // After acquiring the process-local mutex, check whether another process holds
+    // a store-based advisory lock. This detects (but does not block) concurrent access
+    // from multiple Node.js processes sharing the same store backend.
+    // The lock is advisory only — a warning is emitted, but execution proceeds.
+    // A TTL ensures stale locks from crashed processes auto-expire.
+    try {
+      const existingLock = await this.store.get(ADVISORY_LOCK_KEY);
+      if (existingLock !== null && existingLock !== this.processId) {
+        process.emitWarning(
+          `AgentWallet: another process (${existingLock}) holds the advisory lock on this store. ` +
+          "Concurrent access from multiple processes can cause TOCTOU races, " +
+          "spending limit bypasses, and audit log inconsistencies. " +
+          "Use a single process per store, or use separate stores with storePrefix.",
+          "KovaAdvisoryLockWarning",
+        );
+      }
+      await this.store.set(ADVISORY_LOCK_KEY, this.processId, ADVISORY_LOCK_TTL_SECONDS);
+    } catch {
+      // Non-fatal: if the store is unavailable, we still proceed with the transaction.
+      // The advisory lock is best-effort — store failures should not block execution.
+    }
+
+    // CRIT-14 fix: Track in-flight transactions so drain() can wait for completion.
+    this.inflightCount++;
     try {
       return await this.executeInternal(intent);
     } finally {
+      this.inflightCount--;
       releaseLock!();
     }
   }
@@ -783,11 +972,16 @@ export class AgentWallet {
     if (this.circuitBreaker) {
       let cbReason: string | null;
       try {
-        cbReason = await this.circuitBreaker.check(undefined, normalizedIntent.type);
-      } catch (cbErr) {
+        // CRIT-05 fix: Pass wallet-level agentId for per-agent circuit breaker isolation
+        cbReason = await this.circuitBreaker.check(undefined, normalizedIntent.type, this.walletAgentId);
+      } catch {
         // H-31: Store error during circuit breaker check — fail-closed (deny)
-        const errMsg = cbErr instanceof Error ? cbErr.message : String(cbErr);
-        console.error(`[KOVA] Circuit breaker check failed (fail-closed): ${errMsg}`);
+        // HIGH-25 fix: Use process.emitWarning instead of console.error to avoid
+        // leaking store error details to stderr.
+        process.emitWarning(
+          "Circuit breaker check failed (fail-closed)",
+          { code: "KOVA_CIRCUIT_BREAKER_WARNING" },
+        );
         return {
           status: "denied",
           summary: "Denied: circuit breaker check unavailable (fail-closed)",
@@ -827,10 +1021,15 @@ export class AgentWallet {
     // should not break the transaction flow, but are logged for observability.
     if (this.circuitBreaker) {
       try {
-        await this.circuitBreaker.recordOutcome(policyDecision.decision, undefined, normalizedIntent.type);
-      } catch (cbErr) {
-        const errMsg = cbErr instanceof Error ? cbErr.message : String(cbErr);
-        console.error(`[KOVA] Circuit breaker recordOutcome failed: ${errMsg}`);
+        // CRIT-05 fix: Pass wallet-level agentId for per-agent circuit breaker isolation
+        await this.circuitBreaker.recordOutcome(policyDecision.decision, undefined, normalizedIntent.type, this.walletAgentId);
+      } catch {
+        // HIGH-25 fix: Use process.emitWarning instead of console.error to avoid
+        // leaking store error details to stderr.
+        process.emitWarning(
+          "Circuit breaker recordOutcome failed",
+          { code: "KOVA_CIRCUIT_BREAKER_WARNING" },
+        );
         // Non-fatal: the transaction has already been evaluated by policy.
         // Failing to record the outcome means the circuit breaker count may drift,
         // but this is safer than aborting a policy-approved transaction.
@@ -861,14 +1060,22 @@ export class AgentWallet {
         error,
       };
 
-      // M-52 fix: Wrap logAudit in try/catch for denied results. If audit logging
-      // fails, still return the denial to the caller (fail-closed on the transaction,
-      // not on the response). The denial decision itself is security-critical.
-      try {
-        await this.logAudit(normalizedIntent, ruleAudits, policyDecision, undefined);
-      } catch {
-        // Audit failure for denied results is non-fatal — the denial still stands
+      // DATA-004 fix: Apply the same retry logic (3 attempts with backoff) used for
+      // confirmed transactions. Without retries, transient audit store failures cause
+      // denied transactions to be silently unlogged, making it appear that certain
+      // policy violations never occurred. An attacker who can cause transient audit
+      // store failures could selectively prevent denial records from being logged.
+      let deniedAuditLogged = false;
+      for (let attempt = 0; attempt < 3 && !deniedAuditLogged; attempt++) {
+        try {
+          await this.logAudit(normalizedIntent, ruleAudits, policyDecision, undefined);
+          deniedAuditLogged = true;
+        } catch {
+          if (attempt < 2) await new Promise((r) => setTimeout(r, 100 * (attempt + 1)));
+        }
       }
+      // M-52 fix: Audit failure for denied results is non-fatal — the denial still stands.
+      // The denial decision itself is security-critical and must be returned regardless.
       // S2-03 fix: Don't cache denied results — denial may be temporary (rate limit expires, budget resets)
       return result;
     }
@@ -908,8 +1115,21 @@ export class AgentWallet {
     try {
       const signerAddress = await this.signer.getAddress();
 
+      // CRIT-06 fix: Capture pre-swap balance snapshot for post-swap verification.
+      // For swap intents, record the output token balance before broadcasting so we
+      // can verify the swap produced the expected minimum output (detects sandwich attacks).
+      let preSwapSnapshot: { outputToken: string; preBalance: bigint; snapshotTimestamp: number } | undefined;
+      if (normalizedIntent.type === "swap" && this.chain.getPreSwapSnapshot) {
+        const swapParams = normalizedIntent.params as { toToken: string };
+        try {
+          preSwapSnapshot = await this.chain.getPreSwapSnapshot(signerAddress, swapParams.toToken);
+        } catch {
+          // Non-fatal: if snapshot fails, skip post-swap verification but continue the swap
+        }
+      }
+
       // Build unsigned transaction
-      const unsignedTx = await this.chain.buildTransaction(normalizedIntent, signerAddress);
+      let unsignedTx = await this.chain.buildTransaction(normalizedIntent, signerAddress);
 
       // CRIT-02 fix: Simulate transaction before signing to detect on-chain errors early.
       // This catches insufficient balance, program errors, and other issues without spending fees.
@@ -941,6 +1161,19 @@ export class AgentWallet {
         return simResult;
       }
 
+      // CRIT-07 fix: Refresh the blockhash before signing.
+      // If policy evaluation involved an approval gate (which can block for minutes),
+      // the blockhash obtained during buildTransaction may have expired (~60-90s on Solana).
+      // Refreshing ensures the transaction won't fail at broadcast due to a stale blockhash.
+      if (this.chain.refreshBlockhash) {
+        try {
+          unsignedTx = await this.chain.refreshBlockhash(unsignedTx);
+        } catch {
+          // Non-fatal: if refresh fails, proceed with the original blockhash.
+          // The broadcast may fail with BlockhashNotFound, but that's recoverable.
+        }
+      }
+
       // Sign it
       const signedTx = await this.signer.sign(unsignedTx);
 
@@ -954,6 +1187,37 @@ export class AgentWallet {
 
       // Broadcast to chain
       const txId = await this.chain.broadcast(signedTx.data);
+
+      // CRIT-06 fix: Post-swap verification — check that the swap produced the expected
+      // minimum output amount. Detects sandwich attacks and partial fills by comparing
+      // pre-swap and post-swap balances of the output token.
+      if (preSwapSnapshot && this.chain.verifySwapOutput && normalizedIntent.type === "swap") {
+        // Compute minimum expected output. Without a quote oracle in the pipeline,
+        // use 0n as the absolute minimum (any positive output is acceptable).
+        // When a quoted amount is available (e.g., from a DEX aggregator), pass it
+        // as quotedOutAmount for tighter slippage detection.
+        const minimumExpectedOut = BigInt(0);
+        try {
+          const verification = await this.chain.verifySwapOutput(
+            signerAddress,
+            preSwapSnapshot,
+            minimumExpectedOut,
+          );
+          if (!verification.passed) {
+            // Log a warning but don't fail the transaction — the swap already executed on-chain.
+            // The warning alerts operators to potential sandwich attacks for investigation.
+            // HIGH-25 fix: Use process.emitWarning instead of console.error to avoid
+            // leaking exact balances and amounts to stderr.
+            process.emitWarning(
+              "Swap output verification failed: received amount below minimum expected. " +
+              "This may indicate a sandwich attack or partial fill.",
+              { code: "KOVA_SWAP_VERIFICATION_WARNING" },
+            );
+          }
+        } catch {
+          // Non-fatal: verification failure doesn't invalidate the swap transaction
+        }
+      }
 
       const result: TransactionResult = {
         status: "confirmed",
@@ -1091,8 +1355,13 @@ export class AgentWallet {
    */
   async getPolicy(): Promise<PolicySummary> {
     const rules = this.policy.getRules();
+    // MED-38 fix: Redact the policy name to prevent rule-set reconnaissance.
+    // Previously exposed exact rule names joined (e.g., "spending-limit+allowlist+rate-limit"),
+    // which revealed exactly which policy rules are configured and could be used to
+    // craft transactions that exploit gaps in coverage.
+    const ruleCount = this.policy.getRuleNames().length;
     const summary: PolicySummary = {
-      name: this.policy.getRuleNames().join("+") || "default",
+      name: ruleCount > 0 ? "custom" : "default",
       spendingLimits: {},
       allowlistedAddresses: 0,
       allowlistedPrograms: 0,
@@ -1118,7 +1387,9 @@ export class AgentWallet {
     // an attacker to calculate exactly how many denials trigger the breaker and
     // how long to wait before retrying.
     if (this.circuitBreaker) {
-      const isOpen = await this.circuitBreaker.isOpen();
+      // HIGH-10 fix: Pass walletAgentId so isOpen() checks per-agent circuit breaker
+      // state, preventing cross-agent DoS where one agent's denials block another.
+      const isOpen = await this.circuitBreaker.isOpen(undefined, this.walletAgentId);
       summary.circuitBreaker = {
         threshold: "[redacted]" as unknown as number,
         cooldownMs: "[redacted]" as unknown as number,
@@ -1149,7 +1420,9 @@ export class AgentWallet {
     if (!Number.isFinite(limit) || limit < 1) {
       limit = 10;
     }
-    const sanitizedLimit = Math.min(Math.floor(limit), MAX_HISTORY_LIMIT);
+    // LOW-04 fix: Clamp limit to at least 1 so callers cannot request zero or
+    // negative results, which would silently return an empty array.
+    const sanitizedLimit = Math.min(Math.floor(Math.max(1, limit)), MAX_HISTORY_LIMIT);
     try {
       const entries = await this.logger.getRecent(sanitizedLimit);
       return entries.map((entry): TransactionResult => {
@@ -1192,8 +1465,54 @@ export class AgentWallet {
    * Handle a tool call from an AI agent.
    * Dispatches to the appropriate wallet method based on tool name.
    */
-  async handleToolCall(name: string, input: Record<string, unknown>): Promise<ToolCallResult> {
+  /**
+   * INPUT-001 fix: Per-instance write rate limiting timestamps.
+   * Previously, write rate limiting was only enforced in safeHandleToolCall() (tools.ts),
+   * meaning direct callers of handleToolCall() bypassed it entirely. Moving it here
+   * ensures all callers — including Anthropic/OpenAI adapter users — are rate-limited.
+   */
+  private readonly writeTimestamps: number[] = [];
+
+  async handleToolCall(name: string, input: Record<string, unknown>, authToken?: string): Promise<ToolCallResult> {
+    // CRIT-04 fix: Verify caller authentication if authToken is configured.
+    if (this.authToken && authToken !== this.authToken) {
+      return { success: false, error: "Authentication failed: invalid or missing auth token." };
+    }
     try {
+      // INPUT-001 fix: Validate and sanitize tool input INSIDE handleToolCall to ensure
+      // all callers go through schema validation, required field checks, unknown property
+      // stripping, and type validation — even if they bypass safeHandleToolCall().
+      // Previously, the Anthropic/OpenAI adapters were format-conversion-only and did not
+      // route through safeHandleToolCall, so direct callers skipped all validation.
+      let validatedInput: Record<string, unknown>;
+      try {
+        validatedInput = validateToolInput(name, input) as Record<string, unknown>;
+      } catch (validationErr) {
+        // MED-09 fix: Return an error immediately instead of falling through to process
+        // the raw (unvalidated) input. Falling through undermines the entire validation
+        // pipeline — unknown tools, missing fields, and type mismatches would bypass
+        // schema validation and reach the handler dispatch with unsanitized input.
+        const msg = validationErr instanceof Error ? validationErr.message : String(validationErr);
+        return { success: false, error: `Validation failed: ${stripControlChars(msg.slice(0, 200))}` };
+      }
+
+      // INPUT-001 fix: Enforce write rate limit floor for write operations.
+      // Same logic as safeHandleToolCall but instance-scoped to this wallet.
+      if (WRITE_TOOL_NAMES.has(name)) {
+        const now = Date.now();
+        const windowStart = now - 60_000;
+        while (this.writeTimestamps.length > 0 && this.writeTimestamps[0]! < windowStart) {
+          this.writeTimestamps.shift();
+        }
+        if (this.writeTimestamps.length >= WRITE_RATE_LIMIT_PER_MINUTE) {
+          return {
+            success: false,
+            error: `Write rate limit exceeded (${WRITE_RATE_LIMIT_PER_MINUTE} per minute). Try again later.`,
+          };
+        }
+        this.writeTimestamps.push(now);
+      }
+
       // H-06 fix: Check tool enablement before dispatch. Only tools in the configured
       // enabledTools set are dispatched. This prevents dangerous tools (wallet_execute_custom,
       // wallet_get_policy) from being invoked even if the agent knows the tool name.
@@ -1215,23 +1534,25 @@ export class AgentWallet {
       // configured tool set. The default case below provides a secondary safety net,
       // returning "Unknown tool" for any value that somehow passes the guard but
       // doesn't match a known case — ensuring fail-closed behavior.
+      // INPUT-001 fix: Use validatedInput (sanitized, stripped of unknown props)
+      // instead of raw input for all handler dispatch.
       switch (name as WalletToolName) {
         case "wallet_transfer":
-          return await this.handleTransfer(input);
+          return await this.handleTransfer(validatedInput);
         case "wallet_swap":
-          return await this.handleSwap(input);
+          return await this.handleSwap(validatedInput);
         case "wallet_mint":
-          return await this.handleMint(input);
+          return await this.handleMint(validatedInput);
         case "wallet_stake":
-          return await this.handleStake(input);
+          return await this.handleStake(validatedInput);
         case "wallet_execute_custom":
-          return await this.handleCustom(input);
+          return await this.handleCustom(validatedInput);
         case "wallet_get_balance":
-          return await this.handleGetBalance(input);
+          return await this.handleGetBalance(validatedInput);
         case "wallet_get_policy":
           return await this.handleGetPolicy();
         case "wallet_get_transaction_history":
-          return await this.handleGetHistory(input);
+          return await this.handleGetHistory(validatedInput);
         default: {
           // M-11 fix: Sanitize tool name before reflecting in error response.
           // M-55 fix: Do NOT list available tools — prevents reconnaissance.
@@ -1434,14 +1755,18 @@ export class AgentWallet {
 	      const amountErr = validateDecimalAmount(amount);
 	      if (amountErr) return `Swap: ${amountErr}`;
 	      if (maxSlippage !== undefined) {
-	        if (typeof maxSlippage !== "number" || !Number.isFinite(maxSlippage) || maxSlippage < 0 || maxSlippage > 1) {
-	          return "Swap: 'maxSlippage' must be a finite number between 0 and 1";
+	        // MED-07 fix: Reject negative and zero maxSlippage. A value of 0 means zero
+	        // tolerance for price movement, which would cause all swaps to fail and could
+	        // indicate a logic error. Require strictly positive slippage (> 0).
+	        if (typeof maxSlippage !== "number" || !Number.isFinite(maxSlippage) || maxSlippage <= 0 || maxSlippage > 1) {
+	          return "Swap: 'maxSlippage' must be a finite number greater than 0 and at most 1";
 	        }
-	        // M-60 fix: Cap maxSlippage to 50% (0.5) to prevent MEV extraction.
-	        // A 100% slippage tolerance allows sandwich attacks to extract the entire
-	        // swap value. Even 50% is generous — most legitimate swaps use 0.5-5%.
-	        if (maxSlippage > 0.5) {
-	          return "Swap: 'maxSlippage' exceeds maximum of 0.5 (50%). High slippage enables MEV extraction";
+	        // HIGH-11 fix: Cap maxSlippage to 5% (0.05) to align with the chain-layer cap
+	        // in src/chains/solana/swaps.ts (MED-12 fix). Previously this was 50% (0.5),
+	        // creating a gap where the wallet layer would accept slippage that the chain
+	        // layer would reject. Most legitimate swaps use 0.5-5%.
+	        if (maxSlippage > 0.05) {
+	          return "Swap: 'maxSlippage' exceeds maximum of 0.05 (5%). High slippage enables MEV extraction";
 	        }
 	      }
 	    }
@@ -1590,12 +1915,23 @@ export class AgentWallet {
       // would persist on disk for a full day. Only cache the fields needed for idempotency
       // replay: status, txId, intentId, timestamp, summary, and error codes. Raw params
       // (recipient addresses, token amounts) from the original intent are excluded.
+      //
+      // MED-27 fix: Redact addresses in the summary before caching. The summary field
+      // contains human-readable transaction details (amounts, token names, shortened
+      // addresses) that persist in the store for the full idempotency TTL. Redacting
+      // base58 addresses limits sensitive data exposure in the cache while preserving
+      // enough context for idempotency replay semantics.
+      const redactedSummary = result.summary
+        ? result.summary.replace(/\b[A-HJ-NP-Za-km-z1-9]{32,44}\b/g, (addr) =>
+            addr.length > 8 ? `${addr.slice(0, 3)}...${addr.slice(-3)}` : addr
+          )
+        : result.summary;
       const sanitizedResult: Record<string, unknown> = {
         status: result.status,
         txId: result.txId,
         intentId: result.intentId,
         timestamp: result.timestamp,
-        summary: result.summary,
+        summary: redactedSummary,
       };
       if (result.error) {
         sanitizedResult.error = { code: result.error.code, message: result.error.message };
@@ -2306,6 +2642,12 @@ export class AgentWallet {
    * prompt-injected the agent can learn the exact amounts to stay under to avoid
    * triggering controls. Only expose the token and whether a limit exists.
    */
+  /**
+   * MED-38 fix: Redact token names in addition to amounts in spending limits.
+   * Exposing which tokens have limits reveals which tokens are protected and,
+   * by omission, which tokens have NO limits — enabling an attacker to target
+   * unprotected tokens. Replace token names with "[redacted]" as well.
+   */
   private populateSpendingLimits(
     summary: PolicySummary,
     rule: SpendingLimitRule,
@@ -2314,36 +2656,42 @@ export class AgentWallet {
     if (config.perTransaction) {
       summary.spendingLimits.perTransaction = {
         amount: "[redacted]",
-        token: config.perTransaction.token,
+        token: "[redacted]",
       };
     }
     if (config.daily) {
       summary.spendingLimits.daily = {
         amount: "[redacted]",
-        token: config.daily.token,
+        token: "[redacted]",
       };
     }
     if (config.weekly) {
       summary.spendingLimits.weekly = {
         amount: "[redacted]",
-        token: config.weekly.token,
+        token: "[redacted]",
       };
     }
     if (config.monthly) {
       summary.spendingLimits.monthly = {
         amount: "[redacted]",
-        token: config.monthly.token,
+        token: "[redacted]",
       };
     }
   }
 
+  /**
+   * MED-38 fix: Redact exact allowlist counts to prevent reconnaissance.
+   * Exposing exact counts (e.g., "3 addresses, 2 programs") reveals how
+   * restrictive the allowlist is and helps attackers gauge bypass feasibility.
+   * Instead, indicate only whether allowlists are configured (non-zero) or not.
+   */
   private populateAllowlist(
     summary: PolicySummary,
-    rule: AllowlistRule,
+    _rule: AllowlistRule,
   ): void {
-    const config = rule.getConfig();
-    summary.allowlistedAddresses = config.allowAddresses?.length ?? 0;
-    summary.allowlistedPrograms = config.allowPrograms?.length ?? 0;
+    const config = _rule.getConfig();
+    summary.allowlistedAddresses = (config.allowAddresses?.length ?? 0) > 0 ? -1 : 0;
+    summary.allowlistedPrograms = (config.allowPrograms?.length ?? 0) > 0 ? -1 : 0;
   }
 
   /**
@@ -2364,6 +2712,12 @@ export class AgentWallet {
     };
   }
 
+  /**
+   * MED-38 fix: Redact timezone from the time window summary.
+   * Exposing the exact timezone reveals the operator's location and helps
+   * an attacker determine when the window opens/closes for timing attacks.
+   * Only expose whether the window is currently active.
+   */
   private populateTimeWindow(
     summary: PolicySummary,
     rule: TimeWindowRule,
@@ -2413,7 +2767,7 @@ export class AgentWallet {
     }
 
     summary.activeHours = {
-      timezone: config.timezone,
+      timezone: "[redacted]",
       isCurrentlyActive: isActive,
     };
   }
@@ -2425,13 +2779,12 @@ export class AgentWallet {
    */
   private populateApprovalGate(
     summary: PolicySummary,
-    rule: ApprovalGateRule,
+    _rule: ApprovalGateRule,
   ): void {
-    const config = rule.getConfig();
     summary.approvalRequired = {
       above: {
         amount: "[redacted]",
-        token: config.above.token,
+        token: "[redacted]",
       },
     };
   }

@@ -122,6 +122,7 @@ export const WALLET_TOOLS: readonly ToolDefinition[] = [
         reason: {
           type: "string",
           description: "Why this transfer is being made (for audit trail)",
+          maxLength: 500,
         },
       },
       required: ["to", "amount", "token", "chain"],
@@ -138,15 +139,18 @@ export const WALLET_TOOLS: readonly ToolDefinition[] = [
         fromToken: {
           type: "string",
           description: 'Token to sell (e.g., "SOL")',
+          maxLength: 64,
         },
         toToken: {
           type: "string",
           description: 'Token to buy (e.g., "USDC")',
+          maxLength: 64,
         },
         amount: {
           type: "string",
           description:
             'Amount of fromToken to sell as a decimal string (e.g., "5.0")',
+          maxLength: 64,
         },
         maxSlippage: {
           type: "number",
@@ -166,6 +170,7 @@ export const WALLET_TOOLS: readonly ToolDefinition[] = [
         reason: {
           type: "string",
           description: "Why this swap is being made (for audit trail)",
+          maxLength: 500,
         },
       },
       required: ["fromToken", "toToken", "amount", "chain"],
@@ -182,15 +187,18 @@ export const WALLET_TOOLS: readonly ToolDefinition[] = [
         collection: {
           type: "string",
           description: "Collection or program address",
+          maxLength: 128,
         },
         metadataUri: {
           type: "string",
           description: "Metadata URI for the NFT",
+          maxLength: 256,
         },
         to: {
           type: "string",
           description:
             "Recipient address (defaults to this wallet's address if not specified)",
+          maxLength: 128,
         },
         chain: {
           type: "string",
@@ -202,6 +210,7 @@ export const WALLET_TOOLS: readonly ToolDefinition[] = [
         reason: {
           type: "string",
           description: "Why this mint is being made (for audit trail)",
+          maxLength: 500,
         },
       },
       required: ["collection", "metadataUri", "chain"],
@@ -218,15 +227,18 @@ export const WALLET_TOOLS: readonly ToolDefinition[] = [
         amount: {
           type: "string",
           description: 'Amount to stake as a decimal string (e.g., "100")',
+          maxLength: 64,
         },
         token: {
           type: "string",
           description: 'Token to stake (e.g., "SOL")',
+          maxLength: 64,
         },
         validator: {
           type: "string",
           description:
             "Validator or staking pool address (optional, uses default if omitted)",
+          maxLength: 128,
         },
         chain: {
           type: "string",
@@ -238,6 +250,7 @@ export const WALLET_TOOLS: readonly ToolDefinition[] = [
         reason: {
           type: "string",
           description: "Why this stake is being made (for audit trail)",
+          maxLength: 500,
         },
       },
       required: ["amount", "token", "chain"],
@@ -261,6 +274,7 @@ export const WALLET_TOOLS: readonly ToolDefinition[] = [
           type: "string",
           description:
             'Token symbol to check balance for (e.g., "SOL", "USDC")',
+          maxLength: 64,
         },
       },
       required: ["token"],
@@ -345,6 +359,7 @@ export const DANGEROUS_TOOLS: readonly ToolDefinition[] = [
           type: "string",
           description:
             "Why this instruction is being executed (for audit trail)",
+          maxLength: 500,
         },
       },
       required: ["programId", "data", "accounts", "chain"],
@@ -410,13 +425,34 @@ export function getFilteredTools(options?: { includeDangerous?: boolean; exclude
 /**
  * M-12: Sanitize attacker-controlled values before including them in error messages.
  * Truncates long values, strips control characters, and prevents log injection.
+ *
+ * LOW-05 fix: Avoid calling toString() on arbitrary objects, which can trigger
+ * prototype pollution gadgets or custom getters. Only stringify primitives
+ * (string, number, boolean); all other types return a safe placeholder.
  */
 function sanitizeForError(value: unknown): string {
-  const str = String(value);
+  // LOW-05 fix: Use typeof guard to avoid invoking toString on untrusted objects.
+  let str: string;
+  const t = typeof value;
+  if (t === "string" || t === "number" || t === "boolean") {
+    str = String(value);
+  } else if (value === null || value === undefined) {
+    str = String(value);
+  } else {
+    // Arbitrary objects, functions, symbols — do not invoke toString/valueOf.
+    str = "[object]";
+  }
   // Strip control characters (C0, DEL, C1 ranges) and truncate to 100 chars.
   // LOW-T3-01 fix: Use Array.from() to avoid splitting multi-byte Unicode surrogate pairs
   // that .slice() could bisect, producing invalid lone surrogates in the output.
-  const cleaned = Array.from(str.replace(/[\x00-\x1F\x7F-\x9F]/g, "")).slice(0, 100).join("");
+  // INPUT-010 fix: Also strip Unicode bidirectional overrides (RTL/LTR) and zero-width
+  // characters that could be used to disguise error message content in logs/UIs.
+  const cleaned = Array.from(
+    str
+      .replace(/[\x00-\x1F\x7F-\x9F]/g, "")                    // C0, DEL, C1 control chars
+      .replace(/[\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, "") // Bidi overrides
+      .replace(/[\u200B-\u200D\uFEFF]/g, ""),                   // Zero-width chars
+  ).slice(0, 100).join("");
   return cleaned;
 }
 
@@ -469,6 +505,17 @@ export function validateToolInput(
         `Field "${key}" for tool "${toolName}" must be a number, got ${typeof input[key]}`,
       );
     }
+    // LOW-08 fix: NaN passes typeof === "number" but is not a valid numeric
+    // value. Reject it explicitly to prevent downstream arithmetic errors.
+    if (
+      (expectedType === "number" || expectedType === "integer") &&
+      typeof input[key] === "number" &&
+      Number.isNaN(input[key] as number)
+    ) {
+      throw new Error(
+        `Field "${key}" for tool "${toolName}" must be a finite number, got NaN`,
+      );
+    }
     if (expectedType === "boolean" && typeof input[key] !== "boolean") {
       throw new Error(
         `Field "${key}" for tool "${toolName}" must be a boolean, got ${typeof input[key]}`,
@@ -502,10 +549,21 @@ export function validateToolInput(
     }
 
     // HIGH-T3-04 fix: Validate maxItems for array-typed fields (passed as JSON strings)
+    // LOW-07 fix: Also validate maxItems when the value is already a native array,
+    // not just a JSON-encoded string. Without the Array.isArray guard a non-array
+    // JSON value (e.g. a plain string) could bypass the length check via its
+    // string .length property.
     const maxItems = properties[key]?.maxItems;
-    if (maxItems && typeof input[key] === "string") {
+    if (maxItems && Array.isArray(input[key])) {
+      if ((input[key] as unknown[]).length > maxItems) {
+        throw new Error(
+          `Field "${key}" for tool "${toolName}" exceeds max items of ${maxItems}`,
+        );
+      }
+    } else if (maxItems && typeof input[key] === "string") {
       try {
         const parsed = JSON.parse(input[key] as string);
+        // LOW-07 fix: Only enforce maxItems when parsed result is actually an array.
         if (Array.isArray(parsed) && parsed.length > maxItems) {
           throw new Error(
             `Field "${key}" for tool "${toolName}" exceeds max items of ${maxItems}`,
@@ -522,8 +580,42 @@ export function validateToolInput(
 
   // API-005: Also validate enum constraints on optional (non-required) fields if present
   // MED-CROSS-01 fix: Also validate maximum constraints on optional fields
+  // INPUT-007 fix: Extend optional field validation to match required field validation
+  // (type checking, maxLength, maxItems) to prevent type confusion in downstream handlers.
   for (const key of knownKeys) {
-    if (key in input && input[key] !== undefined && input[key] !== null) {
+    if (key in input && input[key] !== undefined && input[key] !== null && !required.includes(key)) {
+      const expectedType = properties[key]?.type;
+      // INPUT-007 fix: Validate types for optional fields
+      if (expectedType === "string" && typeof input[key] !== "string") {
+        throw new Error(
+          `Field "${key}" for tool "${toolName}" must be a string, got ${typeof input[key]}`,
+        );
+      }
+      if (
+        (expectedType === "number" || expectedType === "integer") &&
+        typeof input[key] !== "number"
+      ) {
+        throw new Error(
+          `Field "${key}" for tool "${toolName}" must be a number, got ${typeof input[key]}`,
+        );
+      }
+      // LOW-08 fix: NaN passes typeof === "number" but is not a valid numeric
+      // value. Reject it explicitly to prevent downstream arithmetic errors.
+      if (
+        (expectedType === "number" || expectedType === "integer") &&
+        typeof input[key] === "number" &&
+        Number.isNaN(input[key] as number)
+      ) {
+        throw new Error(
+          `Field "${key}" for tool "${toolName}" must be a finite number, got NaN`,
+        );
+      }
+      if (expectedType === "boolean" && typeof input[key] !== "boolean") {
+        throw new Error(
+          `Field "${key}" for tool "${toolName}" must be a boolean, got ${typeof input[key]}`,
+        );
+      }
+
       const enumValues = properties[key]?.enum;
       if (enumValues && !enumValues.includes(input[key] as string)) {
         throw new Error(
@@ -535,6 +627,37 @@ export function validateToolInput(
         throw new Error(
           `Field "${key}" for tool "${toolName}" exceeds maximum value of ${maxVal}`,
         );
+      }
+      // INPUT-007 fix: Validate maxLength for optional string fields
+      const maxLen = properties[key]?.maxLength;
+      if (maxLen && typeof input[key] === "string" && (input[key] as string).length > maxLen) {
+        throw new Error(
+          `Field "${key}" for tool "${toolName}" exceeds max length of ${maxLen}`,
+        );
+      }
+      // INPUT-007 fix: Validate maxItems for optional array-typed fields (JSON strings)
+      // LOW-07 fix: Also validate maxItems when the value is already a native array.
+      const maxItems = properties[key]?.maxItems;
+      if (maxItems && Array.isArray(input[key])) {
+        if ((input[key] as unknown[]).length > maxItems) {
+          throw new Error(
+            `Field "${key}" for tool "${toolName}" exceeds max items of ${maxItems}`,
+          );
+        }
+      } else if (maxItems && typeof input[key] === "string") {
+        try {
+          const parsed = JSON.parse(input[key] as string);
+          // LOW-07 fix: Only enforce maxItems when parsed result is actually an array.
+          if (Array.isArray(parsed) && parsed.length > maxItems) {
+            throw new Error(
+              `Field "${key}" for tool "${toolName}" exceeds max items of ${maxItems}`,
+            );
+          }
+        } catch (err) {
+          if (err instanceof Error && err.message.includes("exceeds max items")) {
+            throw err;
+          }
+        }
       }
     }
   }
@@ -595,9 +718,18 @@ export function sanitizeToolResponse(toolName: string, result: unknown): string 
     // Strip characters that commonly appear in prompt injection payloads
     if (typeof value === "string") {
       return value
-        .replace(/[\x00-\x1F\x7F-\x9F]/g, "") // control chars
-        .replace(/```/g, "'''")                  // code fences
-        .replace(/<\/?[a-zA-Z][^>]*>/g, "");     // HTML-like tags
+        .replace(/[\x00-\x1F\x7F-\x9F]/g, "")              // control chars (C0, DEL, C1)
+        // INPUT-003 fix: Strip Unicode RTL/LTR override characters that can reorder
+        // text display to disguise injection payloads.
+        .replace(/[\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, "") // bidi overrides
+        // INPUT-003 fix: Strip zero-width characters that can hide payloads from
+        // human reviewers while being processed by LLMs.
+        .replace(/[\u200B-\u200D\uFEFF]/g, "")              // zero-width chars
+        // INPUT-003 fix: Escape Markdown special characters that could be used for
+        // injection payloads in Markdown-rendering contexts.
+        .replace(/([*_~`#\[\]|])/g, "\\$1")                 // Markdown specials
+        .replace(/```/g, "'''")                               // code fences
+        .replace(/<\/?[a-zA-Z][^>]*>/g, "");                  // HTML-like tags
     }
     // BigInt serialization support
     if (typeof value === "bigint") {

@@ -190,16 +190,16 @@ describe("SqliteStore", () => {
   });
 
   describe("TTL edge cases", () => {
-    it("should not set TTL when ttlSeconds is zero", async () => {
-      await store.set("key1", "value1", 0);
-      await new Promise((r) => setTimeout(r, 10));
-      expect(await store.get("key1")).toBe("value1");
+    it("should throw when ttlSeconds is zero (MED-08)", async () => {
+      await expect(store.set("key1", "value1", 0)).rejects.toThrow(
+        "ttlSeconds must be a positive finite number",
+      );
     });
 
-    it("should not set TTL when ttlSeconds is negative", async () => {
-      await store.set("key1", "value1", -5);
-      await new Promise((r) => setTimeout(r, 10));
-      expect(await store.get("key1")).toBe("value1");
+    it("should throw when ttlSeconds is negative (MED-08)", async () => {
+      await expect(store.set("key1", "value1", -5)).rejects.toThrow(
+        "ttlSeconds must be a positive finite number",
+      );
     });
 
     it("should overwrite TTL when re-setting with new TTL", async () => {

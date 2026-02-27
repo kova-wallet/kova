@@ -191,8 +191,10 @@ const approval = new TelegramApprovalBot({
 | `token` | `string` | Yes | -- | Bot token from BotFather |
 | `chatId` | `string` | Yes | -- | Telegram chat ID to send requests to |
 | `defaultTimeout` | `number` | No | `300,000` (5 min) | Default timeout in milliseconds |
-| `allowedUserIds` | `number[]` | No | `undefined` (any user) | Whitelist of Telegram user IDs allowed to respond |
+| `allowedUserIds` | `number[]` | No | `undefined` | Whitelist of Telegram user IDs allowed to respond. Required unless `allowAllUsers: true` |
+| `allowAllUsers` | `boolean` | No | `undefined` | Explicitly opt in to allowing any chat member to approve/reject. Must be `true` if `allowedUserIds` is not provided |
 | `pollInterval` | `number` | No | `2,000` | Milliseconds between getUpdates polls |
+| `requestTimeoutMs` | `number` | No | `15,000` | HTTP timeout for Telegram API requests |
 
 ### How Polling Works
 
@@ -242,6 +244,19 @@ The `allowedUserIds` field restricts who can respond to approval requests. When 
 
 ::: danger
 If `allowedUserIds` is not configured, **any user** who has access to the chat can approve or reject transactions. In a group chat, this means anyone in the group can approve. Always set `allowedUserIds` in production.
+:::
+
+### Security Hardening
+
+The TelegramApprovalBot includes several security measures:
+
+- **HKDF key derivation**: Callback data is signed using HMAC keys derived via HKDF (HMAC-based Key Derivation Function), providing proper domain separation
+- **192-bit HMAC tags**: Each approval callback carries a 192-bit HMAC tag (48 hex characters) to prevent forgery
+- **HMAC failure counting**: After 10 failed HMAC verification attempts for a single request, it is automatically rejected
+- **Secure token storage**: The bot token is stored as a `Buffer` and zero-filled on `destroy()`, preventing the token from lingering in V8's heap
+
+::: warning
+You must either provide `allowedUserIds` to restrict approvers, or explicitly set `allowAllUsers: true`. Without either, the constructor throws an error.
 :::
 
 ### Token Redaction
