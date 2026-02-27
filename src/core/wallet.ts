@@ -2227,7 +2227,7 @@ export class AgentWallet {
           // Now we use a best-effort approach: re-query the price oracle if available,
           // and only skip if unavailable. Incorrect rollback values could over-count
           // remaining budget (unsafe), so we only rollback if we can get a current price.
-          const chainWithUsd = this.chain as Record<string, unknown>;
+          const chainWithUsd = this.chain as unknown as Record<string, unknown>;
           if (this.chain && typeof chainWithUsd.getValueInUSD === "function") {
             const usdWindowKeys: Array<{ window: string }> = [];
             if (config.dailyUSD) usdWindowKeys.push({ window: "daily" });
