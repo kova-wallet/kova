@@ -67,7 +67,7 @@ async function main() {
     // T6-F5 fix: Pass dangerouslyAllowInProduction to allow LocalSigner usage in examples.
     // Production deployments should use MpcSigner with a hardware-backed provider instead.
     signer: new LocalSigner(keypair, { dangerouslyAllowInProduction: true }),
-    chain: new SolanaAdapter({ rpcUrl: RPC_URL }),
+    chain: new SolanaAdapter({ rpcUrl: RPC_URL, network: "devnet" }),
     policy: engine,
     store,
   });
