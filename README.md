@@ -21,8 +21,10 @@ Give your AI agents the ability to transact on Solana — with guardrails. kova 
 - **AI tool integration** — first-class support for Claude, OpenAI, and LangChain
 - **Human approval** — Telegram bot for human-in-the-loop on high-value transactions
 - **Audit log** — SHA-256 hash-chained, tamper-evident transaction log
-- **Circuit breaker** — automatic cooldown after consecutive policy denials
-- **Solana** — SOL transfers, SPL tokens, Jupiter swaps
+- **Circuit breaker** — automatic cooldown with per-agent isolation
+- **Dashboard** — web admin UI for devnet testing, policy management, and transaction monitoring
+- **Security hardened** — 196 audit findings remediated (14 CRIT, 27 HIGH, 38 MED, 31 LOW)
+- **Solana** — SOL transfers, SPL tokens, Jupiter swaps (devnet by default)
 
 ## Install
 
@@ -40,13 +42,18 @@ import {
 } from "kova";
 
 // 1. Create a signer — holds the private key, signs transactions
-const signer = new LocalSigner(Keypair.generate());
+// Note: LocalSigner is for development only. Use MpcSigner in production.
+const signer = new LocalSigner(Keypair.generate(), { dangerouslyAllowInProduction: true });
 
 // 2. Create a store — tracks spending totals, rate-limit counters, and audit entries
-const store = new MemoryStore();
+// Note: MemoryStore is for development only. Use SqliteStore in production.
+const store = new MemoryStore({ dangerouslyAllowInProduction: true });
 
-// 3. Create a chain adapter — connects to Solana and broadcasts transactions
-const chain = new SolanaAdapter({ rpcUrl: "https://api.devnet.solana.com" });
+// 3. Create a chain adapter — connects to Solana devnet
+const chain = new SolanaAdapter({
+  rpcUrl: "https://api.devnet.solana.com",
+  network: "devnet",
+});
 
 // 4. Define a policy — max 1 SOL per transaction, 5 SOL daily limit
 const policy = Policy.create("demo")
@@ -101,7 +108,7 @@ kova exposes wallet operations as tool definitions that agents can call directly
 ```typescript
 // Send a message to Claude with kova wallet tools attached
 const response = await anthropic.messages.create({
-  model: "claude-sonnet-4-20250514",
+  model: "claude-sonnet-4-5-20250929",
   tools: wallet.toAnthropicTools(),   // converts wallet operations to Anthropic tool format
   messages: [{ role: "user", content: "Send 0.1 SOL to GsbwXf...QRre" }],
 });
@@ -207,6 +214,7 @@ const stricter = Policy.extend(policy, "strict").spendingLimit({ ... }).build();
 | [claude-agent](examples/claude-agent/) | Claude agent with wallet tools |
 | [telegram-approval](examples/telegram-approval/) | Human-in-the-loop approval via Telegram |
 | [policy-playground](examples/policy-playground/) | Interactive policy testing |
+| [dashboard](dashboard/) | Admin UI for devnet testing and policy management |
 
 Run any example:
 
@@ -217,10 +225,15 @@ npx tsx examples/basic-transfer/index.ts   # run any example with tsx
 
 ## Security
 
+kova underwent a comprehensive security audit (8 teams, 40 engineers) with **196 findings remediated** across all severity levels. See [security-audits/](security-audits/) for full reports.
+
+- **Security audited** — 14 Critical, 27 High, 38 Medium, 31 Low findings — all remediated
 - **Fail-closed** — exceptions in policy rules deny the transaction; audit log failures block all transactions
-- **Circuit breaker** — consecutive denials trigger automatic cooldown
+- **Two-phase policy evaluation** — dry-run prevents counter inflation on denied transactions
+- **Circuit breaker** — consecutive denials trigger automatic cooldown with per-agent isolation
 - **Hash-chained audit** — SHA-256 linked entries with `verifyIntegrity()` tamper detection
-- **Serialized execution** — mutex prevents TOCTOU race conditions
+- **Serialized execution** — FIFO async mutex prevents TOCTOU race conditions
+- **DNS pinning** — SSRF and DNS rebinding protection for RPC endpoints
 - **Idempotent** — duplicate intent IDs return cached results
 - **No secret leakage** — errors sanitized before returning to agents
 
