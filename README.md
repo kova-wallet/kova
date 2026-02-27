@@ -223,6 +223,55 @@ cp .env.example .env    # copy the template and fill in your RPC URL, keys, etc.
 npx tsx examples/basic-transfer/index.ts   # run any example with tsx
 ```
 
+## Getting Started
+
+### Prerequisites
+
+- Node.js 20+
+- npm
+
+### Clone and verify
+
+```bash
+git clone https://github.com/0xKeyserSoze/kova.git
+cd kova
+npm install
+npm run lint        # 0 errors, 0 warnings
+npm run typecheck   # clean
+npx vitest run      # 1147 tests pass
+npm run build       # compile
+```
+
+### Run the examples
+
+Examples use Solana devnet — no real funds needed.
+
+```bash
+cp .env.example .env                             # fill in RPC URL if needed (defaults to devnet)
+npx tsx examples/basic-transfer/index.ts         # generates a keypair, airdrops SOL, sends a transfer
+```
+
+The `claude-agent` example requires an `ANTHROPIC_API_KEY` in `.env`.
+
+### Run the dashboard
+
+```bash
+cd dashboard
+npm install
+npx tsx wallet/generate.ts    # one-time: generates a devnet keypair
+npm run dev                   # starts at http://localhost:3000
+```
+
+Fund the wallet at [faucet.solana.com](https://faucet.solana.com) using the address printed by `generate.ts`. The dashboard auto-loads the keypair on startup with a default policy (0.01 SOL per-tx, 1 SOL daily, 5 txns/min rate limit).
+
+### Use kova in your own project
+
+```bash
+npm install kova
+```
+
+Then follow the [Quick Start](#quick-start) above. All consumer code should pass `network: "devnet"` to `SolanaAdapter` and the `dangerouslyAllowInProduction: true` flags to `LocalSigner` and `MemoryStore` during development.
+
 ## Security
 
 kova underwent a comprehensive security audit (8 teams, 40 engineers) with **196 findings remediated** across all severity levels. See [security-audits/](security-audits/) for full reports.
