@@ -40,6 +40,9 @@ kova-list.md
 dashboard-demo-helpers/
 examples/
 
+# Dashboard (separate project, not part of the SDK)
+dashboard/
+
 # Documentation build artifacts
 docs/
 docs-site/.vitepress/cache/
