@@ -33,6 +33,12 @@ SECURITY_AUDIT*.md
 # Design assets (local only)
 assets/
 
+# Local notes and planning files
+thoughts.md
+*.nd
+kova-list.md
+dashboard-demo-helpers/
+
 # Documentation build artifacts
 docs/
 docs-site/.vitepress/cache/

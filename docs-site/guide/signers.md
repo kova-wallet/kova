@@ -17,7 +17,7 @@ Signers are responsible for holding private keys and signing transactions. The `
 | Scenario | Recommended Signer | Why |
 |---|---|---|
 | **Local development / testing** | `LocalSigner` | Simple setup, key lives in memory. No external dependencies. |
-| **Production with MPC** | `MpcSigner` + your provider | Key is split across multiple parties via MPC. Wire any backend (Turnkey, Lit Protocol, Fireblocks). |
+| **Production with MPC** | `MpcSigner` + `TurnkeyProvider` (built-in) or your own provider | Key is split across multiple parties via MPC. Use the built-in Turnkey provider or wire any backend (Lit Protocol, Fireblocks). |
 | **Production with KMS** | Custom signer (e.g., AWS KMS) | Private key managed by a cloud key management service. See the custom signer example below. |
 | **Production (institutional)** | `MpcSigner` or custom signer | Hardware-backed signing with audit trails, multi-party approvals, and compliance features. |
 
@@ -334,50 +334,122 @@ interface MpcSignerConfig {
 }
 ```
 
-### Example: Implementing a Provider
+### Built-in Provider: Turnkey
+
+Kova ships with a ready-made `TurnkeyProvider` that implements `MpcSigningProvider` using [Turnkey](https://turnkey.com)'s server-side SDK. Turnkey signs transactions inside TEEs (Trusted Execution Environments), meaning private keys never leave secure hardware.
+
+#### Install
+
+```bash
+npm install @turnkey/sdk-server
+```
+
+`@turnkey/sdk-server` is an optional peer dependency -- it is only loaded when you use `TurnkeyProvider`.
+
+#### Configuration
 
 ```typescript
-// Example: A Turnkey MPC provider adapter.
-// Turnkey provides MPC-based key management with an API for remote signing.
-import { MpcSigningProvider, MpcSignResult } from "kova";
+import { TurnkeyProvider } from "kova";
+import type { TurnkeyProviderConfig } from "kova";
+```
 
-class TurnkeyProvider implements MpcSigningProvider {
-  readonly name = "turnkey";
-  private readonly organizationId: string;
-  private readonly privateKeyId: string;
+```typescript
+// TurnkeyProvider configuration.
+// All fields are required.
+interface TurnkeyProviderConfig {
+  /** Turnkey API base URL (e.g., "https://api.turnkey.com") */
+  apiBaseUrl: string;
+  /** API public key from your Turnkey API key pair */
+  apiPublicKey: string;
+  /** API private key from your Turnkey API key pair */
+  apiPrivateKey: string;
+  /** Your Turnkey organization ID */
+  defaultOrganizationId: string;
+  /**
+   * The Solana wallet address or Turnkey private key ID to sign with.
+   * If this is a Solana address (base58), it will be used directly.
+   * If this is a Turnkey private key ID (UUID), Turnkey resolves it internally.
+   */
+  signWith: string;
+}
+```
 
-  constructor(config: { organizationId: string; privateKeyId: string }) {
-    this.organizationId = config.organizationId;
-    this.privateKeyId = config.privateKeyId;
-  }
+#### Usage
+
+```typescript
+import { TurnkeyProvider, MpcSigner, AgentWallet, SolanaAdapter } from "kova";
+
+// 1. Create the Turnkey provider with your API credentials
+const provider = new TurnkeyProvider({
+  apiBaseUrl: "https://api.turnkey.com",
+  apiPublicKey: process.env.TURNKEY_API_PUBLIC_KEY!,
+  apiPrivateKey: process.env.TURNKEY_API_PRIVATE_KEY!,
+  defaultOrganizationId: process.env.TURNKEY_ORGANIZATION_ID!,
+  signWith: process.env.TURNKEY_WALLET_ADDRESS!, // Solana address or private key ID
+});
+
+// 2. Wrap it in MpcSigner for retry/timeout/validation
+const signer = new MpcSigner({
+  provider,
+  chain: "solana",
+  maxRetries: 3,
+  timeoutMs: 15_000,
+});
+
+// 3. Use it in an AgentWallet -- works exactly like LocalSigner
+const wallet = new AgentWallet({
+  signer,
+  chain: new SolanaAdapter({ rpcUrl: "https://api.mainnet-beta.solana.com" }),
+  policy: engine,
+  store: new SqliteStore({ path: "./wallet.db" }),
+});
+```
+
+#### Turnkey Setup Steps
+
+1. **Create a Turnkey account** at [app.turnkey.com](https://app.turnkey.com)
+2. **Create an API key pair** in your organization settings. Save the public and private keys.
+3. **Create a Solana wallet** in Turnkey (uses Ed25519 curve). Copy the wallet address.
+4. **Set environment variables**:
+   ```bash
+   TURNKEY_API_PUBLIC_KEY="your-api-public-key"
+   TURNKEY_API_PRIVATE_KEY="your-api-private-key"
+   TURNKEY_ORGANIZATION_ID="your-org-id"
+   TURNKEY_WALLET_ADDRESS="your-solana-wallet-address"
+   ```
+
+::: tip
+The `TurnkeyProvider` lazily initializes the Turnkey SDK client on first use. If `@turnkey/sdk-server` is not installed, you will get a clear error message telling you to install it.
+:::
+
+### Example: Implementing a Custom Provider
+
+If your MPC backend is not Turnkey, implement `MpcSigningProvider` directly:
+
+```typescript
+// Example: A custom MPC provider adapter for Lit Protocol.
+import type { MpcSigningProvider, MpcSignResult } from "kova";
+
+class LitProtocolProvider implements MpcSigningProvider {
+  readonly name = "lit-protocol";
 
   async getAddress(): Promise<string> {
-    // Call Turnkey API to get the public address for this private key
-    const response = await turnkeyClient.getPrivateKey({
-      organizationId: this.organizationId,
-      privateKeyId: this.privateKeyId,
-    });
-    return response.addresses[0].address;
+    // Call your MPC backend to get the public address
+    return "your-wallet-address";
   }
 
   async signTransaction(transactionData: Uint8Array): Promise<MpcSignResult> {
-    // Submit the unsigned transaction bytes to Turnkey for MPC signing
-    const result = await turnkeyClient.signRawPayload({
-      organizationId: this.organizationId,
-      privateKeyId: this.privateKeyId,
-      payload: Buffer.from(transactionData).toString("hex"),
-      encoding: "hex",
-    });
-
+    // Submit unsigned transaction bytes to your MPC backend for signing
+    const result = await yourMpcBackend.sign(transactionData);
     return {
-      signedData: Buffer.from(result.signedPayload, "hex"),
-      signature: Buffer.from(result.signature, "hex"),
+      signedData: result.signedTransaction,  // Full signed transaction bytes
+      signature: result.signature,            // Raw 64-byte Ed25519 signature
     };
   }
 
   async healthCheck(): Promise<boolean> {
     try {
-      await turnkeyClient.getWhoami({ organizationId: this.organizationId });
+      await yourMpcBackend.ping();
       return true;
     } catch {
       return false;
@@ -389,10 +461,13 @@ class TurnkeyProvider implements MpcSigningProvider {
 ### Using MpcSigner
 
 ```typescript
-// Create the provider (your backend adapter)
+// Create the provider (your backend adapter or the built-in TurnkeyProvider)
 const provider = new TurnkeyProvider({
-  organizationId: process.env.TURNKEY_ORG_ID!,
-  privateKeyId: process.env.TURNKEY_KEY_ID!,
+  apiBaseUrl: "https://api.turnkey.com",
+  apiPublicKey: process.env.TURNKEY_API_PUBLIC_KEY!,
+  apiPrivateKey: process.env.TURNKEY_API_PRIVATE_KEY!,
+  defaultOrganizationId: process.env.TURNKEY_ORGANIZATION_ID!,
+  signWith: process.env.TURNKEY_WALLET_ADDRESS!,
 });
 
 // Wrap it in MpcSigner with chain validation and retry configuration

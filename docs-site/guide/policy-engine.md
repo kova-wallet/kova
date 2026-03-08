@@ -183,6 +183,42 @@ If you place `ApprovalGateRule` first, every high-value transaction would trigge
 Most setups only need 2-3 rules. A common minimal configuration is just `RateLimitRule` + `SpendingLimitRule`. Only add `AllowlistRule`, `TimeWindowRule`, or `ApprovalGateRule` when your use case requires them.
 :::
 
+::: warning Spending limit and approval gate interaction
+Because `SpendingLimitRule` evaluates before `ApprovalGateRule`, the spending limit acts as a **hard ceiling**. Transactions that exceed the spending limit are denied outright and never reach the approval gate for human review. If you want transactions above a threshold to route to human approval instead of being denied, set the per-transaction spending limit **higher** than the approval gate threshold. For example:
+
+- Per-transaction spending limit: **10 SOL** (hard cap)
+- Approval gate threshold: **1 SOL** (human review)
+- Transactions ≤ 1 SOL: auto-approved
+- Transactions 1-10 SOL: routed to approval
+- Transactions > 10 SOL: denied by spending limit
+:::
+
+## Verbose Error Messages
+
+By default, policy denial messages are **sanitized** before being returned to the caller. Numeric values (amounts, limits), rule names, and other details are stripped to prevent untrusted agents from performing policy reconnaissance.
+
+To see the full, unredacted denial messages (useful for dashboards and debugging), set `verboseErrors: true` when constructing the `AgentWallet`:
+
+```typescript
+const wallet = new AgentWallet({
+  signer,
+  chain,
+  policy: engine,
+  store,
+  verboseErrors: true, // Show full denial details (amounts, limits, rule names)
+});
+```
+
+With `verboseErrors: false` (default):
+```
+Denied by policy: Per-transaction policy rule exceeded
+```
+
+With `verboseErrors: true`:
+```
+Denied by policy: Per-transaction spending limit exceeded: tried to send 3 SOL, limit is 2 SOL
+```
+
 ## PolicyEvaluationResult
 
 The result object returned by `evaluate()`. It tells you the final decision, provides a detailed audit trail for each rule that was evaluated, and reports the total evaluation time.

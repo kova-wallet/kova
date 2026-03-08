@@ -56,6 +56,7 @@ import type { AgentWalletConfig } from "kova";
 | `authToken` | `string` | No | Capability token for caller authentication. When set, `execute()` and `handleToolCall()` require this token; calls without it are rejected with `AUTH_FAILED` |
 | `requireAuth` | `boolean` | No | When `true`, the constructor throws if `authToken` is not provided, enforcing that all wallet instances have caller authentication. Default: `false` |
 | `agentId` | `string` | No | Wallet-level agent identifier. Used for circuit breaker isolation and per-agent rate limiting instead of the self-reported `agentId` in intent metadata, which is untrusted |
+| `verboseErrors` | `boolean` | No | When `true`, policy denial messages include full details (amounts, limits, rule names) without sanitization. Useful for dashboards and development. **Do not enable for untrusted agent callers** -- detailed denials enable policy reconnaissance. Default: `false` |
 
 ::: tip What is a circuit breaker?
 A circuit breaker is a safety mechanism borrowed from electrical engineering. If too many transactions are denied in a row (suggesting a bug or runaway loop), the circuit breaker "trips" and blocks ALL transactions for a cooldown period. This prevents a misbehaving agent from hammering the system with doomed requests.

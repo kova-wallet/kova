@@ -28,8 +28,17 @@ export interface ToolDefinition {
   };
 }
 
+export type ToolCallErrorCode =
+  | "UNKNOWN_TOOL"
+  | "RATE_LIMITED"
+  | "VALIDATION_FAILED"
+  | "EXECUTION_FAILED";
+
 export interface ToolCallResult {
   success: boolean;
   data?: unknown;
+  /** Error message when success is false */
   error?: string;
+  /** Error code for programmatic handling when success is false */
+  errorCode?: ToolCallErrorCode;
 }

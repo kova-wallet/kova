@@ -33,7 +33,8 @@
  */
 
 import { Keypair, Transaction, VersionedTransaction } from "@solana/web3.js";
-import { createPublicKey, verify as cryptoVerify } from "crypto";
+import { createPublicKey } from "crypto";
+import { ed25519 } from "@noble/curves/ed25519";
 import type { Signer, UnsignedTransaction, SignedTransaction } from "./interface.js";
 
 const ED25519_SIGNATURE_LENGTH = 64;
@@ -124,8 +125,11 @@ export class LocalSigner implements Signer {
     // @solana/web3.js Keypair implementation. For production use, prefer MpcSigner with a
     // hardware-backed signing provider (e.g., Turnkey, Fireblocks) that never exposes raw
     // key material to the application process.
-    const clonedSecret = new Uint8Array(keypair.secretKey);
-    this.keypair = Keypair.fromSecretKey(clonedSecret);
+    // HIGH-01 fix: Pass a fresh copy to Keypair.fromSecretKey so external callers
+    // cannot mutate our internal keypair. Note: Keypair.fromSecretKey does NOT deep-copy
+    // the input — it stores the same underlying bytes. We must NOT zero the buffer
+    // we pass in (CRYPTO-004 was zeroing it, which corrupted the keypair's secret key).
+    this.keypair = Keypair.fromSecretKey(new Uint8Array(keypair.secretKey));
 
     // CRYPTO-010 fix: Verify that the reconstructed keypair has the same public key.
     // Detects corruption in the clone/reconstruction process.
@@ -134,10 +138,6 @@ export class LocalSigner implements Signer {
       this.destroyed = true;
       throw new Error("LocalSigner: reconstructed keypair has different public key (possible corruption)");
     }
-
-    // CRYPTO-004 fix: Zero the intermediate buffer after keypair reconstruction
-    // to minimize the window where key material exists in an extra copy.
-    clonedSecret.fill(0);
   }
 
   /**
@@ -209,15 +209,21 @@ export class LocalSigner implements Signer {
     let signature: Uint8Array;
     let messageBytes: Uint8Array;
 
-    // CRIT-02 fix: Single deserialization — reuse the result of the first try/catch.
-    let versionedTx: VersionedTransaction | null = null;
+    // Detect whether the serialized transaction is versioned or legacy.
+    // VersionedTransaction.deserialize() accepts BOTH formats (it auto-detects),
+    // so we must check the message version explicitly to route correctly.
+    // Legacy Transaction.sign() and VersionedTransaction.sign() use different
+    // internal flows; using the wrong path can produce verify mismatches.
+    let isVersioned = false;
     try {
-      versionedTx = VersionedTransaction.deserialize(txData);
+      const probe = VersionedTransaction.deserialize(txData);
+      isVersioned = probe.version !== "legacy";
     } catch {
-      // Not a versioned transaction — will try legacy below
+      // Deserialization failed — treat as legacy
     }
 
-    if (versionedTx) {
+    if (isVersioned) {
+      const versionedTx = VersionedTransaction.deserialize(txData);
       versionedTx.sign([this.keypair]);
       signedData = versionedTx.serialize();
       const sig = versionedTx.signatures[0];
@@ -326,38 +332,21 @@ export class LocalSigner implements Signer {
 }
 
 /**
- * CRIT-01 helper: Verify an Ed25519 signature using Node.js built-in crypto.
- * Uses the 'ed25519' named curve available in Node.js >= 18.
+ * CRIT-01 helper: Verify an Ed25519 signature using @noble/curves/ed25519.
+ * Uses the same Ed25519 implementation that @solana/web3.js uses for signing,
+ * ensuring sign/verify compatibility regardless of Node.js version.
  */
 function verifyEd25519Signature(
   signature: Uint8Array,
   message: Uint8Array,
   publicKey: Uint8Array,
 ): Promise<boolean> {
-  return new Promise((resolve, reject) => {
-    try {
-      // Node.js crypto.verify with Ed25519 expects a raw 32-byte public key
-      // wrapped in a KeyObject. We import the raw key as 'ed25519' type.
-      const keyObject = createPublicKey({
-        key: Buffer.concat([
-          // HIGH-T1-04 fix: Use named constant for the DER SPKI prefix
-          ED25519_DER_SPKI_PREFIX,
-          Buffer.from(publicKey),
-        ]),
-        format: "der",
-        type: "spki",
-      });
-      const result = cryptoVerify(
-        null, // Ed25519 doesn't use a separate hash algorithm
-        Buffer.from(message),
-        keyObject,
-        Buffer.from(signature),
-      );
-      resolve(result);
-    // CRYPTO-009 fix: Differentiate infrastructure errors (key import failures,
-    // algorithm unavailability) from actual verification failures (returning false).
-    } catch (err) {
-      reject(new Error(`Ed25519 verification infrastructure error: ${err instanceof Error ? err.message : String(err)}`));
-    }
-  });
+  try {
+    const result = ed25519.verify(signature, message, publicKey);
+    return Promise.resolve(result);
+  } catch (err) {
+    return Promise.reject(
+      new Error(`Ed25519 verification infrastructure error: ${err instanceof Error ? err.message : String(err)}`),
+    );
+  }
 }

@@ -1,6 +1,6 @@
 {
-  "name": "kova",
-  "version": "0.1.0",
+  "name": "kova-wallet",
+  "version": "1.0.0",
   "description": "A policy-constrained crypto wallet SDK for autonomous AI agents",
   "type": "module",
   "main": "dist/index.js",
@@ -91,6 +91,14 @@
     "typescript": "5.9.3",
     "vitepress": "1.6.4",
     "vitest": "4.0.18"
+  },
+  "peerDependencies": {
+    "@turnkey/sdk-server": ">=2.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@turnkey/sdk-server": {
+      "optional": true
+    }
   },
   "dependencies": {
     "@noble/curves": "1.9.7",

@@ -238,20 +238,24 @@ When a transaction would exceed any configured limit, the rule returns `DENY` wi
 
 **Per-transaction limit exceeded:**
 ```
-DENY: Per-transaction limit exceeded: 3 SOL > 2 SOL
+DENY: Per-transaction spending limit exceeded: tried to send 3 SOL, limit is 2 SOL
 ```
 
 **Daily limit exceeded:**
 ```
-DENY: Daily spending limit exceeded: 8 + 3 = 11 SOL > 10 SOL
+DENY: Daily spending limit exceeded: tried to send 3 SOL, daily limit is 10 SOL (already spent ~8.0000 SOL in this daily window)
 ```
 
 **Weekly limit exceeded:**
 ```
-DENY: Weekly spending limit exceeded: 45 + 10 = 55 SOL > 50 SOL
+DENY: Weekly spending limit exceeded: tried to send 10 SOL, weekly limit is 50 SOL (already spent ~45.0000 SOL in this weekly window)
 ```
 
-The reason includes the current spent amount, the transaction amount, the total that would result, and the configured limit. This information is included in the `TransactionResult.error.message` field and in the audit log.
+The reason includes the attempted amount, the configured limit, and for time-window limits, the current accumulated spend within the window. This information is included in the `TransactionResult.error.message` field and in the audit log.
+
+::: warning Error sanitization
+By default, `AgentWallet` sanitizes denial messages before returning them to the caller, stripping numeric values and rule names to prevent policy reconnaissance by untrusted agents. To see the full detailed messages (e.g., in a dashboard or during development), set `verboseErrors: true` in the `AgentWalletConfig`. See [AgentWallet Configuration](/guide/wallet#agentwallet-config) for details.
+:::
 
 ## Atomic Increment-Then-Check
 

@@ -67,8 +67,6 @@ export interface IntentMetadata {
   agentId?: string;
   /** Identifier for the task this is part of */
   taskId?: string;
-  /** Urgency level — may influence approval timeout */
-  urgency?: "low" | "normal" | "high";
 }
 
 export interface TransactionIntent {

@@ -361,6 +361,14 @@ export interface AgentWalletConfig {
    * intent metadata, which is untrusted.
    */
   agentId?: string;
+  /**
+   * When true, policy denial messages are returned without sanitization,
+   * including exact amounts, limits, and rule names. Useful for dashboards
+   * and development environments where the caller is the wallet owner.
+   * DO NOT enable in production for untrusted agent callers — detailed
+   * denial messages enable policy reconnaissance.
+   */
+  verboseErrors?: boolean;
 }
 
 /** Default safe tools when no enabledTools is configured */
@@ -396,6 +404,8 @@ export class AgentWallet {
   private readonly authToken?: string;
   /** CRIT-05 fix: Wallet-level agent identifier for security-critical decisions */
   private readonly walletAgentId?: string;
+  /** When true, skip sanitization of policy denial messages */
+  private readonly verboseErrors: boolean;
   /**
    * CRIT-13 fix: Unique identifier for this process + wallet instance.
    * Used as the value for the store-based advisory lock to detect when
@@ -523,6 +533,7 @@ export class AgentWallet {
 
     // CRIT-05 fix: Store wallet-level agentId for security-critical decisions
     this.walletAgentId = config.agentId;
+    this.verboseErrors = config.verboseErrors ?? false;
 
     // CRIT-13 fix: Generate a unique identifier for this process + wallet instance.
     // Combines process.pid with a random UUID to ensure uniqueness across both
@@ -1037,23 +1048,19 @@ export class AgentWallet {
 
     // 3. If denied, return immediately with error
     if (policyDecision.decision === "DENY") {
-      // CRIT-12 fix: Sanitize denial reason before exposing to agent to prevent
-      // policy reconnaissance (exact limit amounts, remaining budget, counters).
-      // HIGH-13 fix: Also sanitizes policy evaluation error reasons that may
-      // contain internal details from rule.evaluate() failures.
-      const sanitizedReason = sanitizePolicyDenialForAgent(policyDecision.reason);
-      // H-05 fix: Do NOT include policyDecision.rule in the error response returned
-      // to the agent. Specific rule names (e.g., "spending-limit", "allowlist") enable
-      // reconnaissance — an attacker learns exactly which rule denied, helping them
-      // craft evasion strategies. The rule name is still available in the audit log.
+      // When verboseErrors is enabled (dashboard/dev mode), return the raw denial
+      // reason with full details. Otherwise, sanitize to prevent policy reconnaissance.
+      const reason = this.verboseErrors
+        ? policyDecision.reason
+        : sanitizePolicyDenialForAgent(policyDecision.reason);
       const error: TransactionError = {
         code: "POLICY_DENIED",
-        message: sanitizedReason,
+        message: reason,
       };
 
       const result: TransactionResult = {
         status: "denied",
-        summary: `Denied by policy: ${sanitizedReason}`,
+        summary: `Denied by policy: ${reason}`,
         intentId,
         timestamp: Date.now(),
         error,
@@ -1715,11 +1722,6 @@ export class AgentWallet {
 	          return "Metadata 'taskId' contains invalid characters. Only alphanumeric, hyphens, underscores, dots, and @ are allowed";
 	        }
 	      }
-	      if (metadata.urgency !== undefined) {
-	        if (metadata.urgency !== "low" && metadata.urgency !== "normal" && metadata.urgency !== "high") {
-	          return "Metadata 'urgency' must be one of: low, normal, high";
-	        }
-	      }
 	    }
 
 	    // Type-specific validation with HIGH-10 max length checks
@@ -2033,7 +2035,6 @@ export class AgentWallet {
 	    if (typeof raw.reason === "string") sanitized.reason = stripControlChars(raw.reason.slice(0, MAX_REASON_LENGTH));
 	    if (typeof raw.agentId === "string") sanitized.agentId = stripControlChars(raw.agentId.slice(0, MAX_METADATA_ID_LENGTH));
 	    if (typeof raw.taskId === "string") sanitized.taskId = stripControlChars(raw.taskId.slice(0, MAX_METADATA_ID_LENGTH));
-	    if (raw.urgency === "low" || raw.urgency === "normal" || raw.urgency === "high") sanitized.urgency = raw.urgency;
 
 	    return Object.keys(sanitized).length > 0 ? (sanitized as TransactionIntent["metadata"]) : undefined;
 	  }

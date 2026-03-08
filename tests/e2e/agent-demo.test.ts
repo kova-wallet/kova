@@ -371,8 +371,7 @@ describe("Agent Demo — E2E Workflow", () => {
       );
       expect(r2.status).toBe("denied");
       expect(r2.error!.code).toBe("POLICY_DENIED");
-      // M-61: Denial reason no longer reveals window type
-      expect(r2.error!.message).toContain("Spending limit exceeded");
+      expect(r2.error!.message).toContain("spending limit exceeded");
     });
   });
 
