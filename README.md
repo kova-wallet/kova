@@ -10,6 +10,13 @@
   <a href="https://0xkeysersoze.github.io/kova/"><strong>Documentation &rarr;</strong></a>
 </p>
 
+<p align="center">
+  <a href="https://github.com/0xKeyserSoze/kova/actions/workflows/ci.yml"><img src="https://github.com/0xKeyserSoze/kova/actions/workflows/ci.yml/badge.svg?branch=prod" alt="CI" /></a>
+  <a href="https://www.npmjs.com/package/kova-wallet"><img src="https://img.shields.io/npm/v/kova-wallet" alt="npm version" /></a>
+  <a href="https://github.com/0xKeyserSoze/kova/blob/prod/LICENSE"><img src="https://img.shields.io/npm/l/kova-wallet" alt="license" /></a>
+  <img src="https://img.shields.io/node/v/kova-wallet" alt="node version" />
+</p>
+
 ---
 
 Give your AI agents the ability to transact on Solana — with guardrails. kova sits between your agent and the blockchain, enforcing spending limits, allowlists, rate limits, time windows, and human approval gates on every transaction.
@@ -47,20 +54,9 @@ npm install
 ```bash
 npm run lint        # 0 errors, 0 warnings
 npm run typecheck   # clean
-npx vitest run      # 1147 tests pass
+npx vitest run      # 1163 tests pass
 npm run build       # compile
 ```
-
-### Run the examples
-
-Examples use Solana devnet — no real funds needed.
-
-```bash
-cp .env.example .env                             # fill in RPC URL if needed (defaults to devnet)
-npx tsx examples/basic-transfer/index.ts         # generates a keypair, airdrops SOL, sends a transfer
-```
-
-The `claude-agent` example requires an `ANTHROPIC_API_KEY` in `.env`.
 
 ### Run the dashboard
 
@@ -76,7 +72,7 @@ Fund the wallet at [faucet.solana.com](https://faucet.solana.com) using the addr
 ### Use kova in your own project
 
 ```bash
-npm install kova
+npm install kova-wallet
 ```
 
 ```typescript
@@ -84,7 +80,7 @@ import { Keypair } from "@solana/web3.js";
 import {
   AgentWallet, Policy, PolicyEngine,
   SpendingLimitRule, LocalSigner, MemoryStore, SolanaAdapter,
-} from "kova";
+} from "kova-wallet";
 
 // 1. Create a signer — holds the private key, signs transactions
 // Note: LocalSigner is for development only. Use MpcSigner in production.
@@ -193,7 +189,7 @@ if (toolCall) {
 ### LangChain
 
 ```typescript
-import { createLangChainTools } from "kova";
+import { createLangChainTools } from "kova-wallet";
 
 // Convert kova wallet operations into LangChain-compatible tool objects
 const tools = createLangChainTools(wallet);
@@ -253,19 +249,7 @@ const stricter = Policy.extend(policy, "strict").spendingLimit({ ... }).build();
 | `MemoryStore` | Development and testing (data lost on exit) |
 | `SqliteStore` | Production (persistent, WAL mode, encrypted counters) |
 
-## Examples
-
-| Example | Description |
-|---------|-------------|
-| [basic-transfer](examples/basic-transfer/) | Send SOL with spending limits |
-| [claude-agent](examples/claude-agent/) | Claude agent with wallet tools |
-| [telegram-approval](examples/telegram-approval/) | Human-in-the-loop approval via Telegram |
-| [policy-playground](examples/policy-playground/) | Interactive policy testing |
-| [dashboard](dashboard/) | Admin UI for devnet testing and policy management |
-
 ## Security
-
-kova underwent a comprehensive security audit (8 teams, 40 engineers) with **196 findings remediated** across all severity levels. See [security-audits/](security-audits/) for full reports.
 
 - **Security audited** — 14 Critical, 27 High, 38 Medium, 31 Low findings — all remediated
 - **Fail-closed** — exceptions in policy rules deny the transaction; audit log failures block all transactions
