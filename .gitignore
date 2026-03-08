@@ -38,6 +38,7 @@ thoughts.md
 *.nd
 kova-list.md
 dashboard-demo-helpers/
+examples/
 
 # Documentation build artifacts
 docs/
