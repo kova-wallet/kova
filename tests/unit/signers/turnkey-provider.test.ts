@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect } from "vitest";
 import { TurnkeyProvider } from "../../../src/signers/turnkey-provider.js";
 import type { TurnkeyProviderConfig } from "../../../src/signers/turnkey-provider.js";
 import { Keypair, VersionedTransaction, TransactionMessage, SystemProgram, PublicKey } from "@solana/web3.js";

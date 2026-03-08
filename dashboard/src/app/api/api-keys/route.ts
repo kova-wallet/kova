@@ -1,11 +1,18 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createApiKey, listApiKeys, revokeApiKey, deleteApiKey } from "@/lib/api-keys";
+import { requireDashboardAuth } from "@/lib/auth";
 
-export async function GET() {
+export async function GET(req: NextRequest) {
+  const auth = requireDashboardAuth(req);
+  if (!auth.authenticated) return auth.response;
+
   return NextResponse.json({ keys: listApiKeys() });
 }
 
 export async function POST(req: NextRequest) {
+  const auth = requireDashboardAuth(req);
+  if (!auth.authenticated) return auth.response;
+
   try {
     const body = await req.json();
     const { action } = body as { action: string };

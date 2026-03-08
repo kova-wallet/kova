@@ -1,8 +1,13 @@
+import { NextRequest } from "next/server";
 import { getApprovalChannel } from "@/lib/wallet-manager";
+import { requireDashboardAuth } from "@/lib/auth";
 
 export const dynamic = "force-dynamic";
 
-export async function GET() {
+export async function GET(req: NextRequest) {
+  const auth = requireDashboardAuth(req);
+  if (!auth.authenticated) return auth.response;
+
   const encoder = new TextEncoder();
 
   const stream = new ReadableStream({

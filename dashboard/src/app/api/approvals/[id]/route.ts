@@ -1,10 +1,14 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getApprovalChannel } from "@/lib/wallet-manager";
+import { requireDashboardAuth } from "@/lib/auth";
 
 export async function POST(
   req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
+  const auth = requireDashboardAuth(req);
+  if (!auth.authenticated) return auth.response;
+
   const { id } = await params;
   const channel = getApprovalChannel();
 

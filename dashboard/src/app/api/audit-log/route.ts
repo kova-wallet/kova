@@ -1,7 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { queryAuditLog } from "@/lib/audit-log";
+import { requireDashboardAuth } from "@/lib/auth";
 
 export async function GET(req: NextRequest) {
+  const auth = requireDashboardAuth(req);
+  if (!auth.authenticated) return auth.response;
+
   try {
     const params = req.nextUrl.searchParams;
     const entries = await queryAuditLog({

@@ -60,4 +60,37 @@ export function verifyAuthToken(token: string): boolean {
   return mismatch === 0;
 }
 
+/**
+ * Route-level auth guard (defense-in-depth).
+ *
+ * Middleware is the first layer; this is the second.
+ * Unlike middleware (Edge runtime, can only check cookie existence),
+ * this runs in Node.js and does full HMAC verification.
+ */
+export function requireDashboardAuth(
+  req: Request
+): { authenticated: true } | { authenticated: false; response: Response } {
+  // If no password configured, auth is disabled (dev mode)
+  if (!process.env.KOVA_DASHBOARD_PASSWORD) {
+    return { authenticated: true };
+  }
+
+  // Parse cookie from request headers
+  const cookieHeader = req.headers.get("cookie") ?? "";
+  const match = cookieHeader.match(/(?:^|;\s*)kova_auth=([^;]*)/);
+  const token = match?.[1];
+
+  if (!token || !verifyAuthToken(decodeURIComponent(token))) {
+    return {
+      authenticated: false,
+      response: Response.json(
+        { error: "Authentication required" },
+        { status: 401 }
+      ),
+    };
+  }
+
+  return { authenticated: true };
+}
+
 export { AUTH_COOKIE_NAME, COOKIE_MAX_AGE };

@@ -1,7 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { switchWallet } from "@/lib/wallet-manager";
+import { requireDashboardAuth } from "@/lib/auth";
 
 export async function POST(req: NextRequest) {
+  const auth = requireDashboardAuth(req);
+  if (!auth.authenticated) return auth.response;
+
   try {
     const { address } = (await req.json()) as { address: string };
     if (!address) {

@@ -1,8 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createWalletFromSource } from "@/lib/wallet-manager";
 import type { WalletSourceConfig } from "@/lib/wallet-sources";
+import { requireDashboardAuth } from "@/lib/auth";
 
 export async function POST(req: NextRequest) {
+  const auth = requireDashboardAuth(req);
+  if (!auth.authenticated) return auth.response;
+
   try {
     const body = await req.json();
     const { mode, secretKey, keyfileBytes, keyfilePath, turnkeyConfig } = body as {
