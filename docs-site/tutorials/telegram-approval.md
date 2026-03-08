@@ -143,8 +143,9 @@ const approvalBot = new TelegramApprovalBot({
   token: TELEGRAM_BOT_TOKEN,               // Authenticates with the Telegram Bot API
   chatId: TELEGRAM_CHAT_ID,                 // Chat where approval messages are delivered
   defaultTimeout: 300000,                    // 5 minutes to respond before auto-deny (fail-closed)
-  allowedUserIds: [TELEGRAM_CHAT_ID],        // Only these Telegram user IDs can approve/reject.
-                                             // Prevents unauthorized users from approving transactions.
+  allowedUserIds: [Number(TELEGRAM_CHAT_ID)], // Only these Telegram user IDs can approve/reject.
+                                             // Number() converts the env var string to the number
+                                             // that Telegram uses for user IDs.
   pollInterval: 2000,                        // Poll Telegram for callback responses every 2 seconds.
                                              // Lower = more responsive, higher = fewer API calls.
 });
@@ -155,7 +156,7 @@ const approvalBot = new TelegramApprovalBot({
 | `token` | `string` | Bot token from @BotFather |
 | `chatId` | `string` | Chat ID where approval messages are sent |
 | `defaultTimeout` | `number` | Milliseconds to wait for a response (default: 300000) |
-| `allowedUserIds` | `string[]` | Only these user IDs can approve or reject |
+| `allowedUserIds` | `number[]` | Only these user IDs can approve or reject |
 | `pollInterval` | `number` | How often to poll for callback responses in ms |
 
 ## Step 5: Build a Policy with Approval Gate
@@ -204,7 +205,7 @@ import {
 } from "kova";
 
 // Create the store for spending counters, rate limit windows, and audit log.
-const store = new MemoryStore();
+const store = new MemoryStore(); // Dev-only; throws in production unless KOVA_ALLOW_MEMORY_STORE=1
 // Extract the policy configuration to create individual rule instances.
 const config = policy.toJSON();
 
@@ -213,7 +214,7 @@ const config = policy.toJSON();
 const rules = [
   new SpendingLimitRule(config.spendingLimit!),  // Check spending caps first
   new RateLimitRule(config.rateLimit!),            // Check rate limits next
-  new ApprovalGateRule(config.requireApproval!),   // Approval gate runs last (most expensive)
+  new ApprovalGateRule(config.approvalGate!),   // Approval gate runs last (most expensive)
 ];
 
 // Pass the approvalBot as the third argument to PolicyEngine.
@@ -243,7 +244,7 @@ const keypair = Keypair.fromSecretKey(
 );
 
 // Create the signer, chain adapter, and audit logger.
-const signer = new LocalSigner(keypair);       // Signs transactions with the local keypair
+const signer = new LocalSigner(keypair);       // Dev-only; throws in production unless KOVA_ALLOW_LOCAL_SIGNER=1
 const chain = new SolanaAdapter({
   rpcUrl: "https://api.devnet.solana.com",     // Solana devnet for testing
   commitment: "confirmed",                      // Wait for supermajority confirmation
@@ -486,7 +487,7 @@ const approvalBot = new TelegramApprovalBot({
   token: TELEGRAM_BOT_TOKEN,
   chatId: TELEGRAM_CHAT_ID,
   defaultTimeout: 300000,                // 5 minutes to respond before auto-deny
-  allowedUserIds: [TELEGRAM_CHAT_ID],    // Only this user can approve/reject
+  allowedUserIds: [Number(TELEGRAM_CHAT_ID)],  // Only this user can approve/reject
   pollInterval: 2000,                    // Check for responses every 2 seconds
 });
 
@@ -509,12 +510,12 @@ const policy = Policy.create("telegram-approval-policy")
 
 // --- Engine ---
 // Create the store, rules, and policy engine.
-const store = new MemoryStore();
+const store = new MemoryStore(); // Dev-only; throws in production unless KOVA_ALLOW_MEMORY_STORE=1
 const config = policy.toJSON();
 const rules = [
   new SpendingLimitRule(config.spendingLimit!),  // Check spending caps first
   new RateLimitRule(config.rateLimit!),            // Check rate limits next
-  new ApprovalGateRule(config.requireApproval!),   // Approval gate runs last
+  new ApprovalGateRule(config.approvalGate!),   // Approval gate runs last
 ];
 // Pass approvalBot so the ApprovalGateRule can send Telegram messages.
 const engine = new PolicyEngine(rules, store, approvalBot);
@@ -524,7 +525,7 @@ const engine = new PolicyEngine(rules, store, approvalBot);
 const keypair = Keypair.fromSecretKey(
   Uint8Array.from(JSON.parse(SOLANA_SECRET_KEY))
 );
-const signer = new LocalSigner(keypair);           // Signs transactions locally
+const signer = new LocalSigner(keypair);           // Dev-only; throws in production unless KOVA_ALLOW_LOCAL_SIGNER=1
 const chain = new SolanaAdapter({
   rpcUrl: "https://api.devnet.solana.com",         // Devnet for testing
   commitment: "confirmed",                          // Wait for supermajority

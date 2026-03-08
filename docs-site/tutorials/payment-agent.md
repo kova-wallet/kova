@@ -116,9 +116,9 @@ const secretKey = Uint8Array.from(JSON.parse(process.env.SOLANA_SECRET_KEY!));
 const keypair = Keypair.fromSecretKey(secretKey);
 
 // Wrap the keypair in a LocalSigner so it implements the Signer interface.
-const signer = new LocalSigner(keypair);
+const signer = new LocalSigner(keypair); // Dev-only; throws in production unless KOVA_ALLOW_LOCAL_SIGNER=1
 // Create an in-memory store for spending counters, rate limits, and audit logs.
-const store = new MemoryStore();
+const store = new MemoryStore(); // Dev-only; throws in production unless KOVA_ALLOW_MEMORY_STORE=1
 // Connect to Solana devnet. The chain adapter handles all RPC communication.
 const chain = new SolanaAdapter({
   rpcUrl: "https://api.devnet.solana.com",  // Devnet RPC endpoint (free, rate-limited)
@@ -658,8 +658,8 @@ const secretKey = Uint8Array.from(JSON.parse(process.env.SOLANA_SECRET_KEY!));
 const keypair = Keypair.fromSecretKey(secretKey);
 
 // Create the signer, store, and chain adapter.
-const signer = new LocalSigner(keypair);          // Signs transactions with the local keypair
-const store = new MemoryStore();                   // In-memory state for dev/testing
+const signer = new LocalSigner(keypair);          // Dev-only; throws in production unless KOVA_ALLOW_LOCAL_SIGNER=1
+const store = new MemoryStore();                   // Dev-only; throws in production unless KOVA_ALLOW_MEMORY_STORE=1
 const chain = new SolanaAdapter({
   rpcUrl: "https://api.devnet.solana.com",         // Devnet RPC endpoint
   commitment: "confirmed",                          // Wait for supermajority confirmation

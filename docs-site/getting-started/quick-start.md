@@ -53,10 +53,10 @@ async function main() {
   const keypair = Keypair.generate();
 
   // LocalSigner wraps the keypair so the wallet can sign transactions.
-  // It implements the Signer interface: getAddress(), sign(), healthCheck().
+  // It implements the Signer interface: getAddress(), sign(), healthCheck(), destroy(), toJSON().
   // WARNING: LocalSigner holds the key in plain text in process memory.
   // Use MpcSigner (Turnkey, Fireblocks, Lit Protocol) for real funds.
-  const signer = new LocalSigner(keypair);
+  const signer = new LocalSigner(keypair); // Dev-only; throws in production unless KOVA_ALLOW_LOCAL_SIGNER=1
 
   // Print the wallet's public address (base58-encoded) for reference.
   // This is the "account number" -- safe to share publicly.
@@ -66,7 +66,7 @@ async function main() {
   // MemoryStore implements the Store interface with get/set/increment/append/getRecent.
   // It holds all policy state (spending counters, rate limit windows, audit entries)
   // in memory. Data is lost when the process exits -- use SqliteStore in production.
-  const store = new MemoryStore();
+  const store = new MemoryStore(); // Dev-only; throws in production unless KOVA_ALLOW_MEMORY_STORE=1
 
   // ── 3. Create a chain adapter for Solana ────────────────────────────────
   // SolanaAdapter connects to a Solana RPC endpoint and handles all chain-specific

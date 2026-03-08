@@ -53,9 +53,10 @@ Given a threshold of 10 SOL with a 5-minute timeout:
 import { ApprovalGateRule } from "kova";
 
 // Import the TypeScript types for configuring the approval gate.
-// ApprovalGateConfig: defines the threshold, channel hint, and timeout.
+// ApprovalGateConfig: defines the threshold, channel hint, timeout, and cumulative window.
 // TokenAmount: a { amount, token } pair representing the approval threshold.
-import type { ApprovalGateConfig, TokenAmount } from "kova";
+// UsdSpendingLimit: a { amount } pair for USD-denominated thresholds.
+import type { ApprovalGateConfig, TokenAmount, UsdSpendingLimit } from "kova";
 ```
 
 ## ApprovalGateConfig
@@ -66,10 +67,20 @@ import type { ApprovalGateConfig, TokenAmount } from "kova";
 interface ApprovalGateConfig {
   /** Transactions above this amount require approval */
   above: TokenAmount;
+  /** USD-denominated threshold (alternative to token-specific threshold) */
+  aboveUSD?: UsdSpendingLimit;
   /** Channel type hint (optional, for documentation) */
   channel?: "telegram" | "slack" | "custom";
   /** Timeout in milliseconds. Defaults to 300,000 (5 minutes) */
   timeout?: number;
+  /** Rolling window in seconds for cumulative amount tracking */
+  cumulativeWindow?: number;
+}
+
+// Represents a USD spending limit.
+interface UsdSpendingLimit {
+  /** USD amount as a string (e.g., "100") */
+  amount: string;
 }
 
 // Represents the threshold amount and token.
@@ -110,8 +121,8 @@ Intent: transfer 15 SOL   │ Threshold: 10 SOL    │ Result: request approval
 Intent: transfer 100 USDC │ Threshold: 10 SOL    │ Result: ALLOW (different token)
 ```
 
-::: tip
-Custom intents have no `amount` field, so they always pass the approval gate. If you need approval for custom intents, implement a custom `PolicyRule`.
+::: warning
+Custom intents no longer pass through the approval gate. They are denied by default. If you need custom intents to bypass the approval gate, implement a custom `PolicyRule` that handles them explicitly.
 :::
 
 ## The Approval Flow
@@ -141,6 +152,10 @@ When a transaction exceeds the threshold:
 ::: tip WHAT IS AN APPROVAL CHANNEL?
 An `ApprovalChannel` is the communication mechanism used to reach a human approver. It is an abstraction -- the SDK provides `TelegramApprovalBot` out of the box (sends a message to a Telegram chat), but you can implement any channel (Slack, email, SMS, a web dashboard). The channel is responsible for delivering the approval request and returning the human's decision.
 :::
+
+### Intent Hash Binding
+
+When an approval request is sent, a SHA-256 hash of the intent is computed and included in the request. This binds the approval to the exact transaction parameters. If the intent is modified between the approval request and execution, the hash will not match and the transaction will be denied. This prevents replay or substitution attacks.
 
 ### PENDING State
 

@@ -58,17 +58,19 @@ import type { RateLimitConfig } from "kova";
 
 ```typescript
 // Configuration for the RateLimitRule.
-// Both fields are optional — configure one or both as needed.
+// Both fields are optional, but at least ONE must be configured (both cannot be omitted).
 // Values must be positive integers (enforced at validation time).
 interface RateLimitConfig {
   /** Maximum number of transactions per rolling minute */
   maxTransactionsPerMinute?: number;
   /** Maximum number of transactions per rolling hour */
   maxTransactionsPerHour?: number;
+  /** Optional key prefix for store isolation between rule instances */
+  keyPrefix?: string;
 }
 ```
 
-Both fields are optional. Configure one or both as needed. Values must be positive integers.
+Both fields are optional individually, but **at least one must be configured** -- omitting both will cause a validation error. Values must be positive integers.
 
 ## Constructor
 

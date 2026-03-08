@@ -109,7 +109,7 @@ const keypair = Keypair.fromSecretKey(Uint8Array.from(keypairData));
 // --- 2. Set up the kova wallet ---
 // Create the shared state store. MemoryStore loses data on restart.
 // For production, use SqliteStore for persistence.
-const store = new MemoryStore();
+const store = new MemoryStore({ dangerouslyAllowInProduction: true });
 
 // Define the policy: what the agent is allowed to do.
 // These rules are enforced server-side — the agent cannot bypass them.

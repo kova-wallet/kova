@@ -69,6 +69,10 @@ interface AllowlistConfig {
   allowPrograms?: string[];
   /** Program IDs the agent is NEVER allowed to interact with */
   denyPrograms?: string[];
+  /** Token symbols/mints the agent IS allowed to transact with */
+  allowTokens?: string[];
+  /** Token symbols/mints the agent is NEVER allowed to transact with */
+  denyTokens?: string[];
 }
 ```
 
@@ -156,9 +160,9 @@ The rule extracts target addresses from intents based on intent type:
 | `custom` | `params.programId` | The smart contract being called |
 | `mint` | `params.collection` | The NFT collection being minted from |
 | `stake` | `params.validator` | The validator node receiving the stake |
-| `swap` | No target address (passes through) | Token swaps route through a DEX aggregator, not a specific address |
+| `swap` | Checked against program allowlists | Swap intents are now validated against program allowlists |
 
-If no target address can be extracted (e.g., swap intents), the address check is skipped.
+Swap intents are checked against the program allowlists. Address matching is case-sensitive on Solana and case-normalized (lowercased) on EVM.
 
 ## Code Examples
 
@@ -253,13 +257,12 @@ The `Policy` builder validates that no address or program appears in both the al
 
 ## Denial Messages
 
-When an address or program is denied, the rule returns descriptive messages:
+When an address or program is denied, the rule returns **generic** denial messages that do not reveal the specific address or program. This prevents policy reconnaissance by untrusted agents:
 
 ```
-DENY: Address is denylisted: ScamAddress1111...
-DENY: Address is not in the allowlist: UnknownAddr2222...
-DENY: Program is denylisted: MaliciousProgram3333...
-DENY: Program is not in the allowlist: RandomProgram4444...
+DENY: Address is not permitted by policy
+DENY: Program is not permitted by policy
+DENY: Token is not permitted by policy
 ```
 
 ## Introspection
@@ -273,6 +276,8 @@ console.log("Allowed addresses:", config.allowAddresses);   // Array of allowed 
 console.log("Denied addresses:", config.denyAddresses);     // Array of denied address strings (or undefined)
 console.log("Allowed programs:", config.allowPrograms);     // Array of allowed program ID strings (or undefined)
 console.log("Denied programs:", config.denyPrograms);       // Array of denied program ID strings (or undefined)
+console.log("Allowed tokens:", config.allowTokens);         // Array of allowed token strings (or undefined)
+console.log("Denied tokens:", config.denyTokens);           // Array of denied token strings (or undefined)
 ```
 
 `getConfig()` returns copies of the lists. Mutating the returned arrays does not affect the rule.

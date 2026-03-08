@@ -30,7 +30,7 @@ Think of `SpendingLimitRule` as a prepaid budget tracker. Every time your agent 
 If any answer is "yes," the transaction is blocked. The rule keeps running totals using counters that automatically reset after their time window expires (24 hours, 7 days, or 30 days).
 
 ::: tip
-Each limit is scoped to a specific token (e.g., SOL or USDC). A SOL spending limit will not count USDC transactions against it. To limit multiple tokens, create separate `SpendingLimitRule` instances -- one per token.
+Each limit is scoped to a specific token (e.g., SOL or USDC). If the intent's token does not match the configured limit's token, the transaction is **denied** (not allowed). To permit multiple tokens, create separate `SpendingLimitRule` instances -- one per token -- or use USD-denominated limits which are token-agnostic.
 :::
 
 ## Decision Table
@@ -40,7 +40,7 @@ Each limit is scoped to a specific token (e.g., SOL or USDC). A SOL spending lim
 | Send 1 SOL | 2 SOL | 0 SOL | 10 SOL | **ALLOW** -- under both limits |
 | Send 3 SOL | 2 SOL | 0 SOL | 10 SOL | **DENY** -- exceeds per-transaction limit |
 | Send 1 SOL | 2 SOL | 9.5 SOL | 10 SOL | **DENY** -- 9.5 + 1 = 10.5, exceeds daily limit |
-| Send 100 USDC | 2 SOL | 5 SOL | 10 SOL | **ALLOW** -- different token, rule does not apply |
+| Send 100 USDC | 2 SOL | 5 SOL | 10 SOL | **DENY** -- mismatched token, rule denies by default |
 | Send 2 SOL | 2 SOL | 0 SOL | 10 SOL | **ALLOW** -- exactly at per-transaction limit (not exceeded) |
 
 ## Import
@@ -52,7 +52,8 @@ import { SpendingLimitRule } from "kova";
 // Import the TypeScript types for configuring spending limits.
 // SpendingLimitConfig: defines per-transaction, daily, weekly, and monthly caps.
 // TokenAmount: a { amount, token } pair representing a cap value and the token it applies to.
-import type { SpendingLimitConfig, TokenAmount } from "kova";
+// UsdSpendingLimit: a { amount } pair for USD-denominated limits.
+import type { SpendingLimitConfig, TokenAmount, UsdSpendingLimit } from "kova";
 ```
 
 ## SpendingLimitConfig
@@ -70,6 +71,22 @@ interface SpendingLimitConfig {
   weekly?: TokenAmount;
   /** Maximum total amount over a rolling 30-day window */
   monthly?: TokenAmount;
+  /** Maximum per-transaction amount in USD */
+  perTransactionUSD?: UsdSpendingLimit;
+  /** Maximum total USD amount over a rolling 24-hour window */
+  dailyUSD?: UsdSpendingLimit;
+  /** Maximum total USD amount over a rolling 7-day window */
+  weeklyUSD?: UsdSpendingLimit;
+  /** Maximum total USD amount over a rolling 30-day window */
+  monthlyUSD?: UsdSpendingLimit;
+  /** Optional key prefix for store isolation between rule instances */
+  keyPrefix?: string;
+}
+
+// Represents a USD spending limit.
+interface UsdSpendingLimit {
+  /** USD amount as a string (e.g., "100") */
+  amount: string;
 }
 
 // Represents a token amount used in spending limit configuration.
@@ -111,7 +128,7 @@ The constructor takes only a `SpendingLimitConfig` object. No additional argumen
 
 ## How Rolling Windows Work
 
-Time-window limits (daily, weekly, monthly) use **lazy TTL** via the store:
+Time-window limits (daily, weekly, monthly) use a **sliding window** with rolling TTL-based expiration via the store:
 
 1. On the first transaction, a counter key is created in the store with a TTL matching the window duration:
    - Daily: 86,400 seconds (24 hours)
@@ -120,7 +137,7 @@ Time-window limits (daily, weekly, monthly) use **lazy TTL** via the store:
 2. Each allowed transaction increments the counter by the transaction amount.
 3. When the TTL expires, the store automatically removes the key. The next transaction starts a fresh counter.
 
-This means the windows are **rolling** -- they measure spending over the last N seconds from the first transaction, not calendar days/weeks/months.
+This means the windows are **sliding** -- they measure spending over the last N seconds using rolling TTL-based expiration, not calendar days/weeks/months. All amounts are tracked with BigInt precision (PRECISION_DECIMALS=9) to avoid floating-point rounding errors.
 
 ::: tip WHAT DOES "ROLLING WINDOW" MEAN?
 A rolling window is like a sliding 24-hour clock, not a calendar day. If your first transaction happens at 3 PM on Tuesday, the "daily" window runs until 3 PM on Wednesday -- not until midnight. This is different from calendar-based limits where spending resets at midnight every night.
@@ -141,12 +158,12 @@ Time ─────────────────────────
 
 Token matching is **case-insensitive**. A limit configured for `"SOL"` will match intents using `"sol"`, `"Sol"`, or `"SOL"`.
 
-If the intent's token does not match the limit's token, the limit is skipped (not denied). This means a SOL spending limit will not affect USDC transactions.
+If the intent's token does not match the limit's token, the transaction is **denied** (not skipped). This cross-token denial behavior prevents untracked spending in tokens not covered by the configured limits.
 
 ```typescript
 // This spending limit only applies to SOL transactions.
 // If the intent uses a different token (e.g., USDC), this rule
-// returns ALLOW and does not count the transaction against any limit.
+// DENIES the transaction because the token does not match.
 const rule = new SpendingLimitRule({
   daily: { amount: "10", token: "SOL" },
 });
@@ -156,8 +173,8 @@ const rule = new SpendingLimitRule({
 wallet.execute({ type: "transfer", chain: "solana", params: { to: "...", amount: "5", token: "SOL" } });
 
 // USDC transfer: the token "USDC" does not match the limit's token "SOL",
-// so this rule is skipped entirely. The 1000 USDC transfer is ALLOWED by this rule
-// regardless of how much SOL has been spent. To limit USDC, add a separate SpendingLimitRule.
+// so this rule DENIES the transaction. To allow USDC, add a separate SpendingLimitRule
+// for USDC, or use USD-denominated limits which are token-agnostic.
 wallet.execute({ type: "transfer", chain: "solana", params: { to: "...", amount: "1000", token: "USDC" } });
 ```
 

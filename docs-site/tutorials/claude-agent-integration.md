@@ -127,7 +127,7 @@ import {
 
 // The private key stays on your server
 const keypair = Keypair.generate();
-const signer = new LocalSigner(keypair);
+const signer = new LocalSigner(keypair); // Dev-only; throws in production unless KOVA_ALLOW_LOCAL_SIGNER=1
 
 // Define what the agent is allowed to do
 const policy = Policy.create("claude-agent")
@@ -140,7 +140,7 @@ const policy = Policy.create("claude-agent")
   .build();
 
 // Build the engine from the policy config
-const store = new MemoryStore();
+const store = new MemoryStore(); // Dev-only; throws in production unless KOVA_ALLOW_MEMORY_STORE=1
 const config = policy.toJSON();
 const rules = [];
 if (config.spendingLimit) rules.push(new SpendingLimitRule(config.spendingLimit));
@@ -452,7 +452,7 @@ const TREASURY = "9aE4Uy6gzM..."; // your recipient address
 
 function createWallet(): AgentWallet {
   const keypair = Keypair.generate();
-  const store = new MemoryStore();
+  const store = new MemoryStore(); // Dev-only; throws in production unless KOVA_ALLOW_MEMORY_STORE=1
 
   const policy = Policy.create("claude-agent")
     .spendingLimit({
@@ -472,7 +472,7 @@ function createWallet(): AgentWallet {
   if (config.rateLimit) rules.push(new RateLimitRule(config.rateLimit));
 
   return new AgentWallet({
-    signer: new LocalSigner(keypair),
+    signer: new LocalSigner(keypair), // Dev-only; throws in production unless KOVA_ALLOW_LOCAL_SIGNER=1
     chain: new SolanaAdapter({ rpcUrl: "https://api.devnet.solana.com" }),
     policy: new PolicyEngine(rules, store),
     store,

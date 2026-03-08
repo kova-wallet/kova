@@ -174,7 +174,7 @@ const keypair = Keypair.generate();
 // rate limit counters (how many transactions this minute), audit log entries,
 // and idempotency keys (to prevent duplicate transaction processing).
 // MemoryStore is fast but all data is lost when the process exits.
-const store = new MemoryStore();
+const store = new MemoryStore(); // Dev-only; throws in production unless KOVA_ALLOW_MEMORY_STORE=1
 
 // ── Step 3: Define the policy using the fluent builder ──────────────────────
 // Policy.create() returns a builder. Each chained method adds a constraint.
@@ -211,7 +211,7 @@ const engine = new PolicyEngine([
 // It connects the signer (who signs), chain adapter (where to send),
 // policy engine (what's allowed), and store (tracking state).
 const wallet = new AgentWallet({
-  signer: new LocalSigner(keypair),  // Signs transactions with the in-memory keypair
+  signer: new LocalSigner(keypair),  // Dev-only; throws in production unless KOVA_ALLOW_LOCAL_SIGNER=1
   chain: new SolanaAdapter({
     rpcUrl: "https://api.devnet.solana.com",  // Solana devnet -- free test network
   }),

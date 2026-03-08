@@ -117,7 +117,7 @@ The trading agent can execute swaps on Jupiter and Orca and transfer SOL, with a
 // Each agent gets its own keypair. In production, load these from
 // separate environment variables or a secrets manager.
 const tradingKeypair = Keypair.generate();
-const tradingSigner = new LocalSigner(tradingKeypair);
+const tradingSigner = new LocalSigner(tradingKeypair); // Dev-only; throws in production unless KOVA_ALLOW_LOCAL_SIGNER=1
 
 // Build the trading policy: generous limits, program-restricted swaps.
 const tradingPolicy = Policy.create("trading-agent")
@@ -155,7 +155,7 @@ const tradingWallet = new AgentWallet({
   // Key prefix isolates this agent's counters and logs in the shared store.
   // All keys written by this wallet will be prefixed with "trade:"
   // e.g., "trade:spending:daily:SOL", "trade:audit:log"
-  keyPrefix: "trade:",
+  storePrefix: "trade:",
 });
 ```
 
@@ -169,7 +169,7 @@ The payments agent can only send SOL transfers to a pre-approved list of address
 // ── Payments Agent ──────────────────────────────────────────────────────────
 
 const paymentsKeypair = Keypair.generate();
-const paymentsSigner = new LocalSigner(paymentsKeypair);
+const paymentsSigner = new LocalSigner(paymentsKeypair); // Dev-only; throws in production unless KOVA_ALLOW_LOCAL_SIGNER=1
 
 // Build the payments policy: conservative limits, address-restricted.
 const paymentsPolicy = Policy.create("payments-agent")
@@ -206,7 +206,7 @@ const paymentsWallet = new AgentWallet({
   store,
   logger: paymentsLogger,
   // Different prefix -- keeps this agent's data separate from the trading agent.
-  keyPrefix: "pay:",
+  storePrefix: "pay:",
 });
 ```
 
@@ -345,7 +345,7 @@ main()
 
 ## Key Prefix Strategy
 
-The `keyPrefix` parameter on `AgentWallet` namespaces all store keys for that wallet. Here is how it works:
+The `storePrefix` parameter on `AgentWallet` namespaces all store keys for that wallet. Here is how it works:
 
 | Without prefix | With prefix `trade:` | With prefix `pay:` |
 |---|---|---|
@@ -360,7 +360,7 @@ This means:
 - The supervisor can query **both** by reading from both prefixed keys
 
 ::: warning UNIQUE PREFIXES
-Make sure each agent has a unique `keyPrefix`. If two agents share the same prefix, their spending counters will be combined and their audit logs will be interleaved. This could allow one agent to exhaust another's spending limit.
+Make sure each agent has a unique `storePrefix`. If two agents share the same prefix, their spending counters will be combined and their audit logs will be interleaved. This could allow one agent to exhaust another's spending limit.
 :::
 
 ---
@@ -373,12 +373,12 @@ The pattern is the same for any number of agents. Each one gets:
 
 ```typescript
 const agentN = new AgentWallet({
-  signer: new LocalSigner(keypairN),    // Unique signer
+  signer: new LocalSigner(keypairN),    // Unique signer (Dev-only; throws in production unless KOVA_ALLOW_LOCAL_SIGNER=1)
   chain,                                 // Shared chain adapter
   policy: new PolicyEngine(rulesN, store), // Unique policy
   store,                                 // Shared store
   logger: new AuditLogger(store),        // Shared store for logs
-  keyPrefix: "agent-n:",                 // Unique prefix
+  storePrefix: "agent-n:",                 // Unique prefix
 });
 ```
 
@@ -393,10 +393,10 @@ import { RedisStore } from "./redis-store";
 const store = new RedisStore("redis://redis:6379");
 
 // Agent 1 (Process A)
-const wallet1 = new AgentWallet({ ..., store, keyPrefix: "agent1:" });
+const wallet1 = new AgentWallet({ ..., store, storePrefix: "agent1:" });
 
 // Agent 2 (Process B -- different container)
-const wallet2 = new AgentWallet({ ..., store, keyPrefix: "agent2:" });
+const wallet2 = new AgentWallet({ ..., store, storePrefix: "agent2:" });
 ```
 
 ### Centralized Monitoring Dashboard
@@ -430,8 +430,8 @@ app.get("/agents/status", async (req, res) => {
 
 | Mistake | What happens | Fix |
 |---------|-------------|-----|
-| Same `keyPrefix` for two agents | Spending counters collide -- one agent can exhaust the other's limit | Use unique prefixes per agent |
-| Forgetting `keyPrefix` entirely | All agents share the default (empty) prefix -- same as above | Always set `keyPrefix` when running multiple agents |
+| Same `storePrefix` for two agents | Spending counters collide -- one agent can exhaust the other's limit | Use unique prefixes per agent |
+| Forgetting `storePrefix` entirely | All agents share the default (empty) prefix -- same as above | Always set `storePrefix` when running multiple agents |
 | Creating separate `SolanaAdapter` instances | Wastes RPC connections, may hit rate limits faster | Share a single adapter instance |
 | Using `MemoryStore` with multiple agents | State is lost on restart, limits reset | Use `SqliteStore` or a custom persistent store |
 

@@ -25,7 +25,7 @@ The `CircuitBreakerConfig` interface controls the breaker's behavior:
 // These settings determine how quickly the breaker trips and how long
 // it stays open before auto-resetting.
 interface CircuitBreakerConfig {
-  /** Number of consecutive denials before circuit opens. Must be >= 1. Default: 10 */
+  /** Number of consecutive denials before circuit opens. Must be >= 1. Default: 5 */
   // If the agent receives this many DENY decisions in a row (without any
   // ALLOW in between), the circuit opens and blocks all further transactions.
   // Lower values are more aggressive (trip faster), higher values are more lenient.
@@ -34,14 +34,19 @@ interface CircuitBreakerConfig {
   // How long the circuit stays open (blocking all transactions) before
   // automatically resetting to closed. This gives operators time to investigate.
   cooldownMs: number;
+  /** Intent types to track. Maximum 20 entries. */
+  intentTypes?: string[];
+  /** Whether to fail when multiple wallet instances are detected. */
+  failOnMultiInstance?: boolean;
 }
 ```
 
 | Parameter | Default | Description |
 |---|---|---|
-| `threshold` | `10` | Number of consecutive `DENY` decisions before the circuit opens |
+| `threshold` | `5` | Number of consecutive `DENY` decisions before the circuit opens |
 | `cooldownMs` | `300000` (5 min) | How long the circuit stays open before auto-resetting |
 | `intentTypes` | `["transfer", "swap", "stake", "custom"]` | Intent types to track. Maximum 20 entries. |
+| `failOnMultiInstance` | `undefined` | Whether to fail when multiple wallet instances are detected |
 
 ## State Machine
 
@@ -90,12 +95,11 @@ if (this.circuitBreaker) {
 
 ## Store Keys
 
-The circuit breaker persists its state using two store keys:
+The circuit breaker persists its state using a single combined JSON key:
 
 | Key | Value | Description |
 |---|---|---|
-| `circuit:denial_count` | `"0"`, `"1"`, `"2"`, ... | Current consecutive denial count |
-| `circuit:cooldown_until` | `"1700000300000"` | Unix timestamp (ms) when the cooldown expires |
+| `circuit:state` | `{"denialCount":3,"cooldownUntil":1700000300000}` | Combined JSON with denial count and cooldown timestamp |
 
 This means the circuit breaker state survives process restarts (as long as the store is persistent). If you use `MemoryStore`, the state is lost on restart and the breaker resets.
 
@@ -110,12 +114,12 @@ const wallet = new AgentWallet({
   policy: engine,
   store,
   agentId: "agent-billing",  // Circuit breaker isolated to this agent
-  circuitBreaker: { threshold: 10, cooldownMs: 300_000 },
+  circuitBreaker: { threshold: 5, cooldownMs: 300_000 },
 });
 ```
 
 ::: tip
-Without `agentId`, a single circuit breaker is shared across all callers. A malicious agent could deliberately trigger 10 denials to block legitimate agents. Use `agentId` in multi-agent deployments.
+Without `agentId`, a single circuit breaker is shared across all callers. A malicious agent could deliberately trigger 5 denials to block legitimate agents. Use `agentId` in multi-agent deployments.
 :::
 
 ## Configuring via AgentWallet
@@ -156,7 +160,7 @@ const rules = [
 const engine = new PolicyEngine(rules, store);
 
 // Custom circuit breaker: trip after 3 consecutive denials, with a 60-second cooldown.
-// This is more aggressive than the default (10 denials, 5-minute cooldown),
+// This is more aggressive than the default (5 denials, 5-minute cooldown),
 // meaning the wallet locks faster but also recovers faster.
 const wallet = new AgentWallet({
   signer,
@@ -167,7 +171,7 @@ const wallet = new AgentWallet({
 });
 ```
 
-If you omit the `circuitBreaker` option, the default configuration is used (`threshold: 10`, `cooldownMs: 300000`).
+If you omit the `circuitBreaker` option, the default configuration is used (`threshold: 5`, `cooldownMs: 300000`).
 
 ## Disabling the Circuit Breaker
 
@@ -293,7 +297,7 @@ kova has **two** circuit breakers that serve different purposes:
 | **Class** | `CircuitBreaker` | Built into `AuditLogger` |
 | **Trigger** | Consecutive policy denials | Consecutive audit write failures |
 | **Purpose** | Stop runaway agent behavior | Protect audit trail integrity |
-| **Default threshold** | 10 consecutive denials | 3 consecutive failures |
+| **Default threshold** | 5 consecutive denials | 3 consecutive failures |
 | **Cooldown** | Configurable (`cooldownMs`) | None -- stays open until `resetFailureCount()` |
 | **Auto-reset** | Yes, after cooldown expires | No -- requires manual reset |
 | **Error code** | `CIRCUIT_BREAKER_OPEN` | `STORE_ERROR` |

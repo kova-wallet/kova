@@ -2,9 +2,9 @@
 
 ::: info What you'll learn
 - Why the SDK needs a persistence layer and what happens without one
-- The 5-method Store interface that all backends implement
-- When to use `MemoryStore` (dev) vs `SqliteStore` (production)
-- How to implement a custom Store for Redis, DynamoDB, or other backends
+- The 7-method Store interface that all backends implement
+- When to use `MemoryStore` (dev) vs `SqliteStore` (single-server) vs `RedisStore` (multi-server)
+- How to implement a custom Store for DynamoDB, Postgres, or other backends
 - Why `increment()` must be atomic for spending limit safety
 :::
 
@@ -20,7 +20,7 @@ Stores provide pluggable persistence for the SDK's internal state. The interface
 | **Local development / prototyping** | `MemoryStore` | Quick to get started. Spending limits reset on restart, which is fine during development. |
 | **Production (single server)** | `SqliteStore` | Data persists across restarts. Spending counters, rate limits, and audit logs survive crashes. |
 | **Production (multiple servers)** | Custom `RedisStore` | Shared state across instances. See the custom store example below. |
-| **Serverless / edge functions** | Custom store (DynamoDB, Upstash Redis, etc.) | Persistence without a local filesystem. Implement the 5-method `Store` interface. |
+| **Serverless / edge functions** | Custom store (DynamoDB, Upstash Redis, etc.) | Persistence without a local filesystem. Implement the 7-method `Store` interface. |
 
 ::: tip QUICK RULE OF THUMB
 If you are just getting started or running tests, use `MemoryStore`. If you are deploying to production, use `SqliteStore` (or a custom store for multi-server setups). The only difference is whether your safety data survives restarts.
@@ -51,7 +51,7 @@ import type { Store } from "kova";
 ```
 
 ```typescript
-// The Store interface defines five methods that any persistence backend must provide.
+// The Store interface defines seven methods that any persistence backend must provide.
 // All methods are async (return Promises) so they work with both in-memory and
 // remote/disk-based backends without changing the calling code.
 interface Store {
@@ -65,6 +65,11 @@ interface Store {
   // to auto-expire entries (e.g., rate limit counters that reset every hour).
   // If ttlSeconds is omitted or undefined, the entry persists indefinitely.
   set(key: string, value: string, ttlSeconds?: number): Promise<void>;
+
+  /** Set a value only if the key does not already exist. Returns true if set, false if key existed. */
+  // Used for idempotency locks and other compare-and-set operations where
+  // you need to ensure only the first caller wins.
+  setIfNotExists(key: string, value: string, ttlSeconds?: number): Promise<boolean>;
 
   /** Atomically increment a numeric value. Returns the new value.
       Creates the key with the given amount if it does not exist. */
@@ -83,6 +88,10 @@ interface Store {
   // Retrieves recent audit log entries for inspection or display.
   // Returns entries in reverse chronological order (newest first).
   getRecent(key: string, count: number): Promise<string[]>;
+
+  /** Clear all entries from a list. */
+  // Optional method for removing all entries from a specific list key.
+  clearList?(key: string): Promise<void>;
 }
 ```
 
@@ -102,15 +111,11 @@ import { MemoryStore } from "kova";
 
 // Create an in-memory store instance. All data lives in JavaScript objects/maps
 // within the current Node.js process. Fast and simple, but nothing survives a restart.
-const store = new MemoryStore();
-
-// IMPORTANT: If NODE_ENV=production, MemoryStore will throw unless you
-// explicitly opt in with dangerouslyAllowInProduction:
-const prodStore = new MemoryStore({ dangerouslyAllowInProduction: true });
+const store = new MemoryStore(); // Dev-only; throws in production unless KOVA_ALLOW_MEMORY_STORE=1
 ```
 
 ::: warning Production Safety
-`MemoryStore` is designed for development and testing. When `NODE_ENV=production`, it will throw an error unless `{ dangerouslyAllowInProduction: true }` is passed. For production deployments, use `SqliteStore` with encryption instead, which provides persistence and crash recovery.
+`MemoryStore` is designed for development and testing. It will throw an error in all environments unless the `KOVA_ALLOW_MEMORY_STORE=1` environment variable is set. For production deployments, use `SqliteStore` with encryption instead, which provides persistence and crash recovery.
 :::
 
 ### Characteristics
@@ -138,7 +143,6 @@ MemoryStore enforces hard limits to prevent unbounded memory growth:
 
 | Limit | Value | Description |
 |-------|-------|-------------|
-| `MAX_KV_SIZE` | 500,000 | Maximum number of key-value entries. Oldest non-TTL entries are evicted when exceeded |
 | `MAX_LIST_SIZE` | 100,000 | Maximum entries per list (e.g., audit log). Oldest entries are evicted FIFO |
 | `MAX_KEY_LENGTH` | 512 | Maximum length of a store key in characters |
 | `MAX_VALUE_LENGTH` | 1,000,000 | Maximum length of a single value in characters (~1 MB) |
@@ -270,28 +274,9 @@ store.clear();
 | Use case | Dev / Testing | Production |
 | Data after restart | Lost | Preserved |
 
-## createStore() Factory
-
-The `createStore()` factory wraps any Store with a `StoreWithTimeout` that prevents operations from blocking indefinitely:
-
-```typescript
-import { createStore, SqliteStore } from "kova";
-
-// Wrap a SqliteStore with a 3-second timeout per operation.
-const store = createStore(
-  new SqliteStore({ path: "./wallet.db", requireEncryption: false }),
-  { timeoutMs: 3000 },
-);
-
-// Default timeout is 5000ms. To skip the timeout wrapper:
-const rawStore = createStore(baseStore, { noTimeout: true });
-```
-
-If a store operation does not complete within the timeout, a `StoreTimeoutError` is thrown.
-
 ## Implementing a Custom Store
 
-To integrate with Redis, DynamoDB, or any other backend, implement the 5-method `Store` interface:
+To integrate with Redis, DynamoDB, or any other backend, implement the 7-method `Store` interface:
 
 ```typescript
 // Import the Store type that our custom class must implement.
@@ -333,6 +318,18 @@ export class RedisStore implements Store {
       // No TTL -- the key persists until explicitly deleted.
       await this.client.set(key, value);
     }
+  }
+
+  // Set a value only if the key does not already exist.
+  // Uses Redis SET with NX (Not eXists) flag for atomic compare-and-set.
+  async setIfNotExists(key: string, value: string, ttlSeconds?: number): Promise<boolean> {
+    let result: string | null;
+    if (ttlSeconds !== undefined && ttlSeconds > 0) {
+      result = await this.client.set(key, value, "EX", ttlSeconds, "NX");
+    } else {
+      result = await this.client.set(key, value, "NX");
+    }
+    return result === "OK";
   }
 
   // Atomically increment a numeric value stored at the given key.

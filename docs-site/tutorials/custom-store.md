@@ -6,7 +6,7 @@
 
 In this tutorial, you'll build a custom `Store` adapter backed by Redis. By the end, you will understand exactly how the SDK's persistence layer works and be able to wire any database (Postgres, DynamoDB, Turso, Upstash, etc.) into kova.
 
-The `Store` interface has only 5 methods. If you can implement those 5 methods, your adapter works with every SDK feature -- spending limits, rate limits, audit logs, circuit breakers, and idempotency caches.
+The `Store` interface has 7 methods (one optional). If you can implement those methods, your adapter works with every SDK feature -- spending limits, rate limits, audit logs, circuit breakers, and idempotency caches.
 
 ---
 
@@ -32,9 +32,11 @@ Every store adapter implements this interface:
 interface Store {
   get(key: string): Promise<string | null>;
   set(key: string, value: string, ttlSeconds?: number): Promise<void>;
+  setIfNotExists(key: string, value: string, ttlSeconds?: number): Promise<boolean>;
   increment(key: string, amount: number): Promise<number>;
   append(key: string, value: string): Promise<void>;
   getRecent(key: string, count: number): Promise<string[]>;
+  clearList?(key: string): Promise<void>; // optional
 }
 ```
 
@@ -44,9 +46,11 @@ Here is what each method does and which SDK feature uses it:
 |--------|---------|---------|
 | `get(key)` | Read a value by key. Return `null` if not found or expired. | Spending limits, rate limits, circuit breaker, idempotency cache |
 | `set(key, value, ttl?)` | Write a value. Optionally auto-expire after `ttlSeconds`. | Rate limit windows, idempotency cache, circuit breaker state |
+| `setIfNotExists(key, value, ttl?)` | Write a value only if the key does not already exist. Return `true` if the key was set. | Distributed mutex, idempotency cache |
 | `increment(key, amount)` | Atomically add `amount` to a numeric key. Return the new total. Create the key if it does not exist. | Spending limit counters, rate limit counters |
 | `append(key, value)` | Add an entry to the end of a list. | Audit log entries |
 | `getRecent(key, count)` | Return the most recent `count` entries from a list, newest first. | Audit log retrieval, transaction history |
+| `clearList?(key)` | *(Optional)* Remove all entries from a list. | Test cleanup, log rotation |
 
 All methods return `Promise` so they work with both local and remote backends.
 
@@ -76,9 +80,9 @@ import Redis from "ioredis";
 
 ---
 
-## Step 3: Implement `get()` and `set()`
+## Step 3: Implement `get()`, `set()`, and `setIfNotExists()`
 
-These are the simplest methods. Redis handles TTL natively with the `EX` flag.
+These are the simplest methods. Redis handles TTL natively with the `EX` flag, and `NX` for set-if-not-exists.
 
 ```typescript
 export class RedisStore implements Store {
@@ -106,6 +110,19 @@ export class RedisStore implements Store {
     } else {
       // No TTL -- the key persists until explicitly deleted.
       await this.client.set(key, value);
+    }
+  }
+
+  async setIfNotExists(key: string, value: string, ttlSeconds?: number): Promise<boolean> {
+    if (ttlSeconds !== undefined && ttlSeconds > 0) {
+      // "NX" tells Redis to only set the key if it does not already exist.
+      // Combined with "EX" for automatic expiration.
+      // Used by the SDK for distributed mutex and idempotency cache.
+      const result = await this.client.set(key, value, "EX", ttlSeconds, "NX");
+      return result === "OK";
+    } else {
+      const result = await this.client.setnx(key, value);
+      return result === 1;
     }
   }
 }
@@ -202,6 +219,16 @@ export class RedisStore implements Store {
     }
   }
 
+  async setIfNotExists(key: string, value: string, ttlSeconds?: number): Promise<boolean> {
+    if (ttlSeconds !== undefined && ttlSeconds > 0) {
+      const result = await this.client.set(key, value, "EX", ttlSeconds, "NX");
+      return result === "OK";
+    } else {
+      const result = await this.client.setnx(key, value);
+      return result === 1;
+    }
+  }
+
   async increment(key: string, amount: number): Promise<number> {
     const result = await this.client.incrbyfloat(key, amount);
     return parseFloat(result);
@@ -214,6 +241,11 @@ export class RedisStore implements Store {
   async getRecent(key: string, count: number): Promise<string[]> {
     if (count <= 0) return [];
     return this.client.lrange(this.listPrefix + key, 0, count - 1);
+  }
+
+  /** Optional: remove all entries from a list. */
+  async clearList(key: string): Promise<void> {
+    await this.client.del(this.listPrefix + key);
   }
 
   /** Disconnect from Redis. Call this during application shutdown. */
@@ -259,7 +291,7 @@ process.on("SIGTERM", async () => {
 });
 ```
 
-The wallet does not know or care that it is talking to Redis. It calls the same 5 methods regardless of the backend.
+The wallet does not know or care that it is talking to Redis. It calls the same 7 methods regardless of the backend.
 
 ---
 
@@ -361,7 +393,7 @@ If all of these pass, your adapter is compatible with the SDK.
 
 ## Adapting to Other Databases
 
-The same 5 methods map cleanly to any backend. Here is a quick reference:
+The same methods map cleanly to any backend. Here is a quick reference for the core 6 required methods:
 
 | Store Method | Redis | PostgreSQL | DynamoDB |
 |---|---|---|---|
@@ -386,6 +418,7 @@ Before using your custom store in production, verify:
 
 - [ ] `get()` returns `null` for missing and expired keys
 - [ ] `set()` with a TTL causes the key to disappear after expiration
+- [ ] `setIfNotExists()` returns `true` only if the key was newly created, `false` if it already existed
 - [ ] `increment()` is atomic under concurrent access
 - [ ] `increment()` creates the key with the given amount if it does not exist
 - [ ] `append()` adds entries that `getRecent()` returns in newest-first order

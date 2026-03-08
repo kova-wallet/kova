@@ -2,7 +2,7 @@
 
 ::: info What you'll learn
 - How chain adapters abstract blockchain-specific complexity behind a common interface
-- The 6-method ChainAdapter interface for building, signing, and broadcasting transactions
+- The 7-method ChainAdapter interface for building, signing, and broadcasting transactions
 - How to configure the `SolanaAdapter` for devnet and mainnet
 - How Jupiter DEX integration enables token swaps
 - URL validation and SSRF protection for secure RPC connections
@@ -81,6 +81,12 @@ interface ChainAdapter {
     intent: TransactionIntent,
     signerAddress: string,
   ): Promise<UnsignedTransaction>;
+
+  /** Simulate a transaction without broadcasting it */
+  // Runs the transaction through the blockchain's simulation engine to check
+  // for errors (insufficient funds, invalid instructions, etc.) without
+  // actually submitting it. Used by the execute pipeline for preflight checks.
+  simulateTransaction(txData: Uint8Array): Promise<SimulationResult>;
 
   /** Broadcast a signed transaction to the network. Returns the transaction ID. */
   // Submits a fully signed transaction to the blockchain's RPC node.

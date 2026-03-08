@@ -208,7 +208,7 @@ const rule = new TimeWindowRule({
 ```
 
 ::: tip
-When `outsideHoursPolicy` is set to `"require_approval"`, the rule still returns `DENY` (not `PENDING`). The denial reason indicates that approval is required. To actually implement the approval flow, pair this rule with an `ApprovalGateRule` and handle the outside-hours case in your application logic.
+When `outsideHoursPolicy` is set to `"require_approval"`, the rule actually requests approval through the configured approval channel when one is available. If an `ApprovalChannel` is configured in the `PolicyEngine`, off-hours transactions will be routed to the human approver. If no channel is available, the transaction is denied.
 :::
 
 ## Code Examples

@@ -388,7 +388,7 @@ Review this checklist before deploying with real funds.
 - [ ] Set active hours to match your operational schedule.
 - [ ] Configure human approval for all transactions above a meaningful threshold.
 - [ ] Configure enabledTools to restrict which tools the agent can invoke -- default to read-only
-- [ ] Set authToken and requireAuth for caller authentication
+- [ ] Set authToken for caller authentication
 
 ### Approval Channel
 

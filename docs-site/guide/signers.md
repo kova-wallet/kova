@@ -2,7 +2,7 @@
 
 ::: info What you'll learn
 - How signing works and why every transaction needs a cryptographic signature
-- The 3-method Signer interface that all key-management backends implement
+- The 5-method Signer interface that all key-management backends implement
 - When to use `LocalSigner` (dev) vs `MpcSigner` (production)
 - How to implement a custom Signer for Fireblocks, AWS KMS, or other services
 - Security best practices for key management in production
@@ -10,7 +10,7 @@
 
 A Signer holds your agent's private key and uses it to authorize transactions -- like the signature on a check that proves you approved the payment.
 
-Signers are responsible for holding private keys and signing transactions. The `Signer` interface is minimal -- all signing backends implement three methods.
+Signers are responsible for holding private keys and signing transactions. The `Signer` interface is minimal -- all signing backends implement five methods.
 
 ## Which Signer Should I Use?
 
@@ -53,7 +53,7 @@ import type { Signer, UnsignedTransaction, SignedTransaction } from "kova";
 // The Signer interface defines the contract that all key-management backends
 // must fulfill. Whether you use an in-memory keypair, an MPC provider like
 // Fireblocks, or a hardware security module, your signer must implement
-// these three methods.
+// these five methods.
 interface Signer {
   /** Get the public key / address of this signer */
   // Returns the on-chain address (e.g., a Solana base58 public key).
@@ -72,6 +72,16 @@ interface Signer {
   // is ready (e.g., the key material is loaded, the remote API is reachable).
   // The AgentWallet can call this before attempting a transaction.
   healthCheck(): Promise<boolean>;
+
+  /** Zero out key material and prevent further signing */
+  // Destroys the private key from memory. After calling destroy(),
+  // any subsequent sign() calls will throw an error.
+  destroy(): void;
+
+  /** Safe JSON serialization (never includes secret key) */
+  // Returns only the public address, preventing accidental key leakage
+  // via JSON.stringify().
+  toJSON(): Record<string, unknown>;
 }
 ```
 
@@ -145,7 +155,7 @@ const keypair = Keypair.generate();
 
 // Wrap the Keypair in a LocalSigner so it implements the Signer interface.
 // The LocalSigner holds the keypair in process memory for signing transactions.
-const signer = new LocalSigner(keypair);
+const signer = new LocalSigner(keypair); // Dev-only; throws in production unless KOVA_ALLOW_LOCAL_SIGNER=1
 ```
 
 Or from an existing secret key:
@@ -165,15 +175,16 @@ const signer = new LocalSigner(keypair);
 
 ### Production Guard
 
-`LocalSigner` throws an error at construction time in production environments:
+`LocalSigner` throws an error at construction time unless the `KOVA_ALLOW_LOCAL_SIGNER=1` environment variable is set:
 
 ```typescript
-// In production without opt-in:
+// Without opt-in:
 const signer = new LocalSigner(keypair);
 // Error: "LocalSigner is not safe for production use..."
 
-// Explicit opt-in (devnet testing only -- NOT for real funds):
-const signer = new LocalSigner(keypair, { dangerouslyAllowInProduction: true });
+// Explicit opt-in via environment variable (devnet testing only -- NOT for real funds):
+// KOVA_ALLOW_LOCAL_SIGNER=1 node your-script.js
+const signer = new LocalSigner(keypair);
 ```
 
 ::: danger
@@ -615,6 +626,19 @@ export class FireblocksSigner implements Signer {
       // If the API call fails (network error, auth error, etc.), report unhealthy.
       return false;
     }
+  }
+
+  // Clean up resources. For Fireblocks, there is no local key material to zero out,
+  // but we clear the cached address and mark the signer as destroyed.
+  destroy(): void {
+    this.cachedAddress = null;
+  }
+
+  // Safe JSON serialization -- only includes public information.
+  // Prevents accidental leakage of vault IDs or other sensitive config
+  // via JSON.stringify().
+  toJSON(): Record<string, unknown> {
+    return { address: this.cachedAddress, provider: "fireblocks" };
   }
 }
 ```

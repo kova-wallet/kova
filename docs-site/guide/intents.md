@@ -336,8 +336,6 @@ interface IntentMetadata {
   agentId?: string;
   /** Identifier for the task this is part of */
   taskId?: string;
-  /** Urgency level — may influence approval timeout */
-  urgency?: "low" | "normal" | "high";
 }
 ```
 
@@ -362,7 +360,6 @@ const intent: TransactionIntent = {
     reason: "Purchasing training data from vendor",  // Human-readable justification shown in Telegram approval messages
     agentId: "ml-pipeline-agent",                    // Identifies the specific agent (useful when multiple agents share a wallet)
     taskId: "task-2024-001",                         // Links this transaction to an external task/job ID for traceability
-    urgency: "normal",                               // Urgency hint — "high" urgency may get shorter approval timeouts
   },
 };
 ```

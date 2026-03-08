@@ -31,6 +31,7 @@ new AgentWallet(config: AgentWalletConfig)
 | `logger` | `AuditLogger` | No | Tamper-evident audit logger |
 | `circuitBreaker` | `CircuitBreakerConfig` | No | Circuit breaker configuration |
 | `onAuditFailure` | `AuditFailureCallback` | No | Callback fired on audit integrity failures |
+| `enabledTools` | `ReadonlySet<string>` | No | Set of tool names to enable (defaults to safe tools only) |
 
 **Methods:**
 
@@ -197,40 +198,44 @@ interface SwapParams {
   fromToken: string;       // Source token symbol or mint address (the token you're selling)
   toToken: string;         // Destination token symbol or mint address (the token you're buying)
   amount: string;          // Amount of the source token to swap (decimal string)
-  maxSlippage?: number;    // Max acceptable slippage as a decimal (0.01 = 1%). Default: 0.005 (0.5%)
+  maxSlippage?: number;    // Max acceptable slippage as a percentage (e.g., 0.5 = 0.5%). Default: 0.5
 }
 ```
 
 #### MintParams
 
 ```typescript
-// Parameters for an NFT minting operation (not yet implemented).
+// Parameters for an NFT minting operation.
 interface MintParams {
   collection: string;      // Collection address or identifier on-chain
-  quantity: number;         // Number of items to mint from the collection
-  metadata?: Record<string, string>;  // Optional NFT metadata (name, description, etc.)
+  metadataUri: string;     // URI pointing to the NFT metadata (e.g., Arweave or IPFS link)
+  to?: string;             // Optional recipient address (defaults to the wallet's own address)
 }
 ```
 
 #### StakeParams
 
 ```typescript
-// Parameters for a staking operation (not yet implemented).
+// Parameters for a staking operation.
 interface StakeParams {
-  validator: string;       // Validator address to delegate stake to
   amount: string;          // Amount to stake (decimal string)
   token: string;           // Token to stake (e.g., "SOL")
+  validator?: string;      // Optional validator address to delegate stake to
 }
 ```
 
 #### CustomParams
 
 ```typescript
-// Parameters for a custom on-chain program instruction (not yet implemented).
+// Parameters for a custom on-chain program instruction.
 interface CustomParams {
   programId: string;       // The on-chain program/contract address to call
-  instruction: string;     // Instruction name or identifier within the program
-  data?: Record<string, unknown>;  // Arbitrary instruction data passed to the program
+  data: string;            // Instruction data to pass to the program
+  accounts: Array<{        // Accounts required by the instruction
+    address: string;       // Account public key (base58)
+    isSigner: boolean;     // Whether this account must sign the transaction
+    isWritable: boolean;   // Whether this account's data may be modified
+  }>;
 }
 ```
 
@@ -248,7 +253,7 @@ interface TransactionResult {
   txId?: string;                // On-chain transaction ID/signature (only when confirmed)
   summary: string;              // Human-readable summary (e.g., "Sent 1.5 SOL to 9aE4...gzM")
   intentId: string;             // ID of the original TransactionIntent for audit trail correlation
-  timestamp: string;            // ISO 8601 timestamp of when the result was produced
+  timestamp: number;            // Milliseconds since epoch (Unix ms) of when the result was produced
   error?: TransactionError;     // Structured error details (only when denied or failed)
 }
 ```
@@ -274,6 +279,8 @@ type TransactionStatus = "confirmed" | "denied" | "pending" | "failed";
 interface TransactionError {
   code: TransactionErrorCode;   // Machine-readable error code for programmatic handling
   message: string;              // Human-readable error message
+  policyRule?: string;          // Which policy rule caused the denial (e.g., "spending-limit")
+  details?: Record<string, unknown>; // Additional error context
 }
 ```
 
@@ -1119,6 +1126,15 @@ interface ToolParameter {
 }
 ```
 
+#### WalletToolDefinition
+
+Exported type alias for `ToolDefinition`, used when referencing wallet-specific tool definitions.
+
+```typescript
+// Type alias for wallet tool definitions.
+type WalletToolDefinition = ToolDefinition;
+```
+
 #### ToolCallResult
 
 Returned by `wallet.handleToolCall()`.
@@ -1139,10 +1155,41 @@ interface ToolCallResult {
 Array of all built-in wallet tool definitions.
 
 ```typescript
-// Import the complete array of all wallet tool definitions (6 safe by default, 2 dangerous opt-in).
+// Import the complete array of all 8 wallet tool definitions.
 // Use these to build custom AI integrations for providers not natively supported.
 import { WALLET_TOOLS } from "kova";
-// ToolDefinition[]
+// ToolDefinition[] (8 tools)
+```
+
+### DANGEROUS_TOOLS
+
+Array of the 2 dangerous tool definitions (`wallet_execute_custom` and `wallet_get_policy`) that must be explicitly opted into.
+
+```typescript
+// Import the dangerous tool definitions separately.
+import { DANGEROUS_TOOLS } from "kova";
+// ToolDefinition[] (2 tools)
+```
+
+### ALL_WALLET_TOOLS
+
+Combined array of all safe and dangerous tool definitions (same as `WALLET_TOOLS`).
+
+```typescript
+// Import the combined array of all tool definitions.
+import { ALL_WALLET_TOOLS } from "kova";
+// ToolDefinition[] (8 tools)
+```
+
+### WRITE_TOOL_NAMES
+
+Array of tool name strings for write operations only.
+
+```typescript
+// Import the array of write-only tool name strings.
+// Useful for filtering or restricting agents to read-only operations.
+import { WRITE_TOOL_NAMES } from "kova";
+// ["wallet_transfer", "wallet_swap", "wallet_mint", "wallet_stake", "wallet_execute_custom"]
 ```
 
 ### WALLET_TOOL_NAMES
@@ -1153,8 +1200,9 @@ Array of all tool name strings.
 // Import the array of all tool name strings.
 // Useful for validation or filtering.
 import { WALLET_TOOL_NAMES } from "kova";
-// ["wallet_get_balance", "wallet_get_address", "wallet_get_policy",
-//  "wallet_transfer", "wallet_swap", "wallet_get_transaction_history"]
+// ["wallet_transfer", "wallet_swap", "wallet_mint", "wallet_stake",
+//  "wallet_execute_custom", "wallet_get_balance", "wallet_get_policy",
+//  "wallet_get_transaction_history"]
 ```
 
 ### WalletToolName
@@ -1165,11 +1213,13 @@ Union type of all valid tool names.
 // Type-safe union of all valid tool names.
 // Use this type to ensure your code only references valid tool names.
 type WalletToolName =
-  | "wallet_get_balance"              // Query token balance
-  | "wallet_get_address"              // Get wallet's public address
-  | "wallet_get_policy"               // View policy constraints
   | "wallet_transfer"                 // Send tokens
   | "wallet_swap"                     // Swap tokens via DEX
+  | "wallet_mint"                     // Mint an NFT
+  | "wallet_stake"                    // Stake tokens with a validator
+  | "wallet_execute_custom"           // Execute a custom program instruction
+  | "wallet_get_balance"              // Query token balance
+  | "wallet_get_policy"               // View policy constraints
   | "wallet_get_transaction_history"; // View recent transactions
 ```
 
@@ -1280,7 +1330,7 @@ interface LangChainToolDefinition {
   name: string;                                          // Tool name
   description: string;                                   // Tool description for the LLM
   schema: Record<string, unknown>;                       // JSON Schema for input parameters
-  func: (input: Record<string, unknown>) => Promise<string>; // The callable function (returns JSON string)
+  call: (input: Record<string, unknown>) => Promise<string>; // The callable function (returns JSON string)
 }
 ```
 
