@@ -59,8 +59,8 @@ const keypair = Keypair.fromSecretKey(
   Uint8Array.from(JSON.parse(process.env.SOLANA_SECRET_KEY!))
 );
 
-const signer = new LocalSigner(keypair);  // Wraps the keypair for transaction signing
-const store = new MemoryStore();           // Holds spending counters and audit entries in memory
+const signer = new LocalSigner(keypair);  // Dev-only; throws in production unless KOVA_ALLOW_LOCAL_SIGNER=1
+const store = new MemoryStore();           // Dev-only; throws in production unless KOVA_ALLOW_MEMORY_STORE=1
 
 // Configure SolanaAdapter with Jupiter API endpoints for token swaps.
 // For DeFi operations, Jupiter is the primary DEX aggregator on Solana.
@@ -424,8 +424,8 @@ async function main() {
   const keypair = Keypair.fromSecretKey(
     Uint8Array.from(JSON.parse(process.env.SOLANA_SECRET_KEY!))
   );
-  const signer = new LocalSigner(keypair);       // Signs swap transactions
-  const store = new MemoryStore();                // In-memory state (use SqliteStore in production)
+  const signer = new LocalSigner(keypair);       // Dev-only; throws in production unless KOVA_ALLOW_LOCAL_SIGNER=1
+  const store = new MemoryStore();                // Dev-only; throws in production unless KOVA_ALLOW_MEMORY_STORE=1
   const chain = new SolanaAdapter({
     rpcUrl: process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com",
     commitment: "confirmed",
@@ -584,7 +584,7 @@ switch (result.status) {
 
 - **"No route found"**: The token pair has no liquidity on Jupiter. This is common on devnet. Verify the token has active liquidity pools by checking [jup.ag](https://jup.ag/).
 - **"Slippage exceeded"**: The price moved more than your `maxSlippage` between the quote and execution. Increase `maxSlippage` (e.g., from `0.01` to `0.03`) or retry -- the price may have stabilized.
-- **"Insufficient balance"**: Your wallet does not have enough of the source token. Check balances with `wallet.getBalance()` before attempting the swap.
+- **"Insufficient balance"**: Your wallet does not have enough of the source token. Check balances with `wallet.getBalance("SOL")` before attempting the swap.
 - **Transaction times out**: The Solana network may be congested. Retry after a few seconds. If using the public RPC endpoint (`api.mainnet-beta.solana.com`), consider switching to a private RPC provider like Helius or QuickNode for better reliability.
 
 ### Jupiter swap failing on devnet
@@ -600,7 +600,7 @@ This is expected. Jupiter liquidity pools exist primarily on mainnet-beta. Most 
 
 - **Build a simple arbitrage detector.** Check the price of SOL/USDC on Jupiter, compare it to a different source, and execute a swap when the price difference exceeds a threshold.
 - **Add Telegram approval for large swaps.** Combine this tutorial with the [Telegram Approval tutorial](/tutorials/telegram-approval) so swaps above 5 SOL require your manual approval.
-- **Track portfolio value over time.** Write a script that calls `wallet.getBalance()` for SOL and USDC every hour, logs the USD values, and plots a simple chart.
+- **Track portfolio value over time.** Write a script that calls `wallet.getBalance("SOL")` and `wallet.getBalance("USDC")` every hour, logs the USD values, and plots a simple chart.
 
 ## Next Steps
 

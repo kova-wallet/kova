@@ -415,7 +415,7 @@ const store = new SqliteStore({
 const keypair = Keypair.fromSecretKey(
   Uint8Array.from(JSON.parse(required("SOLANA_SECRET_KEY")))
 );
-const signer = new LocalSigner(keypair);  // Signs transactions locally
+const signer = new LocalSigner(keypair);  // Dev-only; throws in production unless KOVA_ALLOW_LOCAL_SIGNER=1
 
 // --- Chain ---
 // Use a private RPC endpoint in production (Helius, QuickNode, etc.)

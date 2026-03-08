@@ -67,7 +67,7 @@ import {
 const wallet = new AgentWallet({
   // signer: Who signs transactions. The signer holds the private key and
   // produces cryptographic signatures that authorize spending.
-  signer: new LocalSigner(keypair),
+  signer: new LocalSigner(keypair), // Dev-only; throws in production unless KOVA_ALLOW_LOCAL_SIGNER=1
 
   // chain: Where transactions go. The chain adapter builds unsigned transactions
   // from intents, broadcasts signed transactions, and queries balances.
@@ -89,9 +89,9 @@ const wallet = new AgentWallet({
 
 | Method | What it does | When to use |
 |--------|-------------|-------------|
-| `execute(intent, metadata?)` | Runs the full 10-step pipeline: validate, policy check, sign, broadcast | Direct programmatic use |
+| `execute(intent, authToken?)` | Runs the full 10-step pipeline: validate, policy check, sign, broadcast | Direct programmatic use |
 | `handleToolCall(name, params)` | Dispatches an AI agent's tool call to the right wallet method | AI agent integration |
-| `getBalance(token?)` | Returns the wallet's balance for a given token | Read-only queries |
+| `getBalance(token)` | Returns the wallet's balance for a given token | Read-only queries |
 | `getAddress()` | Returns the wallet's public address | Display or verification |
 | `getPolicy()` | Returns a human-readable summary of active policy constraints | Agent introspection (opt-in) |
 | `getTransactionHistory(limit?)` | Returns recent audit log entries | Monitoring and debugging |
@@ -270,15 +270,16 @@ A minimal persistence interface used for spending counters, rate limit counters,
 ### Store Interface
 
 ```typescript
-// The Store interface defines 6 operations that the SDK needs for all
+// The Store interface defines 7 operations that the SDK needs for all
 // stateful tracking. Any class implementing this interface can be used.
 interface Store {
   get(key: string): Promise<string | null>;              // Read a value by key
-  set(key: string, value: string, ttl?: number): Promise<void>;  // Write a value with optional TTL
-  setIfNotExists(key: string, value: string, ttl?: number): Promise<boolean>;  // Atomic conditional write
+  set(key: string, value: string, ttlSeconds?: number): Promise<void>;  // Write a value with optional TTL
+  setIfNotExists(key: string, value: string, ttlSeconds?: number): Promise<boolean>;  // Atomic conditional write
   increment(key: string, amount: number): Promise<number>;  // Atomic counter increment
   append(key: string, value: string): Promise<void>;        // Append to a list (for sliding windows)
   getRecent(key: string, count: number): Promise<string[]>; // Read recent list entries
+  clearList?(key: string): Promise<void>;                   // Optional: clear a list
 }
 ```
 
@@ -306,6 +307,9 @@ Responsible for holding keys and signing transactions (cryptographically approvi
 interface Signer {
   getAddress(): Promise<string>;                  // The wallet's public address
   sign(transaction: UnsignedTransaction): Promise<SignedTransaction>;  // Sign a transaction
+  healthCheck(): Promise<boolean>;                // Check if the signer is operational
+  destroy(): Promise<void>;                       // Clean up resources
+  toJSON(): Record<string, unknown>;              // Serialize signer metadata
 }
 ```
 
@@ -331,12 +335,16 @@ Encapsulates all blockchain-specific logic: building transactions, broadcasting,
 // Currently only SolanaAdapter is implemented, but the interface
 // is designed to support any blockchain.
 interface ChainAdapter {
-  getBalance(address: string, token?: string): Promise<string>;        // Token balance
-  getValueInUSD(amount: string, token: string): Promise<number>;       // Price oracle
-  buildTransaction(intent: TransactionIntent): Promise<UnsignedTransaction>;  // Intent -> tx
-  simulateTransaction(tx: UnsignedTransaction): Promise<SimulationResult>;    // Pre-flight check
-  broadcast(signedTx: SignedTransaction): Promise<string>;             // Submit to network
-  getTransactionStatus(txId: string): Promise<TransactionStatusResult>;  // Confirmation polling
+  readonly chain: string;                                                      // Chain identifier (e.g. "solana")
+  getBalance(address: string, token: string): Promise<TokenBalance>;           // Token balance (token required)
+  getValueInUSD(token: string, amount: string): Promise<number>;               // Price oracle
+  buildTransaction(intent: TransactionIntent, signerAddress: string): Promise<UnsignedTransaction>;  // Intent -> tx
+  simulateTransaction(txData: any): Promise<SimulationResult>;                 // Pre-flight check
+  broadcast(signedTxData: any): Promise<string>;                               // Submit to network
+  getTransactionStatus(txId: string): Promise<TransactionStatusResult>;        // Confirmation polling
+  isValidAddress(address: string): boolean;                                    // Address validation
+  // Optional: verifyTransactionIntegrity?, getPreSwapSnapshot?, verifySwapOutput?,
+  //           refreshBlockhash?, destroy?
 }
 ```
 

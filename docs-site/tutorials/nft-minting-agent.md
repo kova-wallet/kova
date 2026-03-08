@@ -99,7 +99,7 @@ const chain = new SolanaAdapter({
 });
 
 const keypair = Keypair.generate();
-const signer = new LocalSigner(keypair);
+const signer = new LocalSigner(keypair); // Dev-only; throws in production unless KOVA_ALLOW_LOCAL_SIGNER=1
 
 // Build the policy using the fluent builder.
 const policy = Policy.create("nft-minting-agent")

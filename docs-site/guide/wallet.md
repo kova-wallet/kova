@@ -45,7 +45,7 @@ import type { AgentWalletConfig } from "kova";
 | `store` | `Store` | Yes | The store for persisting spending counters and tx logs (the database that remembers how much has been spent today) |
 | `approval` | `ApprovalChannel` | No | Optional approval channel for human-in-the-loop (e.g., a Telegram bot that messages a human for approval) |
 | `logger` | `AuditLogger` | No | Optional audit logger. If not provided, one is created using the store |
-| `circuitBreaker` | `Partial<CircuitBreakerConfig> \| false` | No | Circuit breaker config. Set to `false` to disable. Default: `{ threshold: 10, cooldownMs: 300000 }` |
+| `circuitBreaker` | `Partial<CircuitBreakerConfig> \| false` | No | Circuit breaker config. Set to `false` to disable. Default: `{ threshold: 5, cooldownMs: 300000 }` |
 | `onAuditFailure` | `AuditFailureCallback` | No | Callback invoked when an audit log write fails |
 | `idempotencyTtl` | `number` | No | TTL for idempotency cache entries in seconds. Determines how long a duplicate intent ID returns a cached result instead of re-executing. Default: `86400` (24 hours) |
 | `idempotencyHmacKey` | `string \| Buffer` | No | HMAC-SHA256 key for verifying authenticity of cached idempotency entries. Prevents an attacker with store write access from forging cached "confirmed" results. Generate with `crypto.randomBytes(32).toString('hex')` and store securely -- not in the database |
@@ -54,7 +54,6 @@ import type { AgentWalletConfig } from "kova";
 | `enabledTools` | `ReadonlySet<string>` | No | Set of tool names enabled for `handleToolCall()`. Defaults to read-only tools only (`wallet_get_balance`, `wallet_get_transaction_history`). Write tools require explicit opt-in. See [Tool Access Control](#tool-access-control) |
 | `dangerouslyAllowAutoHmacKey` | `boolean` | No | When `true`, allows auto-generation of the idempotency HMAC key. Auto-generated keys do not survive process restarts, risking duplicate transactions. For production, provide a persistent `idempotencyHmacKey` instead |
 | `authToken` | `string` | No | Capability token for caller authentication. When set, `execute()` and `handleToolCall()` require this token; calls without it are rejected with `AUTH_FAILED` |
-| `requireAuth` | `boolean` | No | When `true`, the constructor throws if `authToken` is not provided, enforcing that all wallet instances have caller authentication. Default: `false` |
 | `agentId` | `string` | No | Wallet-level agent identifier. Used for circuit breaker isolation and per-agent rate limiting instead of the self-reported `agentId` in intent metadata, which is untrusted |
 | `verboseErrors` | `boolean` | No | When `true`, policy denial messages include full details (amounts, limits, rule names) without sanitization. Useful for dashboards and development. **Do not enable for untrusted agent callers** -- detailed denials enable policy reconnaissance. Default: `false` |
 
@@ -273,7 +272,7 @@ A **transaction intent** is a high-level description of what you want to do (e.g
 ```typescript
 // Method signature: takes a TransactionIntent and returns a Promise that resolves
 // to a TransactionResult. The entire 10-step pipeline runs inside this call.
-async execute(intent: TransactionIntent): Promise<TransactionResult>
+async execute(intent: TransactionIntent, authToken?: string): Promise<TransactionResult>
 ```
 
 ```typescript
@@ -603,8 +602,6 @@ interface TransactionResult {
   timestamp: number;
   /** Error details if status is "failed" or "denied" */
   error?: TransactionError;
-  /** Chain-specific details */
-  chainData?: Record<string, unknown>;
 }
 ```
 
@@ -665,7 +662,7 @@ If multiple agents share the same `AgentWallet` instance and store, their spendi
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `execute(intent)` | `Promise<TransactionResult>` | Run an intent through the full 10-step pipeline (validate, policy check, build, sign, broadcast) |
+| `execute(intent, authToken?)` | `Promise<TransactionResult>` | Run an intent through the full 10-step pipeline (validate, policy check, build, sign, broadcast) |
 | `getBalance(token)` | `Promise<TokenBalance>` | Check the wallet's balance for a specific token (e.g., "SOL", "USDC") |
 | `getAddress()` | `Promise<string>` | Get the wallet's public address (the address others send funds to) |
 | `getPolicy()` | `Promise<PolicySummary>` | Get a read-only summary of all policy constraints (limits, allowlists, rate limits) |

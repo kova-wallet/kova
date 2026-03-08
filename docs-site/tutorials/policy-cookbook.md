@@ -330,9 +330,9 @@ const config = highValuePolicy.toJSON();
 const rules = [
   new SpendingLimitRule(config.spendingLimit!),  // Check spending caps first (cheapest)
   new RateLimitRule(config.rateLimit!),            // Check rate limits next
-  new ApprovalGateRule(config.requireApproval!),   // Approval gate runs last -- only for allowed intents
+  new ApprovalGateRule(config.approvalGate!),   // Approval gate runs last -- only for allowed intents
 ];
-const store = new MemoryStore();
+const store = new MemoryStore(); // Dev-only; throws in production unless KOVA_ALLOW_MEMORY_STORE=1
 // Pass the approvalBot as the third argument so the ApprovalGateRule can
 // send Telegram messages when a transaction exceeds the approval threshold.
 const engine = new PolicyEngine(rules, store, approvalBot);
@@ -474,14 +474,16 @@ For DeFi operations like token swaps, the agent does not send funds to a wallet 
 **Use case:** An agent that can only read data -- check balances and view policy. It cannot execute any transactions. Perfect for monitoring bots and dashboards.
 
 ```typescript
-// Read-only policy: the safest possible configuration -- zero financial risk.
-// Setting spending limits to "0" blocks ALL transfers and swaps.
+// Read-only policy: the safest possible configuration -- near-zero financial risk.
+// Setting spending limits to "0.000000001" (1 lamport) effectively blocks ALL
+// meaningful transfers and swaps. We use this value instead of "0" because the
+// policy builder rejects zero amounts (amount must be > 0).
 // The agent can still read data (balance, address, policy, history)
 // because read operations bypass the policy engine entirely.
 const readOnlyPolicy = Policy.create("read-only-agent")
   .spendingLimit({
-    perTransaction: { amount: "0", token: "SOL" },  // Zero means no transaction is allowed
-    daily: { amount: "0", token: "SOL" },            // Zero daily cap reinforces the restriction
+    perTransaction: { amount: "0.000000001", token: "SOL" },  // 1 lamport -- effectively zero
+    daily: { amount: "0.000000001", token: "SOL" },            // 1 lamport daily cap reinforces the restriction
   })
   .rateLimit({
     maxTransactionsPerMinute: 30,  // High rate limit allows frequent data polling
@@ -491,8 +493,8 @@ const readOnlyPolicy = Policy.create("read-only-agent")
 ```
 
 **Rationale:**
-- Setting both spending limits to zero effectively blocks all transfers and swaps
-- The agent can still call `wallet.getBalance()`, `wallet.getAddress()`, `wallet.getPolicy()`, and `wallet.getTransactionHistory()` since these are read operations that bypass the policy engine
+- Setting both spending limits to 0.000000001 SOL (1 lamport) effectively blocks all meaningful transfers and swaps
+- The agent can still call `wallet.getBalance("SOL")`, `wallet.getAddress()`, `wallet.getPolicy()`, and `wallet.getTransactionHistory()` since these are read operations that bypass the policy engine
 - High rate limit allows frequent data polling
 - This is the safest configuration -- zero financial risk
 
@@ -512,8 +514,9 @@ const history = await wallet.getTransactionHistory(100);    // Retrieves last 10
 
 ```typescript
 // This intent will be DENIED even though the amount is tiny (0.001 SOL).
-// When the per-transaction spending limit is "0", ANY non-zero amount exceeds it.
-// This is the definitive way to create a truly read-only agent.
+// When the per-transaction spending limit is "0.000000001" (1 lamport),
+// any practical amount exceeds it. This is the definitive way to create
+// a truly read-only agent.
 const denied = {
   type: "transfer",
   chain: "solana",
@@ -527,7 +530,7 @@ const denied = {
 ```
 
 ::: tip
-Even a 0.001 SOL transfer will be denied when the per-transaction limit is "0". This is the most restrictive policy possible.
+Even a 0.001 SOL transfer will be denied when the per-transaction limit is "0.000000001". This is the most restrictive policy possible.
 :::
 
 ---
@@ -691,7 +694,7 @@ This pattern is useful for:
 | Business Hours | 5 SOL | 50 SOL | No | 10/min | Mon-Fri 9-5 ET | No |
 | High-Value Approval | 50 SOL | 200 SOL | No | 10/min | No | Above 10 SOL |
 | DeFi Trader | 10 SOL | 100 SOL | No (programs) | 10/min | No | No |
-| Read-Only | 0 SOL | 0 SOL | No | 30/min | No | No |
+| Read-Only | ~0 SOL | ~0 SOL | No | 30/min | No | No |
 
 ## Common Mistakes
 

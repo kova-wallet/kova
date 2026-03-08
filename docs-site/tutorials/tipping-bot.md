@@ -184,7 +184,7 @@ const chain = new SolanaAdapter({
 
 // In production, load this from an encrypted secrets store.
 const keypair = Keypair.generate();
-const signer = new LocalSigner(keypair);
+const signer = new LocalSigner(keypair); // Dev-only; throws in production unless KOVA_ALLOW_LOCAL_SIGNER=1
 
 // ── Policy: tight limits for micro-payments ─────────────────────────────────
 

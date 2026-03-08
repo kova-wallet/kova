@@ -35,7 +35,7 @@ import { PolicyEngine } from "kova";
 // - rules: an ordered array of PolicyRule objects (evaluated sequentially; order matters!).
 // - store: the persistence layer for rule state (spending counters, rate-limit counters, etc.).
 // - approval (optional): the approval channel used by rules that require human-in-the-loop (e.g., ApprovalGateRule).
-const engine = new PolicyEngine(rules, store, approval?);
+const engine = new PolicyEngine(rules, store, approval?, getValueInUSD?, mutexTimeoutMs?);
 ```
 
 | Parameter | Type | Required | Description |
@@ -43,6 +43,8 @@ const engine = new PolicyEngine(rules, store, approval?);
 | `rules` | `PolicyRule[]` | Yes | Ordered list of rules to evaluate. Must contain at least one rule. |
 | `store` | `Store` | Yes | Store instance for spending counters, rate limits, etc. (the database that tracks how much has been spent) |
 | `approval` | `ApprovalChannel` | No | Approval channel for rules that require human-in-the-loop (e.g., a Telegram bot) |
+| `getValueInUSD` | `(token: string, amount: string) => Promise<number>` | No | Function to convert token amounts to USD for spending limit evaluation |
+| `mutexTimeoutMs` | `number` | No | Timeout in milliseconds for acquiring the evaluation mutex |
 
 ::: danger
 The `PolicyEngine` constructor throws an error if `rules` is empty. An engine with zero rules would allow all transactions unconditionally, violating the deny-by-default principle. You must always have at least one rule.

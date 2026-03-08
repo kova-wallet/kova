@@ -154,10 +154,10 @@ The <Term id="signer" /> is responsible for cryptographically signing transactio
 
 ```typescript
 // Wrap the raw Keypair in a LocalSigner, which implements the Signer interface.
-// The Signer interface exposes: getAddress(), sign(transaction), and healthCheck().
+// The Signer interface exposes: getAddress(), sign(transaction), healthCheck(), destroy(), and toJSON().
 // LocalSigner holds the private key in memory -- suitable for development only.
 // In production, consider an MPC signer or hardware security module (HSM).
-const signer = new LocalSigner(keypair);
+const signer = new LocalSigner(keypair); // Dev-only; throws in production unless KOVA_ALLOW_LOCAL_SIGNER=1
 ```
 
 ## Step 6: Create a MemoryStore
@@ -165,12 +165,13 @@ const signer = new LocalSigner(keypair);
 The <Term id="store" /> holds policy state such as spending counters, rate limit windows, and <Term id="audit-log">audit logs</Term>. `MemoryStore` keeps everything in memory and is ideal for development and testing.
 
 ```typescript
-// MemoryStore implements the Store interface with 5 methods:
-//   get(key), set(key, value), increment(key, amount), append(key, entry), getRecent(key, n)
+// MemoryStore implements the Store interface with 7 methods:
+//   get(key), set(key, value), setIfNotExists(key, value), increment(key, amount),
+//   append(key, entry), getRecent(key, n), clearList(key) (optional)
 // It holds spending counters, rate limit windows, audit log entries, and idempotency
 // caches in JavaScript Maps. All data is lost when the process exits.
 // For production, switch to SqliteStore for persistence across restarts.
-const store = new MemoryStore();
+const store = new MemoryStore(); // Dev-only; throws in production unless KOVA_ALLOW_MEMORY_STORE=1
 ```
 
 ::: details Checkpoint -- Steps 3 through 6
@@ -640,9 +641,9 @@ async function main() {
 
   // 2. Create core components
   // LocalSigner wraps the keypair to implement the Signer interface.
-  const signer = new LocalSigner(keypair);
+  const signer = new LocalSigner(keypair); // Dev-only; throws in production unless KOVA_ALLOW_LOCAL_SIGNER=1
   // MemoryStore holds spending counters, rate limits, and audit entries in memory.
-  const store = new MemoryStore();
+  const store = new MemoryStore(); // Dev-only; throws in production unless KOVA_ALLOW_MEMORY_STORE=1
   // SolanaAdapter connects to devnet for building and broadcasting transactions.
   const chain = new SolanaAdapter({
     rpcUrl: "https://api.devnet.solana.com",  // Devnet RPC endpoint (free, rate-limited)

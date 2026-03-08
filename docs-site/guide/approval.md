@@ -250,8 +250,8 @@ If `allowedUserIds` is not configured, **any user** who has access to the chat c
 
 The TelegramApprovalBot includes several security measures:
 
-- **HKDF key derivation**: Callback data is signed using HMAC keys derived via HKDF (HMAC-based Key Derivation Function), providing proper domain separation
-- **192-bit HMAC tags**: Each approval callback carries a 192-bit HMAC tag (48 hex characters) to prevent forgery
+- **HMAC-SHA-256 signing**: Callback data is signed using HMAC-SHA-256 (via `crypto.createHmac("sha256", key)`) to prevent forgery
+- **HMAC tags**: Each approval callback carries an HMAC-SHA-256 tag to prevent forgery
 - **HMAC failure counting**: After 10 failed HMAC verification attempts for a single request, it is automatically rejected
 - **Secure token storage**: The bot token is stored as a `Buffer` and zero-filled on `destroy()`, preventing the token from lingering in V8's heap
 

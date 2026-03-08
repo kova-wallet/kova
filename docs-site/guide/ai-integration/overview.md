@@ -295,7 +295,7 @@ You can access the raw canonical definitions directly:
 // Import the tool definition constants from kova.
 import { WALLET_TOOLS, getToolByName } from "kova";
 
-// WALLET_TOOLS contains the 6 safe tool definitions. DANGEROUS_TOOLS has 2 more (opt-in).
+// WALLET_TOOLS contains all 8 tool definitions (6 safe + 2 dangerous).
 // You can use these to build custom integrations with providers not natively supported.
 console.log(WALLET_TOOLS.length); // 8
 

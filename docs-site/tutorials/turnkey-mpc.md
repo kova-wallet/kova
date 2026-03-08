@@ -1,5 +1,9 @@
 # MPC Signing with Turnkey (End-to-End)
 
+::: tip BUILT-IN PROVIDER AVAILABLE
+kova ships with a built-in `TurnkeyProvider` that you can import directly from `kova-wallet`. For most use cases, you do not need to build your own. This tutorial walks through creating a custom provider from scratch for educational purposes, so you understand how the `MpcSigningProvider` interface works under the hood.
+:::
+
 ---
 
 ## What You'll Build

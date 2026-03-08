@@ -7,6 +7,10 @@
 - Important limitations and when NOT to use the dashboard
 :::
 
+::: warning Separate Project
+The Kova Dashboard is a separate project and is **not included** in the kova SDK npm package. It lives in the `dashboard/` directory of the kova-wallet repository and must be set up independently.
+:::
+
 The Kova Dashboard is a **Next.js admin UI** for testing and exploring the SDK on Solana devnet. Think of it as a visual control panel for your agent wallet -- you can create wallets, configure policies, execute transactions, and approve requests, all from a browser instead of writing code.
 
 ### When would I use this?
