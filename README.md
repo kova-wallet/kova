@@ -51,7 +51,6 @@ Agent → Intent → Policy Engine → Build Tx → Sign → Broadcast → Audit
 | **Solana** | SOL transfers, SPL tokens, Jupiter swaps, transaction simulation |
 | **Audit Log** | SHA-256 hash-chained, optional AES-256-GCM encryption |
 | **Circuit Breaker** | Auto-cooldown after consecutive denials |
-| **Dashboard** | Web admin UI for policy management, monitoring, and API key management |
 | **Security** | 196 audit findings remediated across 14 CRIT, 27 HIGH, 38 MED, 31 LOW |
 
 ## Quick Start
@@ -89,17 +88,6 @@ const result = await wallet.execute({
 
 console.log(result.status);  // "confirmed" | "denied" | "pending" | "failed"
 ```
-
-### Run the dashboard
-
-```bash
-git clone https://github.com/0xKeyserSoze/kova.git && cd kova && npm install
-cd dashboard && npm install
-npx tsx wallet/generate.ts   # generates a devnet keypair
-npm run dev                  # http://localhost:3000
-```
-
-Fund the wallet at [faucet.solana.com](https://faucet.solana.com) using the printed address.
 
 ## Architecture
 
@@ -260,20 +248,6 @@ The `Signer` interface is minimal — `getAddress()`, `sign()`, `healthCheck()`,
 
 The `ApprovalChannel` interface (`requestApproval()`) is open for custom implementations — Slack, Discord, email, or any other channel.
 
-## Dashboard
-
-The optional web dashboard (`dashboard/`) provides a full admin UI:
-
-- **Wallet management** — generate, import keyfile, or connect Turnkey MPC wallets
-- **Multi-wallet** — switch between loaded wallets with isolated state
-- **Policy builder** — visual form + 6 pre-built templates (conservative, moderate, DeFi bot, etc.)
-- **Transaction monitoring** — real-time history with search and filters
-- **Approval queue** — approve/reject pending transactions via SSE stream
-- **Audit log viewer** — searchable, filterable transaction audit trail
-- **Alert system** — in-memory alerts + webhook dispatch
-- **API keys** — issue scoped keys for agents (execute-only, defense-in-depth route guards)
-- **Auth** — password-based with HMAC-signed session cookies, two-layer route protection
-
 ## Security
 
 | Protection | Implementation |
@@ -288,7 +262,7 @@ The optional web dashboard (`dashboard/`) provides a full admin UI:
 | **Idempotency** | Duplicate intent IDs return cached results. |
 | **Error sanitization** | Errors are sanitized before returning to agents — no secret leakage. |
 | **Counter integrity** | HMAC-protected store counters detect tampering. |
-| **Defense-in-depth** | Dashboard routes have both middleware and per-route auth guards. API keys are scoped to execute-only. |
+| **Defense-in-depth** | Multiple overlapping security layers at every level of the stack. |
 
 196 audit findings remediated: 14 Critical, 27 High, 38 Medium, 31 Low.
 
@@ -307,7 +281,6 @@ kova/
 │   ├── approval/       # TelegramApprovalBot, ApprovalChannel interface
 │   ├── adapters/       # Claude, OpenAI, LangChain tool adapters
 │   └── logging/        # Hash-chained audit logger
-├── dashboard/          # Next.js admin UI
 ├── tests/              # 1100+ unit and integration tests
 └── docs-site/          # VitePress documentation
 ```
