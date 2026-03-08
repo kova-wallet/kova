@@ -8,8 +8,12 @@ import {
   getSignerType,
 } from "@/lib/wallet-manager";
 import { getConfig } from "@/lib/config";
+import { requireDashboardAuth } from "@/lib/auth";
 
-export async function GET() {
+export async function GET(req: NextRequest) {
+  const auth = requireDashboardAuth(req);
+  if (!auth.authenticated) return auth.response;
+
   const config = getConfig();
   return NextResponse.json({
     network: config.network,
@@ -25,6 +29,9 @@ export async function GET() {
 }
 
 export async function POST(req: NextRequest) {
+  const auth = requireDashboardAuth(req);
+  if (!auth.authenticated) return auth.response;
+
   try {
     const body = await req.json();
     const { action } = body as { action: string };

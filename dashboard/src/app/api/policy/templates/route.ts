@@ -1,11 +1,18 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getPolicyTemplates, buildFromTemplate } from "@/lib/policy-templates";
+import { requireDashboardAuth } from "@/lib/auth";
 
-export async function GET() {
+export async function GET(req: NextRequest) {
+  const auth = requireDashboardAuth(req);
+  if (!auth.authenticated) return auth.response;
+
   return NextResponse.json({ templates: getPolicyTemplates() });
 }
 
 export async function POST(req: NextRequest) {
+  const auth = requireDashboardAuth(req);
+  if (!auth.authenticated) return auth.response;
+
   try {
     const { templateId } = (await req.json()) as { templateId: string };
     if (!templateId) {

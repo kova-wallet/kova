@@ -198,7 +198,6 @@ export class TurnkeyProvider implements MpcSigningProvider {
 
     try {
       // Dynamic import — @turnkey/sdk-server is an optional peer dependency.
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
       const moduleName = "@turnkey/sdk-server";
       const { Turnkey } = await import(/* webpackIgnore: true */ moduleName);
 

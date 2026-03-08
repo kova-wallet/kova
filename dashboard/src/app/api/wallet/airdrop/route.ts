@@ -1,7 +1,11 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { requestAirdrop, isInitialized } from "@/lib/wallet-manager";
+import { requireDashboardAuth } from "@/lib/auth";
 
-export async function POST() {
+export async function POST(req: NextRequest) {
+  const auth = requireDashboardAuth(req);
+  if (!auth.authenticated) return auth.response;
+
   if (!isInitialized()) {
     return NextResponse.json(
       { error: "No wallet created yet" },

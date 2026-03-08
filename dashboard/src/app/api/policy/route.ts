@@ -5,8 +5,12 @@ import {
   isInitialized,
   applyPolicy,
 } from "@/lib/wallet-manager";
+import { requireDashboardAuth } from "@/lib/auth";
 
-export async function GET() {
+export async function GET(req: NextRequest) {
+  const auth = requireDashboardAuth(req);
+  if (!auth.authenticated) return auth.response;
+
   if (!isInitialized()) {
     return NextResponse.json(
       { error: "No wallet created yet" },
@@ -27,6 +31,9 @@ export async function GET() {
 }
 
 export async function POST(req: NextRequest) {
+  const auth = requireDashboardAuth(req);
+  if (!auth.authenticated) return auth.response;
+
   if (!isInitialized()) {
     return NextResponse.json(
       { error: "No wallet created yet" },
