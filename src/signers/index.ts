@@ -2,3 +2,5 @@ export type { Signer, UnsignedTransaction, SignedTransaction } from "./interface
 export { LocalSigner } from "./local.js";
 export { MpcSigner, MpcSignerError } from "./mpc.js";
 export type { MpcSigningProvider, MpcSignerConfig, MpcSignResult, MpcSignerErrorCode } from "./mpc.js";
+export { TurnkeyProvider } from "./turnkey-provider.js";
+export type { TurnkeyProviderConfig } from "./turnkey-provider.js";

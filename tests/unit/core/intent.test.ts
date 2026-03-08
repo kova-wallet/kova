@@ -168,7 +168,6 @@ describe("Intent Type Guards", () => {
           reason: "Payment for service",
           agentId: "agent-1",
           taskId: "task-42",
-          urgency: "high",
         },
         id: "intent-123",
         createdAt: Date.now(),

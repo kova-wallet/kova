@@ -216,7 +216,7 @@ describe("SpendingLimitRule", () => {
     );
     expect(result2.decision).toBe("DENY");
     if (result2.decision === "DENY") {
-      expect(result2.reason).toContain("Spending limit exceeded");
+      expect(result2.reason).toContain("spending limit exceeded");
     }
   });
 
@@ -695,7 +695,7 @@ describe("SpendingLimitRule — Edge Cases", () => {
     );
     expect(r2.decision).toBe("DENY");
     if (r2.decision === "DENY") {
-      expect(r2.reason).toContain("Spending limit exceeded");
+      expect(r2.reason).toContain("spending limit exceeded");
     }
   });
 

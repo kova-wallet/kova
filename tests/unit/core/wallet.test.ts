@@ -662,7 +662,7 @@ describe("AgentWallet", () => {
         type: "transfer",
         chain: "solana",
         params: { to: VALID_SOL_ADDRESS, amount: "5.5", token: "USDC" },
-        metadata: { agentId: "agent-1", reason: "test payment", urgency: "high" },
+        metadata: { agentId: "agent-1", reason: "test payment" },
       };
 
       await wallet.execute(originalIntent);
@@ -1003,7 +1003,6 @@ describe("AgentWallet", () => {
           agentId: "agent-1",
           taskId: "task-1",
           reason: "monthly payroll",
-          urgency: "high",
         },
       }));
 

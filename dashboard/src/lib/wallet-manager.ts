@@ -1,227 +1,419 @@
 /**
  * Server-side wallet singleton. All API routes share this state.
- * Devnet only — uses LocalSigner + MemoryStore.
+ *
+ * Supports multiple store backends (MemoryStore, SqliteStore) and
+ * multiple signer types (LocalSigner, TurnkeyProvider via MpcSigner).
+ *
+ * Configuration is driven by environment variables via getConfig().
+ * Wallet creation is handled by the WalletSourceRegistry.
+ *
+ * Uses globalThis to persist state across Next.js dev-mode module
+ * re-evaluations, which create separate compilation contexts for
+ * each API route.
  */
 
-import { Connection, Keypair } from "@solana/web3.js";
+import { Connection, Keypair, PublicKey } from "@solana/web3.js";
 import { AgentWallet } from "@kova/core/wallet.js";
 import { PolicyEngine } from "@kova/policy/engine.js";
 import { Policy } from "@kova/policy/builder.js";
 import { LocalSigner } from "@kova/signers/local.js";
 import { SolanaAdapter } from "@kova/chains/solana/adapter.js";
 import { MemoryStore } from "@kova/stores/memory.js";
+import { SqliteStore } from "@kova/stores/sqlite.js";
+import { PrefixedStore } from "@kova/stores/prefixed.js";
+import type { Store } from "@kova/stores/interface.js";
+import type { Signer } from "@kova/signers/interface.js";
 import type { PolicyConfig } from "@kova/policy/types.js";
-import { readFileSync, existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, mkdirSync } from "node:fs";
+import { resolve, dirname } from "node:path";
 import { DashboardApprovalChannel } from "./approval-channel";
 import { policyConfigToRules } from "./policy-helpers";
-import { DEVNET_RPC_URL, AIRDROP_AMOUNT_LAMPORTS } from "./constants";
+import { getConfig, getSolanaNetwork } from "./config";
+import { getWalletSourceRegistry } from "./wallet-sources";
+import type { WalletSourceConfig, WalletSourceType } from "./wallet-sources";
 
-const KEYPAIR_PATH = resolve(process.cwd(), "wallet", "keypair.json");
-
-interface WalletState {
-  wallet: AgentWallet | null;
-  store: MemoryStore | null;
-  approvalChannel: DashboardApprovalChannel | null;
-  address: string | null;
-  policyConfig: PolicyConfig | null;
-  // Store secret key bytes for wallet re-creation on policy change.
-  // DEVNET DEMO ONLY.
+/** Metadata for a loaded wallet — stored per wallet for multi-wallet support. */
+export interface LoadedWallet {
+  wallet: AgentWallet;
+  store: Store;
+  approvalChannel: DashboardApprovalChannel;
+  address: string;
+  policyConfig: PolicyConfig;
   keypairBytes: Uint8Array | null;
+  sourceLabel: string;
+  sourceType: WalletSourceType;
 }
 
-const state: WalletState = {
-  wallet: null,
-  store: null,
-  approvalChannel: null,
-  address: null,
-  policyConfig: null,
-  keypairBytes: null,
-};
+interface WalletManagerState {
+  /** All loaded wallets, keyed by address */
+  wallets: Map<string, LoadedWallet>;
+  /** Currently active wallet address */
+  activeAddress: string | null;
+  /** Shared base store — all wallets use PrefixedStore wrappers around this */
+  baseStore: Store | null;
+}
+
+// Persist state on globalThis so it survives Next.js dev-mode module re-evaluation
+const GLOBAL_KEY = "__kova_wallet_state_v2__" as const;
+
+function getManagerState(): WalletManagerState {
+  const g = globalThis as unknown as Record<string, WalletManagerState>;
+  if (!g[GLOBAL_KEY]) {
+    g[GLOBAL_KEY] = {
+      wallets: new Map(),
+      activeAddress: null,
+      baseStore: null,
+    };
+  }
+  return g[GLOBAL_KEY];
+}
 
 function getConnection(): Connection {
-  return new Connection(DEVNET_RPC_URL, "confirmed");
+  const config = getConfig();
+  return new Connection(config.rpcUrl, "confirmed");
 }
 
 /**
- * Load the persisted keypair from wallet/keypair.json on server startup
- * so the dashboard is ready immediately without manual wallet creation.
+ * Create the shared base Store instance (singleton).
+ * All wallets share this backend but use PrefixedStore for isolation.
  */
-function autoLoadKeypair(): void {
-  if (state.wallet) return; // already initialized
-  if (!existsSync(KEYPAIR_PATH)) return;
-
-  try {
-    const raw = JSON.parse(readFileSync(KEYPAIR_PATH, "utf-8")) as number[];
-    const keypair = Keypair.fromSecretKey(Uint8Array.from(raw));
-    const policyConfig = buildDefaultPolicyConfig();
-    const store = new MemoryStore({ dangerouslyAllowInProduction: true });
-    const approvalChannel = new DashboardApprovalChannel();
-
-    state.wallet = buildWalletFromState(keypair, policyConfig, store, approvalChannel);
-    state.store = store;
-    state.approvalChannel = approvalChannel;
-    state.address = keypair.publicKey.toBase58();
-    state.policyConfig = policyConfig;
-    state.keypairBytes = keypair.secretKey;
-
-    console.log(`[kova] Auto-loaded wallet: ${state.address}`);
-  } catch (e) {
-    console.error("[kova] Failed to auto-load keypair:", e);
+function getBaseStore(): Store {
+  const mgr = getManagerState();
+  if (!mgr.baseStore) {
+    const config = getConfig();
+    if (config.storeType === "sqlite") {
+      const dbPath = resolve(process.cwd(), config.sqlitePath);
+      const dbDir = dirname(dbPath);
+      if (!existsSync(dbDir)) {
+        mkdirSync(dbDir, { recursive: true });
+      }
+      mgr.baseStore = new SqliteStore({ path: dbPath });
+    } else {
+      mgr.baseStore = new MemoryStore({ dangerouslyAllowInProduction: true });
+    }
   }
+  return mgr.baseStore;
 }
 
-// Auto-load on module initialization (server startup)
-autoLoadKeypair();
+/**
+ * Create a PrefixedStore for a specific wallet address.
+ * Uses the shared base store with wallet address as prefix for isolation.
+ */
+export function createStore(walletAddress?: string): Store {
+  const base = getBaseStore();
+  if (walletAddress) {
+    // Use first 16 chars of address as prefix (safe for PrefixedStore's 64-char limit)
+    const prefix = `wallet:${walletAddress.slice(0, 16)}`;
+    return new PrefixedStore(base, prefix);
+  }
+  return base;
+}
+
+/**
+ * Auto-load wallet on startup based on environment configuration.
+ */
+function autoLoadWallet(): void {
+  const mgrState = getManagerState();
+  if (mgrState.wallets.size > 0) return;
+
+  const registry = getWalletSourceRegistry();
+
+  registry.resolveFromEnv().then(async (resolved) => {
+    const policyConfig = buildDefaultPolicyConfig();
+    const store = createStore(resolved.address);
+    const approvalChannel = new DashboardApprovalChannel();
+
+    const wallet = buildWalletFromSigner(resolved.signer, policyConfig, store, approvalChannel);
+
+    const loaded: LoadedWallet = {
+      wallet,
+      store,
+      approvalChannel,
+      address: resolved.address,
+      policyConfig,
+      keypairBytes: resolved.keypairBytes,
+      sourceLabel: resolved.sourceLabel,
+      sourceType: resolved.sourceType,
+    };
+
+    mgrState.wallets.set(resolved.address, loaded);
+    mgrState.activeAddress = resolved.address;
+
+    const config = getConfig();
+    console.log(`[kova] Auto-loaded wallet (${resolved.sourceLabel}) on ${config.networkLabel}: ${resolved.address}`);
+  }).catch((e) => {
+    // Non-fatal — user can create wallet from UI
+    console.log("[kova] No wallet auto-loaded:", (e as Error).message);
+  });
+}
+
+autoLoadWallet();
 
 function buildDefaultPolicyConfig(): PolicyConfig {
+  const config = getConfig();
   return Policy.create("default")
     .spendingLimit({
-      perTransaction: { amount: "0.01", token: "SOL" },
-      daily: { amount: "1", token: "SOL" },
+      perTransaction: { amount: "10", token: "SOL" },
+      daily: { amount: "10", token: "SOL" },
+    })
+    .requireApproval({
+      above: { amount: "0.01", token: "SOL" },
+      timeout: config.approvalTimeoutMs,
     })
     .rateLimit({ maxTransactionsPerMinute: 5 })
     .build()
     .toJSON();
 }
 
-function buildWalletFromState(
-  keypair: Keypair,
-  config: PolicyConfig,
-  store: MemoryStore,
+function buildWalletFromSigner(
+  signer: Signer,
+  policyConfig: PolicyConfig,
+  store: Store,
   approvalChannel: DashboardApprovalChannel
 ): AgentWallet {
-  const rules = policyConfigToRules(config);
+  const rules = policyConfigToRules(policyConfig);
   if (rules.length === 0) {
     throw new Error("Policy must have at least one rule configured");
   }
 
+  const config = getConfig();
   const engine = new PolicyEngine(rules, store, approvalChannel);
 
   return new AgentWallet({
-    signer: new LocalSigner(keypair, { dangerouslyAllowInProduction: true }),
-    chain: new SolanaAdapter({ rpcUrl: DEVNET_RPC_URL, network: "devnet" }),
+    signer,
+    chain: new SolanaAdapter({
+      rpcUrl: config.rpcUrl,
+      network: getSolanaNetwork(config.network),
+    }),
     policy: engine,
     store,
     approval: approvalChannel,
     dangerouslyAllowAutoHmacKey: true,
+    verboseErrors: true,
   });
 }
 
-export async function createWallet(options?: {
-  importedSecretKey?: number[];
-}): Promise<string> {
-  // Destroy existing wallet if any
-  if (state.wallet) {
-    await state.wallet.destroy();
-  }
+// ── Active wallet helper ───────────────────────────────────────────────────
 
-  const keypair = options?.importedSecretKey
-    ? Keypair.fromSecretKey(Uint8Array.from(options.importedSecretKey))
-    : Keypair.generate();
+function getActiveLoaded(): LoadedWallet | null {
+  const mgr = getManagerState();
+  if (!mgr.activeAddress) return null;
+  return mgr.wallets.get(mgr.activeAddress) ?? null;
+}
+
+// ---------------------------------------------------------------------------
+// Wallet listing / switching
+// ---------------------------------------------------------------------------
+
+/** List all loaded wallets with their metadata. */
+export function listLoadedWallets(): {
+  address: string;
+  sourceLabel: string;
+  sourceType: string;
+  isActive: boolean;
+}[] {
+  const mgr = getManagerState();
+  return Array.from(mgr.wallets.values()).map((w) => ({
+    address: w.address,
+    sourceLabel: w.sourceLabel,
+    sourceType: w.sourceType,
+    isActive: w.address === mgr.activeAddress,
+  }));
+}
+
+/** Switch the active wallet to a different loaded wallet. */
+export function switchWallet(address: string): void {
+  const mgr = getManagerState();
+  if (!mgr.wallets.has(address)) {
+    throw new Error(`No loaded wallet with address: ${address}`);
+  }
+  mgr.activeAddress = address;
+}
+
+export function getActiveWalletName(): string | null {
+  const loaded = getActiveLoaded();
+  return loaded?.sourceLabel ?? null;
+}
+
+export function getSignerType(): string | null {
+  const loaded = getActiveLoaded();
+  return loaded?.sourceType ?? null;
+}
+
+// ---------------------------------------------------------------------------
+// Wallet creation via WalletSourceRegistry
+// ---------------------------------------------------------------------------
+
+/**
+ * Create (or load) a wallet from a WalletSourceConfig.
+ * The wallet is added to the loaded wallets map and set as active.
+ */
+export async function createWalletFromSource(sourceConfig: WalletSourceConfig): Promise<string> {
+  const registry = getWalletSourceRegistry();
+  const resolved = await registry.resolve(sourceConfig);
 
   const policyConfig = buildDefaultPolicyConfig();
-  const store = new MemoryStore({ dangerouslyAllowInProduction: true });
+  const store = createStore(resolved.address);
   const approvalChannel = new DashboardApprovalChannel();
 
-  const wallet = buildWalletFromState(
-    keypair,
-    policyConfig,
+  const wallet = buildWalletFromSigner(resolved.signer, policyConfig, store, approvalChannel);
+
+  const loaded: LoadedWallet = {
+    wallet,
     store,
-    approvalChannel
-  );
+    approvalChannel,
+    address: resolved.address,
+    policyConfig,
+    keypairBytes: resolved.keypairBytes,
+    sourceLabel: resolved.sourceLabel,
+    sourceType: resolved.sourceType,
+  };
 
-  state.wallet = wallet;
-  state.store = store;
-  state.approvalChannel = approvalChannel;
-  state.address = keypair.publicKey.toBase58();
-  state.policyConfig = policyConfig;
-  state.keypairBytes = keypair.secretKey;
+  const mgr = getManagerState();
+  mgr.wallets.set(resolved.address, loaded);
+  mgr.activeAddress = resolved.address;
 
-  return state.address;
+  return resolved.address;
 }
 
-export async function applyPolicy(config: PolicyConfig): Promise<void> {
-  if (!state.keypairBytes) {
+/**
+ * Backwards-compatible createWallet — wraps createWalletFromSource.
+ */
+export async function createWallet(options?: {
+  importedSecretKey?: number[];
+  signerType?: "local" | "turnkey";
+  turnkeyConfig?: {
+    apiBaseUrl: string;
+    apiPublicKey: string;
+    apiPrivateKey: string;
+    organizationId: string;
+    walletAddress: string;
+  };
+}): Promise<string> {
+  if (options?.signerType === "turnkey" && options.turnkeyConfig) {
+    return createWalletFromSource({ type: "turnkey", turnkey: options.turnkeyConfig });
+  }
+  if (options?.importedSecretKey) {
+    return createWalletFromSource({
+      type: "secret-key",
+      secretKey: JSON.stringify(options.importedSecretKey),
+    });
+  }
+  return createWalletFromSource({ type: "generate" });
+}
+
+// ---------------------------------------------------------------------------
+// Policy
+// ---------------------------------------------------------------------------
+
+export async function applyPolicy(policyConf: PolicyConfig): Promise<void> {
+  const loaded = getActiveLoaded();
+  if (!loaded) {
     throw new Error("No wallet created yet");
   }
 
-  // Validate using the SDK's Policy.fromJSON (runs all validations)
-  Policy.fromJSON(config);
+  Policy.fromJSON(policyConf);
 
-  // Destroy current wallet
-  if (state.wallet) {
-    await state.wallet.destroy();
+  await loaded.wallet.destroy();
+
+  const store = createStore(loaded.address);
+  const approvalChannel = loaded.approvalChannel ?? new DashboardApprovalChannel();
+
+  let signer: Signer;
+  if (loaded.keypairBytes) {
+    signer = new LocalSigner(
+      Keypair.fromSecretKey(loaded.keypairBytes),
+      { dangerouslyAllowInProduction: true }
+    );
+  } else if (loaded.sourceType === "turnkey") {
+    // Re-resolve from env for Turnkey signers
+    const registry = getWalletSourceRegistry();
+    const resolved = await registry.resolve({ type: "env" });
+    signer = resolved.signer;
+  } else {
+    throw new Error("Cannot rebuild wallet: no signer available");
   }
 
-  const keypair = Keypair.fromSecretKey(state.keypairBytes);
-  const store = new MemoryStore({ dangerouslyAllowInProduction: true });
-  // Reuse existing approval channel so SSE listeners stay connected
-  const approvalChannel =
-    state.approvalChannel ?? new DashboardApprovalChannel();
+  const wallet = buildWalletFromSigner(signer, policyConf, store, approvalChannel);
 
-  const wallet = buildWalletFromState(
-    keypair,
-    config,
-    store,
-    approvalChannel
-  );
-
-  state.wallet = wallet;
-  state.store = store;
-  state.approvalChannel = approvalChannel;
-  state.policyConfig = config;
+  loaded.wallet = wallet;
+  loaded.store = store;
+  loaded.approvalChannel = approvalChannel;
+  loaded.policyConfig = policyConf;
 }
+
+// ---------------------------------------------------------------------------
+// Airdrop
+// ---------------------------------------------------------------------------
 
 export async function requestAirdrop(): Promise<string> {
-  if (!state.address) {
+  const config = getConfig();
+  const loaded = getActiveLoaded();
+  if (!loaded) {
     throw new Error("No wallet created yet");
+  }
+  if (!config.airdropEnabled) {
+    throw new Error("Airdrop is not available on this network");
   }
 
   const connection = getConnection();
-  const pubkey = Keypair.fromSecretKey(state.keypairBytes!).publicKey;
-  const signature = await connection.requestAirdrop(
-    pubkey,
-    AIRDROP_AMOUNT_LAMPORTS
-  );
+  const pubkey = new PublicKey(loaded.address);
+  const lamports = config.airdropAmountSol * 1_000_000_000;
+  const signature = await connection.requestAirdrop(pubkey, lamports);
   await connection.confirmTransaction(signature, "confirmed");
   return signature;
 }
 
+// ---------------------------------------------------------------------------
+// Accessors (for active wallet)
+// ---------------------------------------------------------------------------
+
 export function getWallet(): AgentWallet | null {
-  return state.wallet;
+  return getActiveLoaded()?.wallet ?? null;
 }
 
 export function getApprovalChannel(): DashboardApprovalChannel | null {
-  return state.approvalChannel;
+  return getActiveLoaded()?.approvalChannel ?? null;
 }
 
 export function getPolicyConfig(): PolicyConfig | null {
-  return state.policyConfig;
+  return getActiveLoaded()?.policyConfig ?? null;
 }
 
 export function getAddress(): string | null {
-  return state.address;
+  return getActiveLoaded()?.address ?? null;
 }
 
 export function isInitialized(): boolean {
-  return state.wallet !== null;
+  return getActiveLoaded() !== null;
 }
 
+// ---------------------------------------------------------------------------
+// Destroy
+// ---------------------------------------------------------------------------
+
+/** Destroy the active wallet and remove it from loaded wallets. */
 export async function destroyWallet(): Promise<void> {
-  if (state.wallet) {
-    await state.wallet.destroy();
+  const mgr = getManagerState();
+  const loaded = getActiveLoaded();
+  if (!loaded) return;
+
+  await loaded.wallet.destroy();
+  loaded.approvalChannel.destroy();
+  mgr.wallets.delete(loaded.address);
+
+  // Switch to another wallet if available, or set to null
+  const remaining = Array.from(mgr.wallets.keys());
+  mgr.activeAddress = remaining.length > 0 ? remaining[0]! : null;
+}
+
+/** Destroy all loaded wallets. */
+export async function destroyAllWallets(): Promise<void> {
+  const mgr = getManagerState();
+  for (const loaded of mgr.wallets.values()) {
+    await loaded.wallet.destroy();
+    loaded.approvalChannel.destroy();
   }
-  if (state.approvalChannel) {
-    state.approvalChannel.destroy();
-  }
-  if (state.store) {
-    state.store.destroy();
-  }
-  state.wallet = null;
-  state.store = null;
-  state.approvalChannel = null;
-  state.address = null;
-  state.policyConfig = null;
-  state.keypairBytes = null;
+  mgr.wallets.clear();
+  mgr.activeAddress = null;
 }

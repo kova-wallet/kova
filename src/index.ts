@@ -96,6 +96,8 @@ export type { Signer, UnsignedTransaction, SignedTransaction } from "./signers/i
 export { LocalSigner } from "./signers/local.js";
 export { MpcSigner, MpcSignerError } from "./signers/mpc.js";
 export type { MpcSigningProvider, MpcSignerConfig, MpcSignResult, MpcSignerErrorCode } from "./signers/mpc.js";
+export { TurnkeyProvider } from "./signers/turnkey-provider.js";
+export type { TurnkeyProviderConfig } from "./signers/turnkey-provider.js";
 
 // ---------------------------------------------------------------------------
 // Stores — Public API
@@ -141,7 +143,7 @@ export type { AuditEntry, PolicyRuleAudit } from "./logging/types.js";
 // LLM Adapters — Public API
 // Tool definitions and framework-specific adapters for AI agent integration.
 // ---------------------------------------------------------------------------
-export type { ToolDefinition, ToolParameter, ToolCallResult } from "./adapters/types.js";
+export type { ToolDefinition, ToolParameter, ToolCallResult, ToolCallErrorCode } from "./adapters/types.js";
 export { WALLET_TOOLS, WALLET_TOOL_NAMES, getToolByName, safeHandleToolCall } from "./adapters/tools.js";
 export type { WalletToolName } from "./adapters/tools.js";
 export { toAnthropicTools } from "./adapters/claude.js";

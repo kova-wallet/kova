@@ -232,6 +232,12 @@ With this setup:
 - Transactions between 10 and 50 SOL trigger a Telegram approval request
 - Transactions above 50 SOL are denied by the spending limit (never reach the approval gate)
 
+::: warning Rule ordering matters
+Because `SpendingLimitRule` evaluates **before** `ApprovalGateRule`, the spending limit's per-transaction cap acts as a hard ceiling. If you set a per-transaction spending limit of 10 SOL and an approval gate threshold of 5 SOL, transactions between 5-10 SOL will route to approval, but transactions above 10 SOL will be **denied outright** by the spending limit and never reach the approval gate.
+
+To allow large transactions to route through approval instead of being denied, set the per-transaction spending limit **higher** than the approval gate threshold. The spending limit serves as the absolute maximum, while the approval gate controls which transactions need human review.
+:::
+
 ::: tip
 Place `ApprovalGateRule` **last** in your rule list. It is the most expensive rule because it blocks execution for minutes while waiting for a human response. Cheaper rules (rate limits, spending limits, allowlists) should run first to filter out obviously invalid transactions before involving a human.
 :::

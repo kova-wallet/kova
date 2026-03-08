@@ -228,11 +228,10 @@ export class SpendingLimitRule implements PolicyRule {
       if (normalizeTokenId(token) === normalizeTokenId(this.config.perTransaction.token)) {
         const limit = parseFloat(this.config.perTransaction.amount);
         if (safeGt(amount, limit)) {
-          // M-61 FIX: Sanitized denial message — does not reveal specific limit details
           return {
             decision: "DENY",
             rule: this.name,
-            reason: "Per-transaction spending limit exceeded",
+            reason: `Per-transaction spending limit exceeded: tried to send ${amount} ${token}, limit is ${this.config.perTransaction.amount} ${this.config.perTransaction.token}`,
           };
         }
       }
@@ -407,11 +406,13 @@ export class SpendingLimitRule implements PolicyRule {
     // exactly to the limit. The previous > comparison allowed one extra transaction that
     // hit the limit precisely, creating an off-by-one bypass.
     if (projectedTotalBi >= limitBi) {
-      // M-61 FIX: Sanitized denial message — does not reveal window type or token details
+      const windowTotal = Number(windowTotalBi) / 1e9;
       return {
         decision: "DENY",
         rule: this.name,
-        reason: "Spending limit exceeded",
+        reason: `${window.charAt(0).toUpperCase() + window.slice(1)} spending limit exceeded: ` +
+          `tried to send ${amount} ${token}, ${window} limit is ${limitConfig.amount} ${limitConfig.token} ` +
+          `(already spent ~${windowTotal.toFixed(4)} ${token} in this ${window} window)`,
       };
     }
 
@@ -571,11 +572,10 @@ export class SpendingLimitRule implements PolicyRule {
     }
 
     if (safeGt(usdValue, limit)) {
-      // M-61 FIX: Sanitized denial message — does not reveal specific limit or token details
       return {
         decision: "DENY",
         rule: this.name,
-        reason: "Per-transaction spending limit exceeded",
+        reason: `Per-transaction USD spending limit exceeded: ${amount} ${token} (~$${usdValue.toFixed(2)}) exceeds limit of $${this.config.perTransactionUSD!.amount}`,
       };
     }
 
@@ -639,11 +639,13 @@ export class SpendingLimitRule implements PolicyRule {
     // exactly to the limit. The previous > comparison allowed one extra transaction that
     // hit the limit precisely, creating an off-by-one bypass.
     if (projectedTotalBi >= limitBi) {
-      // M-61 FIX: Sanitized denial message — does not reveal window type or token details
+      const windowTotal = Number(windowTotalBi) / 1e9;
       return {
         decision: "DENY",
         rule: this.name,
-        reason: "Spending limit exceeded",
+        reason: `${window.charAt(0).toUpperCase() + window.slice(1)} USD spending limit exceeded: ` +
+          `${amount} ${token} (~$${usdValue.toFixed(2)}), ${window} USD limit is $${limitConfig.amount} ` +
+          `(already spent ~$${windowTotal.toFixed(2)} in this ${window} window)`,
       };
     }
 

@@ -763,7 +763,7 @@ export function safeHandleToolCall(
 ): Promise<unknown> {
   const tool = getToolByName(name);
   if (!tool) {
-    return Promise.resolve({ success: false, error: `Unknown tool: ${name}` });
+    return Promise.resolve({ success: false, error: `Unknown tool: ${name}`, errorCode: "UNKNOWN_TOOL" as const });
   }
 
   // API-004: Enforce write rate limit floor for write operations (per-wallet via WeakMap)
@@ -782,6 +782,7 @@ export function safeHandleToolCall(
       return Promise.resolve({
         success: false,
         error: `Write rate limit exceeded (${WRITE_RATE_LIMIT_PER_MINUTE} per minute). Try again later.`,
+        errorCode: "RATE_LIMITED" as const,
       });
     }
     timestamps.push(now);

@@ -209,11 +209,15 @@ With both limits configured, both must pass for the transaction to be allowed. A
 ## Denial Messages
 
 ```
-DENY: Rate limit exceeded: 5/5 transactions per minute
-DENY: Rate limit exceeded: 30/30 transactions per hour
+DENY: Rate limit exceeded: 5/5 transactions per minute already used
+DENY: Rate limit exceeded: 30/30 transactions per hour already used
 ```
 
 The message includes both the current count and the configured limit.
+
+::: warning Error sanitization
+By default, `AgentWallet` sanitizes denial messages before returning them to the caller, stripping numeric values and rule names to prevent policy reconnaissance by untrusted agents. To see the full detailed messages (e.g., in a dashboard or during development), set `verboseErrors: true` in the `AgentWalletConfig`. See [AgentWallet Configuration](/guide/wallet#agentwallet-config) for details.
+:::
 
 ## Introspection
 

@@ -9,12 +9,9 @@
  * - No persistence means audit logs are also lost, breaking compliance requirements.
  * - Use SqliteStore (with SQLCipher encryption) or a Redis-backed store for production.
  *
- * HIGH-19 TODO: In future versions, a `dangerouslyAllowMemoryStore` flag should be
- * required in the constructor options to use MemoryStore outside of test environments.
- * This would make the risk of data loss on restart explicit and opt-in, rather than
- * silently allowing production use with only a process warning. The flag should default
- * to false, requiring callers to acknowledge the risk:
- *   new MemoryStore({ dangerouslyAllowMemoryStore: true })
+ * HIGH-19 RESOLVED: A `dangerouslyAllowInProduction` flag is required in the constructor
+ * options (or KOVA_ALLOW_MEMORY_STORE=1 env var) to use MemoryStore outside of test
+ * environments. Without it, the constructor throws an error.
  *
  * STORE-015: MEMORY GROWTH — In long-running processes, the MemoryStore can grow
  * unboundedly if keys are created but never read (lazy expiration only triggers on

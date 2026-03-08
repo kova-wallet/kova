@@ -796,7 +796,7 @@ describe("Adversarial Tests", () => {
 
       expect(result.status).toBe("denied");
       expect(result.error!.code).toBe("POLICY_DENIED");
-      expect(result.error!.message).toContain("Spending limit exceeded");
+      expect(result.error!.message).toContain("spending limit exceeded");
     });
   });
 

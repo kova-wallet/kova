@@ -232,7 +232,7 @@ describe("AuditLogger", () => {
           type: "transfer",
           chain: "solana",
           params: { to: "recipient", amount: "1.0", token: "SOL" },
-          metadata: { agentId: "agent-1", taskId: "task-1", reason: "payment", urgency: "high" },
+          metadata: { agentId: "agent-1", taskId: "task-1", reason: "payment" },
         },
       });
 
@@ -240,7 +240,7 @@ describe("AuditLogger", () => {
       const recent = await logger.getRecent(1);
 
       expect(recent[0]?.intent.metadata?.agentId).toBe("agent-1");
-      expect(recent[0]?.intent.metadata?.urgency).toBe("high");
+      expect(recent[0]?.intent.metadata?.taskId).toBe("task-1");
     });
   });
 
