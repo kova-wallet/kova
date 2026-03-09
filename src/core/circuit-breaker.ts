@@ -282,6 +282,15 @@ export class CircuitBreaker {
     }
 
     // Track unique agentIds for abuse detection
+    // AUDIT-HIGH-1 fix: Evict oldest entries when the set exceeds the threshold
+    // to prevent unbounded memory growth from attackers cycling agent IDs.
+    if (this.seenAgentIds.size >= MAX_UNIQUE_AGENT_IDS * 2) {
+      const iterator = this.seenAgentIds.values();
+      for (let i = 0; i < MAX_UNIQUE_AGENT_IDS; i++) {
+        const entry = iterator.next();
+        if (!entry.done) this.seenAgentIds.delete(entry.value);
+      }
+    }
     this.seenAgentIds.add(agentId);
     if (this.seenAgentIds.size >= MAX_UNIQUE_AGENT_IDS && !this.agentIdAbuseWarned) {
       this.agentIdAbuseWarned = true;
@@ -308,11 +317,11 @@ export class CircuitBreaker {
   private denialCountKey(intentType?: string, agentId?: string): string {
     let key = "circuit:denials";
     if (agentId) {
-      const sanitizedAgentId = agentId.replace(/:/g, "_");
+      const sanitizedAgentId = agentId.replace(/[^a-zA-Z0-9_-]/g, (c) => encodeURIComponent(c));
       key = `${key}:${sanitizedAgentId}`;
     }
     if (intentType) {
-      const sanitizedIntentType = intentType.replace(/:/g, "_");
+      const sanitizedIntentType = intentType.replace(/[^a-zA-Z0-9_-]/g, (c) => encodeURIComponent(c));
       key = `${key}:${sanitizedIntentType}`;
     }
     return key;
@@ -335,12 +344,15 @@ export class CircuitBreaker {
       // POLICY-009 fix: Sanitize agentId to prevent key injection via `:` separators.
       // An agentId containing `:` could collide with another agent's key space
       // (e.g., agentId "foo:agent:bar" would produce a key overlapping with agent "bar").
-      const sanitizedAgentId = agentId.replace(/:/g, "_");
+      // AUDIT-M-2 fix: Use URL-encoding instead of colon→underscore replacement to
+      // prevent collisions between "foo_bar" and "foo:bar".
+      const sanitizedAgentId = agentId.replace(/[^a-zA-Z0-9_-]/g, (c) => encodeURIComponent(c));
       key = `${key}:agent:${sanitizedAgentId}`;
     }
     if (intentType) {
       // POLICY-009 fix: Also sanitize intentType for consistency.
-      const sanitizedIntentType = intentType.replace(/:/g, "_");
+      // AUDIT-M-2 fix: Use URL-encoding to prevent key collisions.
+      const sanitizedIntentType = intentType.replace(/[^a-zA-Z0-9_-]/g, (c) => encodeURIComponent(c));
       key = `${key}:${sanitizedIntentType}`;
     }
     return key;

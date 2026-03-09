@@ -337,7 +337,7 @@ import { ChatAnthropic } from "@langchain/anthropic";
 // Create a ChatAnthropic LLM instance.
 // Requires ANTHROPIC_API_KEY to be set in the environment.
 const llm = new ChatAnthropic({
-  model: "claude-sonnet-4-5-20250929", // Claude model that supports tool calling
+  model: "claude-sonnet-4-6-20250827", // Claude model that supports tool calling
   temperature: 0,                    // Deterministic output
 });
 

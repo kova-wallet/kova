@@ -699,6 +699,7 @@ export class AuditLogger {
       // H-12 fix: Use constant-time comparison to prevent timing side-channel attacks.
       // An attacker who can measure response time could otherwise brute-force the
       // reset token byte-by-byte via non-constant-time string comparison.
+      // AUDIT-L-12: Length check leaks token length via timing. Low risk for reset tokens.
       const tokenBuffer = Buffer.from(token);
       const expectedBuffer = Buffer.from(this.resetToken);
       if (tokenBuffer.length !== expectedBuffer.length || !timingSafeEqual(tokenBuffer, expectedBuffer)) {

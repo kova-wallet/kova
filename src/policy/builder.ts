@@ -247,6 +247,11 @@ export class PolicyBuilder {
     if (/[eE]/.test(amount.amount)) {
       throw new Error(`${label} amount must not use scientific notation: ${amount.amount}`);
     }
+    // AUDIT-L-3: Reject trailing garbage that parseFloat silently ignores (e.g. "1.5abc").
+    // Only allow digits with optional decimal point — rejects negatives, "abc", "10abc", etc.
+    if (!/^\d+(\.\d+)?$/.test(amount.amount)) {
+      throw new Error(`Invalid ${label} amount: ${amount.amount}`);
+    }
     const parsed = parseFloat(amount.amount);
     if (isNaN(parsed) || parsed <= 0) {
       throw new Error(`Invalid ${label} amount: ${amount.amount}`);
@@ -287,6 +292,10 @@ export class PolicyBuilder {
   private static validateActiveHours(config: ActiveHoursConfig): void {
     if (!config.timezone) {
       throw new Error("Active hours timezone is required");
+    }
+    // AUDIT-L-5: Validate outsideHoursPolicy enum values to reject typos/invalid strings.
+    if (config.outsideHoursPolicy && !["deny", "require_approval"].includes(config.outsideHoursPolicy)) {
+      throw new Error("outsideHoursPolicy must be 'deny' or 'require_approval'");
     }
     if (!config.windows || config.windows.length === 0) {
       throw new Error("At least one active hours window is required");
@@ -362,6 +371,7 @@ export class PolicyBuilder {
  * the dangerous keys are definitively removed. Defense-in-depth: both layers must
  * fail for prototype pollution to succeed.
  */
+// AUDIT-L-6: Does not cover toString/valueOf. Low risk as JSON.parse prevents function injection.
 function stripDangerousKeys(obj: unknown): void {
   if (obj === null || typeof obj !== "object") return;
 

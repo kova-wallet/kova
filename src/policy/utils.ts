@@ -23,6 +23,7 @@
  * symbol rather than treated as an address. If a deployment uses token identifiers longer
  * than 20 chars that should be case-insensitive, increase this bound accordingly.
  */
+// AUDIT-L-2: Heuristic may misclassify short addresses. Consider explicit tokenType field.
 export function normalizeTokenId(token: string): string {
   if (token.startsWith("0x") && token.length === 42) return token.toLowerCase();
   if (/^[A-Za-z0-9_-]{1,20}$/.test(token)) return token.toUpperCase();

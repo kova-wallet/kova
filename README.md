@@ -53,12 +53,30 @@ Agent → Intent → Policy Engine → Build Tx → Sign → Broadcast → Audit
 | **Circuit Breaker** | Auto-cooldown after consecutive denials |
 | **Security** | 196 audit findings remediated across 14 CRIT, 27 HIGH, 38 MED, 31 LOW |
 
+## Important
+
+> **ESM-only** — kova is published as ES modules only. Use `import`, not `require()`. Your `tsconfig.json` should have `"module": "Node16"` and `"moduleResolution": "Node16"`.
+
+> **Single-instance deployment** — The SDK's mutex, circuit breaker, idempotency cache, and spending counters are designed for a single Node.js process per store. Running multiple processes against the same store without external distributed locking can cause TOCTOU races, spending limit bypasses, and audit log inconsistencies. For multi-process deployments, use `RedisStore` with per-instance `storePrefix`, or implement external coordination (e.g., Redis Redlock).
+
+> **Native dependencies are optional** — `better-sqlite3` (for `SqliteStore`) and `ioredis` (for `RedisStore`) are optional peer dependencies. Install only what you need. `better-sqlite3` requires C++ build tools (see [Installation](#install)). If you only need `MemoryStore` for development, no native dependencies are required.
+
 ## Quick Start
 
 ### Install
 
 ```bash
 npm install kova-wallet
+```
+
+For persistent storage (single server):
+```bash
+npm install better-sqlite3          # requires C++ build tools
+```
+
+For multi-server deployments:
+```bash
+npm install ioredis
 ```
 
 ### Minimal example
@@ -170,7 +188,7 @@ kova exposes wallet operations as tool definitions that AI agents call directly.
 
 ```typescript
 const response = await anthropic.messages.create({
-  model: "claude-sonnet-4-5-20250929",
+  model: "claude-sonnet-4-6-20250827",
   tools: wallet.toAnthropicTools(),
   messages: [{ role: "user", content: "Send 0.1 SOL to GsbwXf...QRre" }],
 });
@@ -218,8 +236,8 @@ const tools = createLangChainTools(wallet);
 | `wallet_get_balance` | Query wallet balance |
 | `wallet_get_transaction_history` | Query past transactions |
 | `wallet_get_policy` | View current policy rules |
-| `wallet_mint` | Mint NFTs |
-| `wallet_stake` | Stake tokens |
+| `wallet_mint` | Mint NFTs *(coming soon)* |
+| `wallet_stake` | Stake tokens *(coming soon)* |
 | `wallet_execute_custom` | Raw instructions (dangerous, opt-in only) |
 
 ## Signers
@@ -237,8 +255,11 @@ The `Signer` interface is minimal — `getAddress()`, `sign()`, `healthCheck()`,
 | Store | Use case |
 |-------|----------|
 | `MemoryStore` | Development. In-memory, data lost on exit. Guarded against production. |
-| `SqliteStore` | Production. Persistent, WAL mode, HMAC-protected counters, optional SQLCipher encryption. |
+| `SqliteStore` | Production (single server). Persistent, WAL mode, HMAC-protected counters, optional encryption. Requires `better-sqlite3`. |
+| `RedisStore` | Production (multi-server). Shared state via Redis. Natively atomic operations. Requires `ioredis`. |
 | `PrefixedStore` | Multi-wallet. Wraps any store, namespaces keys per wallet to prevent counter collisions. |
+
+> **Floating-point precision note**: `MemoryStore` counters use IEEE 754 doubles, which can accumulate drift over many increments. For high-precision accounting, prefer `SqliteStore` (native numeric types) or `RedisStore` (INCRBYFLOAT).
 
 ## Approval Channels
 
@@ -276,7 +297,7 @@ kova/
 │   ├── core/           # AgentWallet, intents, results, circuit breaker
 │   ├── policy/         # Policy builder, engine, and 5 rule implementations
 │   ├── signers/        # LocalSigner, MpcSigner, TurnkeyProvider
-│   ├── stores/         # MemoryStore, SqliteStore, PrefixedStore
+│   ├── stores/         # MemoryStore, SqliteStore, RedisStore, PrefixedStore
 │   ├── chains/solana/  # SolanaAdapter, transfers, Jupiter swaps
 │   ├── approval/       # TelegramApprovalBot, ApprovalChannel interface
 │   ├── adapters/       # Claude, OpenAI, LangChain tool adapters

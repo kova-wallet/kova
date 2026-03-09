@@ -87,6 +87,13 @@ export class LocalSigner implements Signer {
     // KOVA_ALLOW_LOCAL_SIGNER=1 environment variable. NODE_ENV is not checked.
     const allowedByEnv = typeof process !== "undefined" &&
       process.env.KOVA_ALLOW_LOCAL_SIGNER === "1";
+    // AUDIT-L-10: Emit a security warning when the env var bypass is used.
+    if (allowedByEnv) {
+      process.emitWarning(
+        "LocalSigner enabled in production via KOVA_ALLOW_LOCAL_SIGNER environment variable",
+        "SecurityWarning",
+      );
+    }
     if (typeof process !== "undefined" && !allowedByEnv) {
       if (!config?.dangerouslyAllowInProduction) {
         throw new Error(

@@ -144,6 +144,7 @@ const SOL_MINT = "So11111111111111111111111111111111111111112";
 // quarterly. If a new version is released, add its program ID here and to
 // DEFAULT_ALLOWED_SWAP_PROGRAMS below. Stale program IDs may cause legitimate swaps
 // to be rejected if Jupiter deprecates older versions.
+// AUDIT-L-11: Hardcoded program list. Use additionalSwapPrograms for new programs.
 const KNOWN_JUPITER_PROGRAMS = new Set([
   "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4", // Jupiter v6
   "JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB", // Jupiter v4

@@ -124,6 +124,9 @@ interface RlpTransactionFields {
  * Supports both short (<56 bytes) and long (>=56 bytes) strings/lists.
  */
 function rlpDecodeItem(buf: Uint8Array, offset: number): { data: Uint8Array; consumed: number; isList: boolean } {
+  if (offset >= buf.length) {
+    throw new Error(`RLP decode error: buffer overflow at offset ${offset}`);
+  }
   const prefix = buf[offset]!;
 
   if (prefix <= 0x7f) {
@@ -133,27 +136,45 @@ function rlpDecodeItem(buf: Uint8Array, offset: number): { data: Uint8Array; con
   if (prefix <= 0xb7) {
     // Short string (0-55 bytes)
     const len = prefix - 0x80;
+    if (offset + 1 + len > buf.length) {
+      throw new Error(`RLP decode error: buffer overflow at offset ${offset}`);
+    }
     return { data: buf.slice(offset + 1, offset + 1 + len), consumed: 1 + len, isList: false };
   }
   if (prefix <= 0xbf) {
     // Long string (>55 bytes)
     const lenOfLen = prefix - 0xb7;
+    if (offset + 1 + lenOfLen > buf.length) {
+      throw new Error(`RLP decode error: buffer overflow at offset ${offset}`);
+    }
     let len = 0;
     for (let i = 0; i < lenOfLen; i++) {
       len = len * 256 + buf[offset + 1 + i]!;
+    }
+    if (offset + 1 + lenOfLen + len > buf.length) {
+      throw new Error(`RLP decode error: buffer overflow at offset ${offset}`);
     }
     return { data: buf.slice(offset + 1 + lenOfLen, offset + 1 + lenOfLen + len), consumed: 1 + lenOfLen + len, isList: false };
   }
   if (prefix <= 0xf7) {
     // Short list (0-55 bytes total payload)
     const len = prefix - 0xc0;
+    if (offset + 1 + len > buf.length) {
+      throw new Error(`RLP decode error: buffer overflow at offset ${offset}`);
+    }
     return { data: buf.slice(offset + 1, offset + 1 + len), consumed: 1 + len, isList: true };
   }
   // Long list (>55 bytes total payload)
   const lenOfLen = prefix - 0xf7;
+  if (offset + 1 + lenOfLen > buf.length) {
+    throw new Error(`RLP decode error: buffer overflow at offset ${offset}`);
+  }
   let len = 0;
   for (let i = 0; i < lenOfLen; i++) {
     len = len * 256 + buf[offset + 1 + i]!;
+  }
+  if (offset + 1 + lenOfLen + len > buf.length) {
+    throw new Error(`RLP decode error: buffer overflow at offset ${offset}`);
   }
   return { data: buf.slice(offset + 1 + lenOfLen, offset + 1 + lenOfLen + len), consumed: 1 + lenOfLen + len, isList: true };
 }
@@ -543,6 +564,9 @@ export class MpcSigner implements Signer {
           });
           const retryValid = cryptoVerify(null, Buffer.from(messageToVerify), freshKeyObject, Buffer.from(result.signature));
           if (!retryValid) {
+            // AUDIT-M-10 fix: Clear address cache on final verification failure to prevent
+            // stale cached addresses from persisting across subsequent signing attempts.
+            this.clearAddressCache();
             throw new MpcSignerError(
               "PROVIDER_ERROR",
               this.provider.name,
@@ -591,6 +615,9 @@ export class MpcSigner implements Signer {
             });
             const retryValid = legacyCryptoVerify(null, Buffer.from(legacyMessageToVerify), freshKey, Buffer.from(result.signature));
             if (!retryValid) {
+              // AUDIT-M-10 fix: Clear address cache on final verification failure to prevent
+              // stale cached addresses from persisting across subsequent signing attempts.
+              this.clearAddressCache();
               throw new MpcSignerError(
                 "PROVIDER_ERROR",
                 this.provider.name,
@@ -660,6 +687,21 @@ export class MpcSigner implements Signer {
               this.provider.name,
               `CRIT-T1-03: MPC provider returned a signed EVM transaction with ` +
               `suspicious gasLimit change. Original: ${origGas}, Signed: ${signedGas}.`,
+            );
+          }
+        }
+        // AUDIT-M-9 fix: Also compare gas price fields to prevent fee inflation attacks
+        const gasPriceField = originalFields.gasPrice || originalFields.maxFeePerGas;
+        const signedGasPriceField = signedFields.gasPrice || signedFields.maxFeePerGas;
+        if (gasPriceField && signedGasPriceField && gasPriceField !== signedGasPriceField) {
+          const origPrice = BigInt(gasPriceField || "0");
+          const signedPrice = BigInt(signedGasPriceField || "0");
+          if (signedPrice > origPrice * 2n) {
+            throw new MpcSignerError(
+              "PROVIDER_ERROR",
+              this.provider.name,
+              `AUDIT-M-9: MPC provider returned a signed EVM transaction with ` +
+              `suspicious gas price change. Original: ${origPrice}, Signed: ${signedPrice}.`,
             );
           }
         }
@@ -821,7 +863,7 @@ export class MpcSigner implements Signer {
         if (attempt === this.maxRetries) break;
         // CRYPTO-016 fix: Exponential backoff between retries (1s, 2s, 4s, ... capped at 10s)
         if (attempt < this.maxRetries) {
-          const delay = Math.min(1000 * Math.pow(2, attempt), 10000);
+          const delay = Math.min(1000 * Math.pow(2, attempt), 10000) * (0.5 + Math.random() * 0.5);
           await new Promise(resolve => setTimeout(resolve, delay));
         }
       }

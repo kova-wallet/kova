@@ -179,7 +179,7 @@ app.post("/chat", async (req, res) => {
 
     // Send the first request to Claude with the wallet tools.
     let response = await anthropic.messages.create({
-      model: "claude-sonnet-4-5-20250929",
+      model: "claude-sonnet-4-6-20250827",
       max_tokens: 1024,
       system: SYSTEM_PROMPT,
       tools,
@@ -218,7 +218,7 @@ app.post("/chat", async (req, res) => {
       // Send tool results back to Claude.
       messages.push({ role: "user", content: toolResults });
       response = await anthropic.messages.create({
-        model: "claude-sonnet-4-5-20250929",
+        model: "claude-sonnet-4-6-20250827",
         max_tokens: 1024,
         system: SYSTEM_PROMPT,
         tools,
@@ -496,7 +496,7 @@ See the [Production Deployment](/tutorials/production) tutorial for a complete g
 
 - **Check the system prompt:** If Claude responds with text instead of calling tools, the system prompt may not be guiding it to use the wallet tools. Make sure the system prompt mentions calling `wallet_get_policy` and `wallet_get_balance`.
 - **Check tool schemas:** Call `wallet.toAnthropicTools()` and `console.log` the result to verify the tool schemas are well-formed. If any schema is malformed, Claude will ignore the tools.
-- **Model version:** Make sure you are using a model that supports tool use (e.g., `claude-sonnet-4-5-20250929`, not an older model).
+- **Model version:** Make sure you are using a model that supports tool use (e.g., `claude-sonnet-4-6-20250827`, not an older model).
 
 ### Requests hang or time out
 

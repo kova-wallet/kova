@@ -246,6 +246,16 @@ The `allowedUserIds` field restricts who can respond to approval requests. When 
 If `allowedUserIds` is not configured, **any user** who has access to the chat can approve or reject transactions. In a group chat, this means anyone in the group can approve. Always set `allowedUserIds` in production.
 :::
 
+### Known Limitations
+
+::: warning Polling Architecture (API-010)
+The `TelegramApprovalBot` uses `getUpdates` long-polling, which has two important limitations:
+
+1. **Single-process only** — Telegram's `getUpdates` is globally destructive: acknowledging an `update_id` discards all lower IDs server-side. Only one process can poll a given bot token at a time. For multi-instance deployments, use Telegram webhooks with a shared message queue (e.g., Redis pub/sub) instead.
+
+2. **Lost updates on restart** — The `lastUpdateOffset` is stored in memory and is not persisted to disk. If the process restarts while an approval request is pending, the bot may miss the human's response. The request will time out and the transaction will be denied (safe failure mode).
+:::
+
 ### Security Hardening
 
 The TelegramApprovalBot includes several security measures:
@@ -262,6 +272,14 @@ You must either provide `allowedUserIds` to restrict approvers, or explicitly se
 ### Token Redaction
 
 The `TelegramApprovalBot` automatically redacts the bot token from error messages. If a Telegram API call fails, the error message replaces the token with `[REDACTED]` to prevent accidental exposure in logs.
+
+### Known Limitations (API-010)
+
+::: warning Polling Architecture Constraints
+- **Single-process only**: Telegram's `getUpdates` long-polling is globally destructive — acknowledging an `update_id` discards all lower IDs server-side. Only **one process** can poll a given bot token at a time. For multi-instance deployments, use Telegram webhooks with a shared message queue (e.g., Redis pub/sub) instead.
+- **Lost updates on restart**: The `lastUpdateOffset` is held in memory and **not persisted to disk**. Restarting the process may re-consume stale updates or miss updates that arrived during downtime.
+- **Blocking during approval**: While waiting for a human response (up to 5 minutes by default), the wallet's execute mutex is held. All other `execute()` calls queue behind the approval wait.
+:::
 
 ## Implementing a Custom ApprovalChannel
 

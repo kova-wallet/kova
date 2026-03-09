@@ -589,6 +589,7 @@ export class TelegramApprovalBot implements ApprovalChannel {
         // matches the approver's Telegram user ID, reject the approval to enforce
         // separation of duties. A compromised authorized user should not be able to
         // both initiate and approve their own high-value transactions.
+        // AUDIT-L-15: Self-approval check uses mismatched ID spaces. agentId must match Telegram userId.
         if (isApprove && request?.agentId && String(from.id) === String(request.agentId)) {
           await this.answerCallbackQuery(
             callbackId,

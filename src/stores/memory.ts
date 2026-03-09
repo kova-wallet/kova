@@ -93,6 +93,8 @@ export class MemoryStore implements Store {
   private gcTimer?: ReturnType<typeof setInterval>;
   // LOW-T5-01 fix: Static flag so the production warning is emitted only once across all instances
   private static warningEmitted = false;
+  /** M-18 fix: Flag to prevent use after destroy() */
+  private destroyed = false;
   /**
    * H-25 fix: Per-instance HMAC key for integrity protection of counter values.
    * This is defense-in-depth against store manipulation: an attacker who can
@@ -302,6 +304,8 @@ export class MemoryStore implements Store {
    * =========================================================================
    */
   async increment(key: string, amount: number): Promise<number> {
+    // M-18 fix: Reject operations after destroy() to prevent use of zeroed HMAC key
+    if (this.destroyed) throw new Error("MemoryStore has been destroyed");
     // STORE-012 fix: Reject non-finite amounts (NaN, Infinity) to prevent counter corruption
     if (!Number.isFinite(amount)) {
       throw new Error(`increment amount must be a finite number, got ${typeof amount === 'number' ? amount : typeof amount}`);
@@ -492,6 +496,9 @@ export class MemoryStore implements Store {
    * should not be used for counter operations (HMAC verification will fail).
    */
   destroy(): void {
+    // M-18 fix: Set destroyed flag BEFORE zeroing the key to prevent a race where
+    // increment() reads the HMAC key after it has been zeroed but before destroyed is set.
+    this.destroyed = true;
     // T1-F4 fix: Zero the HMAC key material using Buffer.fill(0) for reliable in-place
     // zeroization. Unlike strings (which are immutable in V8), Buffer.fill(0) overwrites
     // the underlying ArrayBuffer bytes directly, preventing recovery from heap dumps.

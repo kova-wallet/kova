@@ -9,6 +9,8 @@ export interface ToolParameter {
   type: "string" | "number" | "boolean" | "integer" | "object" | "array";
   description: string;
   enum?: string[];
+  /** AUDIT-L-16: Optional minimum constraint (e.g., for numeric floors). */
+  minimum?: number;
   /** Optional maximum constraint (e.g., for numeric limits). */
   maximum?: number;
   /** HIGH-T3-04 fix: Maximum string length for input validation. */

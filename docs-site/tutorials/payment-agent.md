@@ -295,7 +295,7 @@ async function chat(userMessage: string, messages: Message[]): Promise<string> {
 
   // Send the conversation to Claude with the system prompt and tool definitions.
   let response = await anthropic.messages.create({
-    model: "claude-sonnet-4-5-20250929",  // Claude model to use
+    model: "claude-sonnet-4-6-20250827",  // Claude model to use
     max_tokens: 1024,                      // Maximum tokens in Claude's response
     system: SYSTEM_PROMPT,                 // Instructions that define Claude's behavior
     tools,                                 // Wallet tool definitions from toAnthropicTools()
@@ -346,7 +346,7 @@ async function chat(userMessage: string, messages: Message[]): Promise<string> {
 
     // Get Claude's next response (it may call more tools or produce final text).
     response = await anthropic.messages.create({
-      model: "claude-sonnet-4-5-20250929",
+      model: "claude-sonnet-4-6-20250827",
       max_tokens: 1024,
       system: SYSTEM_PROMPT,
       tools,
@@ -731,7 +731,7 @@ async function chat(userMessage: string, messages: Message[]): Promise<string> {
   messages.push({ role: "user", content: userMessage });
 
   let response = await anthropic.messages.create({
-    model: "claude-sonnet-4-5-20250929",
+    model: "claude-sonnet-4-6-20250827",
     max_tokens: 1024,
     system: SYSTEM_PROMPT,
     tools,
@@ -767,7 +767,7 @@ async function chat(userMessage: string, messages: Message[]): Promise<string> {
     // Send tool results back and get Claude's next response.
     messages.push({ role: "user", content: toolResults });
     response = await anthropic.messages.create({
-      model: "claude-sonnet-4-5-20250929",
+      model: "claude-sonnet-4-6-20250827",
       max_tokens: 1024,
       system: SYSTEM_PROMPT,
       tools,
