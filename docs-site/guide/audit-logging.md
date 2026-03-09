@@ -282,6 +282,18 @@ if (!report.valid) {
 A broken hash chain means that one or more audit entries have been modified, deleted, or inserted after the fact. This is a serious security event. You should immediately investigate the store contents and consider freezing the wallet until the audit trail is restored.
 :::
 
+::: warning Known Limitation — Linear Chain Fragility (ARCH-05)
+The audit hash chain is a **linear chain** with no redundancy. If any single entry is corrupted, deleted, or lost (e.g., due to store eviction or disk failure), the entire chain from that point forward becomes unverifiable. There is no checkpointing or ability to verify entries independently.
+
+Additionally, HMAC key rotation creates a discontinuity — the old chain must be verified with the old key, and the new chain has no linkage to the old one.
+
+**Mitigations for high-assurance deployments:**
+1. **Periodic Merkle checkpoints** — Snapshot the chain hash every N entries to enable sub-chain verification.
+2. **Redundant external hash log** — Write entry hashes to a separate append-only store (e.g., a cloud audit log service).
+3. **Overlapping HMAC key rotation** — Dual-sign entries during key transition periods.
+4. **Store backups** — Regularly back up the audit store to prevent data loss from breaking the chain.
+:::
+
 ## Audit Circuit Breaker
 
 If the audit log store becomes unavailable (e.g., database down, disk full), writing audit entries will fail. After `maxConsecutiveFailures` consecutive write failures (default: 3), the audit logger's internal circuit breaker opens and **all subsequent transactions are blocked**.

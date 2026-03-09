@@ -125,9 +125,10 @@ export interface PolicySummary {
   /** Whether human approval is required above a threshold */
   approvalRequired?: { above: { amount: string; token: string } };
   /** Rate limits in effect (HIGH-09 fix: no current counters exposed) */
+  /** AUDIT-HIGH-5 fix: Allow string for redacted values */
   rateLimits?: {
-    maxPerMinute?: number;
-    maxPerHour?: number;
+    maxPerMinute?: number | "[redacted]";
+    maxPerHour?: number | "[redacted]";
   };
   /** Active hours (if restricted) */
   activeHours?: {
@@ -136,8 +137,9 @@ export interface PolicySummary {
   };
   /** Circuit breaker status (if configured) */
   circuitBreaker?: {
-    threshold: number;
-    cooldownMs: number;
+    /** AUDIT-HIGH-5 fix: Allow string for redacted values */
+    threshold: number | "[redacted]";
+    cooldownMs: number | "[redacted]";
     isOpen: boolean;
   };
 }

@@ -144,6 +144,7 @@ interface DnsCacheEntry {
  * acceptable for the primary single-wallet deployment model. For multi-wallet
  * isolation, use separate processes or worker_threads.
  */
+// AUDIT-L-9: Module-level DNS cache shared across instances. Accepted for single-tenant.
 const dnsCache = new Map<string, DnsCacheEntry>();
 const DNS_CACHE_TTL_MS = 60_000; // 60 seconds
 /**

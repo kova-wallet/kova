@@ -2,9 +2,13 @@
 
 ---
 
+::: tip USING REDIS?
+If you just need a Redis-backed store, you don't need to build a custom adapter -- kova ships with a built-in `RedisStore`. See the [Stores guide](/guide/stores#redisstore) for usage. This tutorial is for integrating with **other** backends (Postgres, DynamoDB, Turso, Upstash, etc.) or for understanding how the Store interface works under the hood.
+:::
+
 ## What You'll Build
 
-In this tutorial, you'll build a custom `Store` adapter backed by Redis. By the end, you will understand exactly how the SDK's persistence layer works and be able to wire any database (Postgres, DynamoDB, Turso, Upstash, etc.) into kova.
+In this tutorial, you'll build a custom `Store` adapter backed by Redis as a learning exercise. By the end, you will understand exactly how the SDK's persistence layer works and be able to wire any database (Postgres, DynamoDB, Turso, Upstash, etc.) into kova.
 
 The `Store` interface has 7 methods (one optional). If you can implement those methods, your adapter works with every SDK feature -- spending limits, rate limits, audit logs, circuit breakers, and idempotency caches.
 

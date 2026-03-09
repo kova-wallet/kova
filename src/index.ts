@@ -105,6 +105,8 @@ export type { TurnkeyProviderConfig } from "./signers/turnkey-provider.js";
 export type { Store } from "./stores/interface.js";
 export { MemoryStore } from "./stores/memory.js";
 export { SqliteStore } from "./stores/sqlite.js";
+export { RedisStore } from "./stores/redis.js";
+export type { RedisStoreConfig } from "./stores/redis.js";
 /** @internal — Used by AgentWallet to namespace store keys; not for direct use. */
 export { PrefixedStore } from "./stores/prefixed.js";
 
@@ -144,7 +146,7 @@ export type { AuditEntry, PolicyRuleAudit } from "./logging/types.js";
 // Tool definitions and framework-specific adapters for AI agent integration.
 // ---------------------------------------------------------------------------
 export type { ToolDefinition, ToolParameter, ToolCallResult, ToolCallErrorCode } from "./adapters/types.js";
-export { WALLET_TOOLS, WALLET_TOOL_NAMES, getToolByName, safeHandleToolCall } from "./adapters/tools.js";
+export { WALLET_TOOLS, WALLET_TOOL_NAMES, getToolByName, safeHandleToolCall, sanitizeToolResponse } from "./adapters/tools.js";
 export type { WalletToolName } from "./adapters/tools.js";
 export { toAnthropicTools } from "./adapters/claude.js";
 export type { AnthropicTool } from "./adapters/claude.js";

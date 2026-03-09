@@ -596,10 +596,18 @@ export async function addPriorityFee(
 
     // HIGH-10 fix: Apply minimum priority fee floor when estimation fails,
     // instead of submitting with zero priority (vulnerable to front-running).
-    const minFee = config?.maxMicroLamports
+    let minFee = config?.maxMicroLamports
       ? Math.min(DEFAULT_MIN_PRIORITY_FEE, config.maxMicroLamports)
       : DEFAULT_MIN_PRIORITY_FEE;
     const computeUnits = config?.computeUnits ?? DEFAULT_COMPUTE_UNITS;
+
+    // AUDIT-M-13 fix: Apply the same maxTotalFeeLamports cap as the main path
+    // to prevent the fallback from exceeding the absolute fee ceiling.
+    const maxTotalFeeLamports = config?.maxPriorityFeeLamports ?? DEFAULT_MAX_PRIORITY_FEE_LAMPORTS;
+    const fallbackTotalFeeLamports = Number(BigInt(minFee) * BigInt(computeUnits) / 1_000_000n);
+    if (fallbackTotalFeeLamports > maxTotalFeeLamports) {
+      minFee = Number(BigInt(maxTotalFeeLamports) * 1_000_000n / BigInt(computeUnits));
+    }
 
     transaction.add(
       ComputeBudgetProgram.setComputeUnitPrice({

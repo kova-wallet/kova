@@ -19,11 +19,15 @@ Stores provide pluggable persistence for the SDK's internal state. The interface
 | **Unit tests / integration tests** | `MemoryStore` | Fast, no setup, no cleanup needed. Data resets automatically. |
 | **Local development / prototyping** | `MemoryStore` | Quick to get started. Spending limits reset on restart, which is fine during development. |
 | **Production (single server)** | `SqliteStore` | Data persists across restarts. Spending counters, rate limits, and audit logs survive crashes. |
-| **Production (multiple servers)** | Custom `RedisStore` | Shared state across instances. See the custom store example below. |
+| **Production (multiple servers)** | `RedisStore` | Shared state across instances. Natively atomic operations. Install `ioredis` and go. |
 | **Serverless / edge functions** | Custom store (DynamoDB, Upstash Redis, etc.) | Persistence without a local filesystem. Implement the 7-method `Store` interface. |
 
 ::: tip QUICK RULE OF THUMB
-If you are just getting started or running tests, use `MemoryStore`. If you are deploying to production, use `SqliteStore` (or a custom store for multi-server setups). The only difference is whether your safety data survives restarts.
+If you are just getting started or running tests, use `MemoryStore`. If you are deploying to production on a single server, use `SqliteStore`. If you need multi-process or multi-server deployments, use `RedisStore`. The only difference is whether your safety data survives restarts and whether it is shared across processes.
+:::
+
+::: warning Floating-Point Precision (ARCH-08)
+`MemoryStore` counters use JavaScript IEEE 754 doubles, which can accumulate drift over many increments (e.g., after thousands of small transactions). For high-precision accounting or sub-cent accuracy, prefer `SqliteStore` (native numeric types) or `RedisStore` (`INCRBYFLOAT`). The drift is mitigated by rounding to 12 decimal places and using BigInt comparisons, but is a known limitation for extremely high-frequency agents.
 :::
 
 ## Why the SDK Needs a Store
@@ -39,7 +43,7 @@ The store is not for your application data -- it is for Kova's own safety mechan
 | **Idempotency cache** | Prevents duplicate execution if the same intent is submitted twice | A crash followed by a retry could execute the same transfer twice |
 
 ::: warning
-In development, `MemoryStore` is fine -- your agent is short-lived and you are not worried about enforcing limits across restarts. In production, you **must** use a persistent store like `SqliteStore` so that these safety guarantees actually hold. Without persistence, a simple process restart could let your agent blow past its spending limits.
+In development, `MemoryStore` is fine -- your agent is short-lived and you are not worried about enforcing limits across restarts. In production, you **must** use a persistent store like `SqliteStore` or `RedisStore` so that these safety guarantees actually hold. Without persistence, a simple process restart could let your agent blow past its spending limits.
 :::
 
 ## Store Interface
@@ -262,123 +266,132 @@ Delete all data from both tables. Useful for testing.
 store.clear();
 ```
 
+## RedisStore
+
+Redis-backed store for multi-process and multi-server production deployments. Requires the `ioredis` optional peer dependency.
+
+```bash
+# Install ioredis (optional peer dependency -- only needed if you use RedisStore)
+npm install ioredis
+```
+
+```typescript
+// Import the built-in RedisStore from kova. Requires ioredis to be installed.
+import { RedisStore } from "kova";
+
+// Connect to a Redis server with a URL.
+const store = new RedisStore({ url: "redis://localhost:6379" });
+
+// Or connect with default settings (localhost:6379):
+const store = new RedisStore();
+```
+
+### RedisStoreConfig
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `client` | `Redis` (ioredis instance) | No | An existing ioredis client. When provided, RedisStore uses this connection and does **not** close it on `disconnect()` -- the caller owns the lifecycle. Use this for Sentinel, Cluster, or custom connection setups. |
+| `url` | `string` | No | Redis connection URL (e.g., `"redis://localhost:6379"`, `"rediss://user:pass@host:6380/0"`). Ignored if `client` is provided. Defaults to `localhost:6379`. |
+| `keyPrefix` | `string` | No | Prefix applied to all Redis keys for application-level namespacing (e.g., `"kova:"`). Separate from `PrefixedStore`'s per-wallet prefix -- you can use both. |
+| `listPrefix` | `string` | No | Internal prefix for list keys to avoid collisions with KV keys. Default: `"list:"`. |
+
+```typescript
+import { RedisStore } from "kova";
+
+// Production RedisStore with an application-level key prefix.
+const store = new RedisStore({
+  url: process.env.REDIS_URL!,
+  // All keys are prefixed with "kova:" to avoid collisions with other
+  // applications sharing the same Redis instance.
+  keyPrefix: "kova:",
+});
+```
+
+#### Bring Your Own Client
+
+For advanced setups (Sentinel, Cluster, custom retry logic), pass an existing ioredis client:
+
+```typescript
+import Redis from "ioredis";
+import { RedisStore } from "kova";
+
+// Create an ioredis Cluster client for high availability.
+const cluster = new Redis.Cluster([
+  { host: "redis-1.example.com", port: 6379 },
+  { host: "redis-2.example.com", port: 6379 },
+]);
+
+// RedisStore wraps the existing client. It will NOT call quit() on disconnect().
+const store = new RedisStore({ client: cluster });
+```
+
+### Characteristics
+
+- **TTL expiration**: Handled natively by Redis. No lazy expiration needed -- Redis deletes keys automatically when their TTL expires.
+- **Atomicity**: `increment()` uses Redis `INCRBYFLOAT`, which is a single atomic command. Safe for concurrent multi-process access without any application-level locking.
+- **Lists**: Uses `RPUSH` for appending and `LRANGE` for retrieval. Lists are automatically trimmed to 100,000 entries via a pipelined `LTRIM` after each append.
+- **Sub-second TTL**: Uses `PX` (milliseconds) for TTL precision, supporting fractional-second TTLs.
+- **KV/List isolation**: List keys are stored under a `list:` prefix internally, so a KV key `"mykey"` and a list key `"mykey"` do not collide in Redis.
+
+### disconnect()
+
+Close the Redis connection. Call this when shutting down.
+
+```typescript
+// Gracefully close the Redis connection.
+// Only closes the connection if RedisStore created it (i.e., you passed
+// a URL, not a client). If you passed your own ioredis client, you are
+// responsible for closing it yourself.
+await store.disconnect();
+```
+
+```typescript
+// Recommended shutdown pattern:
+process.on("SIGTERM", async () => {
+  await store.disconnect();
+  process.exit(0);
+});
+```
+
+### When to Use
+
+- Production deployments with multiple server instances or processes
+- Kubernetes / container deployments where pods share state
+- Any scenario where `SqliteStore`'s single-process limitation is a blocker
+
+::: tip
+`RedisStore` is the recommended store for production multi-server deployments. Every Store method maps directly to a native Redis command, so there is no overhead from application-level locking or worker threads.
+:::
+
 ## Comparison
 
-| Feature | MemoryStore | SqliteStore |
-|---------|-------------|-------------|
-| Persistence | None | File-based |
-| TTL Support | Yes (lazy) | Yes (lazy) |
-| Atomic increment | Yes (sync) | Yes (transaction) |
-| Concurrent access | Single process | Single process (WAL) |
-| Setup | None | Requires `better-sqlite3` |
-| Use case | Dev / Testing | Production |
-| Data after restart | Lost | Preserved |
+| Feature | MemoryStore | SqliteStore | RedisStore |
+|---------|-------------|-------------|------------|
+| Persistence | None | File-based | Redis server |
+| TTL Support | Yes (lazy) | Yes (lazy) | Yes (native) |
+| Atomic increment | Yes (sync) | Yes (transaction) | Yes (INCRBYFLOAT) |
+| Concurrent access | Single process | Single process (WAL) | Multi-process / multi-server |
+| Setup | None | Requires `better-sqlite3` | Requires `ioredis` + Redis server |
+| Use case | Dev / Testing | Production (single server) | Production (multi-server) |
+| Data after restart | Lost | Preserved | Preserved |
 
 ## Implementing a Custom Store
 
-To integrate with Redis, DynamoDB, or any other backend, implement the 7-method `Store` interface:
-
-```typescript
-// Import the Store type that our custom class must implement.
-import type { Store } from "kova";
-// Import the ioredis client library for connecting to a Redis server.
-import Redis from "ioredis";
-
-// A custom Store implementation backed by Redis.
-// Redis is ideal for production deployments because it provides:
-// - Native atomic increment (INCRBYFLOAT)
-// - Built-in TTL support (the EX flag on SET)
-// - High availability via Redis Sentinel or Cluster
-// - Shared state across multiple application instances
-export class RedisStore implements Store {
-  // The ioredis client instance used for all Redis operations.
-  private readonly client: Redis;
-  // Prefix added to list keys to avoid collisions with scalar key-value entries.
-  // For example, a list key "audit:log" becomes "list:audit:log" in Redis.
-  private readonly listPrefix = "list:";
-
-  // Initialize the Redis client with a connection URL (e.g., "redis://localhost:6379").
-  constructor(redisUrl: string) {
-    this.client = new Redis(redisUrl);
-  }
-
-  // Retrieve a value by key. Redis returns null automatically if the key
-  // does not exist or has expired (Redis handles TTL expiration natively).
-  async get(key: string): Promise<string | null> {
-    return this.client.get(key);
-  }
-
-  // Store a key-value pair, optionally with a TTL in seconds.
-  async set(key: string, value: string, ttlSeconds?: number): Promise<void> {
-    if (ttlSeconds !== undefined && ttlSeconds > 0) {
-      // "EX" tells Redis to automatically expire (delete) this key
-      // after ttlSeconds. Used for rate limit windows and idempotency cache entries.
-      await this.client.set(key, value, "EX", ttlSeconds);
-    } else {
-      // No TTL -- the key persists until explicitly deleted.
-      await this.client.set(key, value);
-    }
-  }
-
-  // Set a value only if the key does not already exist.
-  // Uses Redis SET with NX (Not eXists) flag for atomic compare-and-set.
-  async setIfNotExists(key: string, value: string, ttlSeconds?: number): Promise<boolean> {
-    let result: string | null;
-    if (ttlSeconds !== undefined && ttlSeconds > 0) {
-      result = await this.client.set(key, value, "EX", ttlSeconds, "NX");
-    } else {
-      result = await this.client.set(key, value, "NX");
-    }
-    return result === "OK";
-  }
-
-  // Atomically increment a numeric value stored at the given key.
-  // Redis INCRBYFLOAT is a single atomic operation, which is critical
-  // for spending limit tracking -- concurrent execute() calls cannot
-  // read a stale value and both write the same incremented result.
-  async increment(key: string, amount: number): Promise<number> {
-    // Redis INCRBYFLOAT handles atomic increment
-    const result = await this.client.incrbyfloat(key, amount);
-    // INCRBYFLOAT returns a string representation; convert to a number.
-    return parseFloat(result);
-  }
-
-  // Append a new entry to the head of a Redis list.
-  // Used by the audit logging system to record each transaction attempt.
-  async append(key: string, value: string): Promise<void> {
-    // lpush inserts at the head (left) of the list, making the newest
-    // entry always at index 0. The listPrefix avoids key collisions
-    // with scalar values stored via set().
-    await this.client.lpush(this.listPrefix + key, value);
-  }
-
-  // Retrieve the most recent N entries from a list, newest first.
-  async getRecent(key: string, count: number): Promise<string[]> {
-    // Guard against invalid count values.
-    if (count <= 0) return [];
-    // Because lpush adds to the head, lrange(0, count-1) returns
-    // the most recent "count" entries in newest-first order --
-    // exactly what the SDK expects for audit log retrieval.
-    return this.client.lrange(this.listPrefix + key, 0, count - 1);
-  }
-}
-```
+To integrate with DynamoDB, Postgres, or any other backend, implement the 7-method `Store` interface. See the [Building a Custom Store Adapter](/tutorials/custom-store) tutorial for a step-by-step walkthrough.
 
 ::: tip
-The key design constraint for custom stores is that `increment()` must be **atomic**. A non-atomic read-then-write implementation could allow concurrent `execute()` calls to exceed spending limits. Redis handles this natively with `INCRBYFLOAT`. For other backends, use database transactions or conditional writes.
+The key design constraint for custom stores is that `increment()` must be **atomic**. A non-atomic read-then-write implementation could allow concurrent `execute()` calls to exceed spending limits. Use database transactions or conditional writes to ensure atomicity.
 :::
 
-### Using a Custom Store
+### Using a Store
 
 ```typescript
 // Import all the core Kova components needed to wire up a wallet.
-import { AgentWallet, PolicyEngine, LocalSigner, SolanaAdapter } from "kova";
-// Import the custom RedisStore we defined above.
-import { RedisStore } from "./redis-store";
+import { AgentWallet, PolicyEngine, RedisStore } from "kova";
 
 // Create a RedisStore instance pointing to your Redis server.
 // In production, this would typically be a Redis Sentinel or Cluster URL.
-const store = new RedisStore("redis://localhost:6379");
+const store = new RedisStore({ url: "redis://localhost:6379" });
 
 // Create a PolicyEngine with your policy rules and the Redis-backed store.
 // The engine will use the store to persist spending counters, rate limit
@@ -402,7 +415,7 @@ The same `Store` instance is shared between the `PolicyEngine` and `AgentWallet`
 ## Common Mistakes
 
 **1. Using `MemoryStore` in production.**
-Spending limits reset on every process restart, letting the agent spend beyond configured limits. Always use `SqliteStore` or a custom persistent store in production.
+Spending limits reset on every process restart, letting the agent spend beyond configured limits. Always use `SqliteStore` or `RedisStore` in production.
 
 **2. Non-atomic `increment()` in custom stores.**
 If your custom store implements `increment()` as a read-then-write (instead of an atomic operation), concurrent `execute()` calls can read the same stale value and both increment it, allowing the agent to exceed spending limits. Use database transactions, Redis `INCRBYFLOAT`, or compare-and-swap to ensure atomicity.

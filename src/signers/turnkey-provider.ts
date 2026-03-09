@@ -56,18 +56,37 @@ export interface TurnkeyProviderConfig {
 export class TurnkeyProvider implements MpcSigningProvider {
   readonly name = "turnkey";
 
-  private readonly config: TurnkeyProviderConfig;
+  private config: TurnkeyProviderConfig;
   private client: TurnkeyServerClient | null = null;
   private cachedAddress: string | null = null;
 
   constructor(config: TurnkeyProviderConfig) {
     if (!config.apiBaseUrl) throw new Error("TurnkeyProvider: apiBaseUrl is required");
+    if (!config.apiBaseUrl.startsWith("https://")) {
+      throw new Error("TurnkeyProvider: apiBaseUrl must use HTTPS to protect API credentials in transit");
+    }
     if (!config.apiPublicKey) throw new Error("TurnkeyProvider: apiPublicKey is required");
     if (!config.apiPrivateKey) throw new Error("TurnkeyProvider: apiPrivateKey is required");
     if (!config.defaultOrganizationId) throw new Error("TurnkeyProvider: defaultOrganizationId is required");
     if (!config.signWith) throw new Error("TurnkeyProvider: signWith is required");
 
     this.config = config;
+  }
+
+  /** Exclude sensitive fields from JSON serialization */
+  toJSON(): Record<string, unknown> {
+    return {
+      name: this.name,
+      apiBaseUrl: this.config.apiBaseUrl,
+      apiPublicKey: this.config.apiPublicKey,
+      defaultOrganizationId: this.config.defaultOrganizationId,
+      signWith: this.config.signWith,
+    };
+  }
+
+  /** Exclude sensitive fields from console.log / util.inspect */
+  [Symbol.for("nodejs.util.inspect.custom")](): Record<string, unknown> {
+    return this.toJSON();
   }
 
   /**
@@ -154,8 +173,27 @@ export class TurnkeyProvider implements MpcSigningProvider {
     //   - compact-u16 encoding of signature count
     //   - then each signature is 64 bytes
     // For a single-signer tx, byte 0 is 0x01 (count=1), then bytes 1-64 are the signature.
-    const signatureOffset = getSignatureOffset(signedData);
+    const { offset: signatureOffset, count: signatureCount } = getSignatureOffset(signedData);
     const signature = signedData.slice(signatureOffset, signatureOffset + 64);
+
+    // Verify signed transaction integrity: message bytes must match the original
+    const signedMessageStart = signatureOffset + signatureCount * 64;
+    const signedMessageBytes = signedData.slice(signedMessageStart);
+
+    // The original unsigned transaction also has a signature section (with empty/zero signatures)
+    const { offset: origSigOffset, count: origSigCount } = getSignatureOffset(transactionData);
+    const origMessageStart = origSigOffset + origSigCount * 64;
+    const origMessageBytes = transactionData.slice(origMessageStart);
+
+    if (
+      signedMessageBytes.length !== origMessageBytes.length ||
+      !signedMessageBytes.every((byte: number, i: number) => byte === origMessageBytes[i])
+    ) {
+      throw new Error(
+        "TurnkeyProvider: signed transaction message bytes do not match the original unsigned transaction. " +
+        "The transaction may have been tampered with.",
+      );
+    }
 
     return {
       signedData: new Uint8Array(signedData),
@@ -183,6 +221,7 @@ export class TurnkeyProvider implements MpcSigningProvider {
    * Clean up the Turnkey client instance.
    */
   async destroy(): Promise<void> {
+    this.config.apiPrivateKey = "";
     this.client = null;
     this.cachedAddress = null;
   }
@@ -234,15 +273,50 @@ function isUuid(s: string): boolean {
 }
 
 /**
- * Get the offset of the first signature in a serialized Solana transaction.
- * Handles compact-u16 encoding of the signature count.
+ * Get the offset of the first signature and the signature count
+ * in a serialized Solana transaction.
+ * Handles compact-u16 encoding (1, 2, or 3 bytes).
  */
-function getSignatureOffset(data: Buffer | Uint8Array): number {
-  const firstByte = data[0]!;
-  // compact-u16: if high bit is not set, it's a single-byte count
-  if (firstByte <= 0x7f) {
-    return 1; // 1 byte for count, signature starts at byte 1
+function getSignatureOffset(data: Buffer | Uint8Array): { offset: number; count: number } {
+  if (data.length < 1) {
+    throw new Error("Transaction data is too short to contain a signature count");
   }
-  // For >127 signatures (extremely unlikely), the count uses 2-3 bytes
-  return 2;
+
+  const firstByte = data[0]!;
+  let count: number;
+  let offset: number;
+
+  if (firstByte <= 0x7f) {
+    // Single-byte compact-u16: values 0–127
+    count = firstByte;
+    offset = 1;
+  } else if (data.length < 2) {
+    throw new Error("Transaction data is too short for multi-byte compact-u16 signature count");
+  } else {
+    const secondByte = data[1]!;
+    if (secondByte <= 0x7f) {
+      // Two-byte compact-u16: values 128–16383
+      count = (firstByte & 0x7f) | (secondByte << 7);
+      offset = 2;
+    } else {
+      // Three-byte compact-u16: values 16384–65535
+      if (data.length < 3) {
+        throw new Error("Transaction data is too short for 3-byte compact-u16 signature count");
+      }
+      const thirdByte = data[2]!;
+      count = (firstByte & 0x7f) | ((secondByte & 0x7f) << 7) | (thirdByte << 14);
+      offset = 3;
+    }
+  }
+
+  if (count <= 0) {
+    throw new Error("Transaction must have at least one signature");
+  }
+
+  // Validate buffer has enough bytes for at least one signature (64 bytes)
+  if (data.length < offset + 64) {
+    throw new Error("Transaction data is too short to contain a signature");
+  }
+
+  return { offset, count };
 }

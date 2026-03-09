@@ -102,10 +102,10 @@ The `@solana/web3.js` library is bundled with `kova` -- you do not need to insta
 By default, kova uses an in-memory store that loses all state when the process exits. This means spending limits, rate limits, and the circuit breaker reset on every restart -- which is fine for development but defeats the purpose of having guardrails in production.
 
 ::: warning Why this matters
-Imagine setting a daily spending limit of 5 SOL. Without persistent storage, restarting your server resets the counter to zero -- the agent could spend another 5 SOL immediately. In production, you need `SqliteStore` so limits survive restarts.
+Imagine setting a daily spending limit of 5 SOL. Without persistent storage, restarting your server resets the counter to zero -- the agent could spend another 5 SOL immediately. In production, you need `SqliteStore` or `RedisStore` so limits survive restarts.
 :::
 
-For persistent storage, install `better-sqlite3`:
+For persistent storage on a **single server**, install `better-sqlite3`:
 
 ```bash
 # Install better-sqlite3, a native Node.js addon that provides synchronous
@@ -115,11 +115,24 @@ For persistent storage, install `better-sqlite3`:
 npm install better-sqlite3
 ```
 
-This lets you use `SqliteStore`, which persists the SDK's internal safety state (spending counters, rate limits, circuit breaker, audit log, and idempotency cache) to a local file. See the [Stores guide](/guide/stores) for details.
+This lets you use `SqliteStore`, which persists the SDK's internal safety state to a local file. See the [Stores guide](/guide/stores) for details.
 
 ::: warning
 `better-sqlite3` is a native Node.js addon. It requires a C++ compiler (e.g., `gcc`, `clang`, or MSVC) to build during installation. On macOS, ensure Xcode Command Line Tools are installed (`xcode-select --install`). On Linux, install `build-essential` (`sudo apt-get install build-essential`). On Windows, install the Visual Studio C++ build tools.
 :::
+
+### Multi-Server Deployments (Redis)
+
+For production deployments with **multiple servers or processes**, install `ioredis`:
+
+```bash
+# Install ioredis, a Redis client for Node.js. This is required for RedisStore,
+# which shares spending counters, rate limits, and audit logs across multiple
+# processes and servers via a Redis backend.
+npm install ioredis
+```
+
+This lets you use `RedisStore`, which provides shared state across all instances connected to the same Redis server. See the [Stores guide](/guide/stores#redisstore) for details.
 
 ## TypeScript Configuration
 

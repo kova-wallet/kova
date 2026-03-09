@@ -21,11 +21,30 @@
  * calling `db.exec("VACUUM")`) to reclaim disk space in long-running deployments.
  */
 
-import Database from "better-sqlite3";
+import type Database from "better-sqlite3";
+import { createRequire } from "node:module";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { Store } from "./interface.js";
+
+/**
+ * Lazily load better-sqlite3 at runtime. This allows SqliteStore to be an
+ * optional dependency — users who only need MemoryStore or RedisStore don't
+ * need to install it (or have native build tools).
+ */
+function loadBetterSqlite3(): typeof Database {
+  const require = createRequire(import.meta.url);
+  try {
+    return require("better-sqlite3") as typeof Database;
+  } catch {
+    throw new Error(
+      "SqliteStore requires the 'better-sqlite3' package.\n" +
+      "Install it with: npm install better-sqlite3\n" +
+      "Note: better-sqlite3 is a native addon that requires build tools (Python, make, C++ compiler).",
+    );
+  }
+}
 
 /** CRIT-03 fix: Maximum entries per list key to prevent unbounded disk growth */
 const MAX_LIST_SIZE = 100_000;
@@ -306,7 +325,8 @@ export class SqliteStore implements Store {
     }
     try {
       // M-36 fix: Use resolvedDbPath for database creation
-      this.db = new Database(resolvedDbPath);
+      const BetterSqlite3 = loadBetterSqlite3();
+      this.db = new BetterSqlite3(resolvedDbPath);
     } finally {
       if (oldUmask !== undefined) {
         process.umask(oldUmask);

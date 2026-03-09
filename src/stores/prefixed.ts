@@ -60,6 +60,7 @@ const PREFIX_PATTERN = /^[a-zA-Z0-9_\-:]+$/;
  * after wrapping it with PrefixedStore.
  */
 export class PrefixedStore implements Store {
+  // AUDIT-L-13: Inner store reference bypass. Ensure inner store is not exposed after wrapping.
   private readonly inner: Store;
   private readonly prefix: string;
 

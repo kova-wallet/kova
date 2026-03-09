@@ -295,6 +295,7 @@ export function toSmallestUnit(amount: string, decimals: number): bigint {
   // smallest-unit result is 0, this means the amount has more decimal places
   // than the token supports and was silently truncated. This is dangerous because
   // the user intended to send a non-zero amount but the transaction would send nothing.
+  // AUDIT-L-8: parseFloat used for zero detection. Safe for practical amounts.
   if (result === 0n && parseFloat(amount) > 0) {
     // LOW-T1-05 fix: Redact exact input value from error message to prevent information leakage
     throw new SolanaAdapterError(
@@ -518,7 +519,12 @@ export function isPrivateIPv6(ip: string): boolean {
   if (lower === "::1" || lower === "0:0:0:0:0:0:0:1") return true;
   if (lower.startsWith("fc") || lower.startsWith("fd")) return true;
   if (/^fe[89ab]/i.test(lower)) return true;
-  if (lower.startsWith("::ffff:")) return true;
+  // AUDIT-M-14 fix: Extract the IPv4 portion of IPv4-mapped addresses and validate
+  // through isPrivateIPv4 instead of blanket-blocking all IPv4-mapped addresses.
+  if (lower.startsWith("::ffff:")) {
+    const ipv4Part = lower.slice(7);
+    return isPrivateIPv4(ipv4Part);
+  }
   if (lower.startsWith("100:")) return true;
   if (lower.startsWith("2001:db8:") || lower.startsWith("2001:0db8:")) return true;
   if (lower.startsWith("2002:")) return true;

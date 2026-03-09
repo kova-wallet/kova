@@ -347,6 +347,7 @@ export class AllowlistRule implements PolicyRule {
    * the inferred value (defense-in-depth: the explicit value may differ from the
    * default if a different program variant is used).
    */
+  // AUDIT-L-4: Program inference is Solana-specific. Gate on intent.chain for multi-chain.
   private extractProgramId(intent: TransactionIntent): string | null {
     const params = intent.params as unknown as Record<string, unknown>;
 

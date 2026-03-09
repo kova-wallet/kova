@@ -821,8 +821,47 @@ const store = new SqliteStore({
 ```
 
 ::: warning
-SQLite is single-writer. Do not share the same database file across multiple processes.
+SQLite is single-writer. Do not share the same database file across multiple processes. For multi-process deployments, use `RedisStore`.
 :::
+
+---
+
+### RedisStore
+
+Redis-backed implementation of `Store` for multi-process production deployments. Requires the `ioredis` optional peer dependency.
+
+```typescript
+// Create a Redis-backed store. Requires ioredis: npm install ioredis
+new RedisStore(config?: RedisStoreConfig)
+```
+
+#### RedisStoreConfig
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `client` | `Redis` | No | An existing ioredis client instance (for Sentinel, Cluster, etc.). RedisStore will not close it on `disconnect()`. |
+| `url` | `string` | No | Redis connection URL. Ignored if `client` is provided. Defaults to `localhost:6379`. |
+| `keyPrefix` | `string` | No | Prefix for all Redis keys (e.g., `"kova:"`). For application-level namespacing. |
+| `listPrefix` | `string` | No | Internal prefix for list keys. Default: `"list:"`. |
+
+```typescript
+// Import and create a Redis-backed store.
+import { RedisStore } from "kova";
+
+// Simple: connect with a URL
+const store = new RedisStore({ url: "redis://localhost:6379" });
+
+// Advanced: bring your own ioredis client
+import Redis from "ioredis";
+const client = new Redis.Cluster([{ host: "redis-1", port: 6379 }]);
+const store = new RedisStore({ client });
+```
+
+**Methods** (in addition to `Store` interface):
+
+| Method | Description |
+|--------|-------------|
+| `disconnect()` | Close the Redis connection. Only closes if RedisStore created it. |
 
 ---
 

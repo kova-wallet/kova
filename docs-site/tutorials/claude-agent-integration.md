@@ -244,7 +244,7 @@ const messages: Anthropic.MessageParam[] = [
 ];
 
 let response = await anthropic.messages.create({
-  model: "claude-sonnet-4-5-20250929",
+  model: "claude-sonnet-4-6-20250827",
   max_tokens: 1024,
   system: `You are a payment assistant with access to a crypto wallet.
 Always check wallet_get_policy before your first transaction.
@@ -328,7 +328,7 @@ while (response.stop_reason === "tool_use") {
   messages.push({ role: "user", content: toolResults });
 
   response = await anthropic.messages.create({
-    model: "claude-sonnet-4-5-20250929",
+    model: "claude-sonnet-4-6-20250827",
     max_tokens: 1024,
     system: `You are a payment assistant with access to a crypto wallet.
 Always check wallet_get_policy before your first transaction.
@@ -496,7 +496,7 @@ Include a "reason" in every transfer for the audit trail.`;
   ];
 
   let response = await anthropic.messages.create({
-    model: "claude-sonnet-4-5-20250929",
+    model: "claude-sonnet-4-6-20250827",
     max_tokens: 1024,
     system: systemPrompt,
     tools,
@@ -525,7 +525,7 @@ Include a "reason" in every transfer for the audit trail.`;
     messages.push({ role: "user", content: toolResults });
 
     response = await anthropic.messages.create({
-      model: "claude-sonnet-4-5-20250929",
+      model: "claude-sonnet-4-6-20250827",
       max_tokens: 1024,
       system: systemPrompt,
       tools,

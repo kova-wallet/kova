@@ -10,7 +10,7 @@
  * are present, types are correct, and unknown properties are stripped.
  */
 
-import { WALLET_TOOLS, safeHandleToolCall, sanitizeToolResponse } from "./tools.js";
+import { getFilteredTools, safeHandleToolCall, sanitizeToolResponse } from "./tools.js";
 import type { ToolDefinition } from "./types.js";
 import type { AgentWallet } from "../core/wallet.js";
 
@@ -47,8 +47,9 @@ export interface LangChainToolDefinition {
  */
 export function createLangChainTools(
   wallet: AgentWallet,
+  options?: { includeDangerous?: boolean; exclude?: string[] },
 ): LangChainToolDefinition[] {
-  return WALLET_TOOLS.map((tool) => ({
+  return getFilteredTools(options).map((tool) => ({
     name: tool.name,
     description: tool.description,
     schema: {

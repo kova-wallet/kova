@@ -158,6 +158,7 @@ export const WALLET_TOOLS: readonly ToolDefinition[] = [
             "Maximum slippage tolerance as a decimal (e.g., 0.01 for 1%). Defaults to 0.5%",
           // MED-CROSS-01 fix: Enforce maximum slippage cap in schema definition.
           // This is now enforced server-side by validateToolInput() alongside maxLength.
+          minimum: 0,
           maximum: 0.5,
         },
         chain: {
@@ -180,7 +181,7 @@ export const WALLET_TOOLS: readonly ToolDefinition[] = [
   {
     name: "wallet_mint",
     description:
-      "Mint an NFT from a collection. Creates a new NFT using the specified collection address and metadata URI.",
+      "Mint an NFT from a collection. Creates a new NFT using the specified collection address and metadata URI. (Coming soon — not yet implemented in SolanaAdapter.)",
     parameters: {
       type: "object",
       properties: {
@@ -220,7 +221,7 @@ export const WALLET_TOOLS: readonly ToolDefinition[] = [
   {
     name: "wallet_stake",
     description:
-      "Stake tokens with a validator or staking pool. Locks the specified amount of tokens for staking rewards.",
+      "Stake tokens with a validator or staking pool. Locks the specified amount of tokens for staking rewards. (Coming soon — not yet implemented in SolanaAdapter.)",
     parameters: {
       type: "object",
       properties: {
@@ -548,6 +549,14 @@ export function validateToolInput(
       );
     }
 
+    // AUDIT-L-16: Validate numeric minimum constraints server-side.
+    const minVal = properties[key]?.minimum;
+    if (minVal !== undefined && typeof input[key] === "number" && (input[key] as number) < minVal) {
+      throw new Error(
+        `Field "${key}" for tool "${toolName}" is below minimum value of ${minVal}`,
+      );
+    }
+
     // HIGH-T3-04 fix: Validate maxItems for array-typed fields (passed as JSON strings)
     // LOW-07 fix: Also validate maxItems when the value is already a native array,
     // not just a JSON-encoded string. Without the Array.isArray guard a non-array
@@ -626,6 +635,13 @@ export function validateToolInput(
       if (maxVal !== undefined && typeof input[key] === "number" && (input[key] as number) > maxVal) {
         throw new Error(
           `Field "${key}" for tool "${toolName}" exceeds maximum value of ${maxVal}`,
+        );
+      }
+      // AUDIT-L-16: Validate numeric minimum constraints for optional fields.
+      const minVal = properties[key]?.minimum;
+      if (minVal !== undefined && typeof input[key] === "number" && (input[key] as number) < minVal) {
+        throw new Error(
+          `Field "${key}" for tool "${toolName}" is below minimum value of ${minVal}`,
         );
       }
       // INPUT-007 fix: Validate maxLength for optional string fields
@@ -763,7 +779,9 @@ export function safeHandleToolCall(
 ): Promise<unknown> {
   const tool = getToolByName(name);
   if (!tool) {
-    return Promise.resolve({ success: false, error: `Unknown tool: ${name}`, errorCode: "UNKNOWN_TOOL" as const });
+    // AUDIT-L-17: Strip control chars from untrusted tool name before including in error.
+    const safeName = String(name).replace(/[\x00-\x1F\x7F-\x9F]/g, "").slice(0, 64);
+    return Promise.resolve({ success: false, error: `Unknown tool: ${safeName}`, errorCode: "UNKNOWN_TOOL" as const });
   }
 
   // API-004: Enforce write rate limit floor for write operations (per-wallet via WeakMap)

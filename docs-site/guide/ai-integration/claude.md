@@ -91,7 +91,7 @@ To understand the integration, it helps to see exactly what JSON gets sent to Cl
 
 ```json
 {
-  "model": "claude-sonnet-4-5-20250929",
+  "model": "claude-sonnet-4-6-20250827",
   "max_tokens": 1024,
   "system": "You are a helpful payment assistant with access to a crypto wallet.",
   "tools": [
@@ -231,7 +231,7 @@ async function runAgent(userMessage: string): Promise<string> {
 
   // 4. Send the initial message to Claude with the wallet tools available.
   let response = await anthropic.messages.create({
-    model: "claude-sonnet-4-5-20250929",       // The Claude model to use
+    model: "claude-sonnet-4-6-20250827",       // The Claude model to use
     max_tokens: 1024,                        // Maximum response length
     // System prompt guides Claude's behavior (but is NOT a security boundary).
     system: "You are a helpful payment assistant with access to a crypto wallet. Always check your policy constraints before making transactions.",
@@ -275,7 +275,7 @@ async function runAgent(userMessage: string): Promise<string> {
     // call more tools or generate a final text response.
     messages.push({ role: "user", content: toolResults });
     response = await anthropic.messages.create({
-      model: "claude-sonnet-4-5-20250929",
+      model: "claude-sonnet-4-6-20250827",
       max_tokens: 1024,
       system: "You are a helpful payment assistant with access to a crypto wallet. Always check your policy constraints before making transactions.",
       tools,
@@ -333,7 +333,7 @@ async function paymentAgent(
   // Send the initial request to Claude with a detailed system prompt
   // that defines the exact workflow Claude should follow.
   let response = await anthropic.messages.create({
-    model: "claude-sonnet-4-5-20250929",
+    model: "claude-sonnet-4-6-20250827",
     max_tokens: 1024,
     // The system prompt defines a step-by-step workflow for Claude:
     // This makes the agent's behavior predictable and auditable.
@@ -376,7 +376,7 @@ async function paymentAgent(
     // Feed the tool results back to Claude for the next turn.
     messages.push({ role: "user", content: toolResults });
     response = await anthropic.messages.create({
-      model: "claude-sonnet-4-5-20250929",
+      model: "claude-sonnet-4-6-20250827",
       max_tokens: 1024,
       system: [
         "You are a payment assistant. Before sending any payment:",
@@ -444,7 +444,7 @@ Key principles for system prompts:
 
 2. **Forgetting to push both the assistant message and tool results.** The conversation history must alternate between `assistant` and `user` roles. After processing Claude's tool calls, you need to push *two* messages: the assistant's response (containing tool_use blocks) and the user's tool results. Skipping either one will break the conversation.
 
-3. **Using the wrong Anthropic model.** Not all Claude models support tool use. Make sure you are using a model that supports it, such as `claude-sonnet-4-5-20250929` or `claude-sonnet-4-5-20250929`. Check the [Anthropic documentation](https://docs.anthropic.com/en/docs/build-with-claude/tool-use) for the latest supported models.
+3. **Using the wrong Anthropic model.** Not all Claude models support tool use. Make sure you are using a recent model (e.g., `claude-sonnet-4-6-20250827`). Check the [Anthropic documentation](https://docs.anthropic.com/en/docs/build-with-claude/tool-use) for the latest supported models — newer versions may be available since these docs were written.
 
 ## Troubleshooting
 
