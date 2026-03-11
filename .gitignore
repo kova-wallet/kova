@@ -15,8 +15,12 @@ coverage/
 test-ledger/
 
 # Security audit files (H-34: prevent leaking security findings into repo)
+audit.md
 security_audit*.md
 SECURITY_AUDIT*.md
+
+# Planning/integration notes
+pyth-integration.md
 
 # SQLite databases (H-35: wallet stores may use SQLite; exclude DB files from repo)
 *.db
