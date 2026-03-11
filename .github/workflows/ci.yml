@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, dev, prod]
+    branches: [dev, prod]
   pull_request:
-    branches: [main, dev, prod]
+    branches: [dev, prod]
 
 permissions:
   contents: read
@@ -98,7 +98,8 @@ jobs:
           if [ $AUDIT_EXIT -ne 0 ]; then
             # Allowlisted advisory IDs (keep sorted, document reason for each):
             #   GHSA-3gc7-fjrx-p6mg — bigint-buffer, transitive via @solana/spl-token, no upstream fix
-            ALLOWLIST="GHSA-3gc7-fjrx-p6mg"
+            #   GHSA-378v-28hj-76wf — bn.js, transitive via @solana/web3.js, no upstream fix
+            ALLOWLIST="GHSA-3gc7-fjrx-p6mg GHSA-378v-28hj-76wf"
             NON_ALLOWLISTED=$(node -e "
               const data = require('/tmp/audit-prod.json');
               const allowlist = new Set(process.argv.slice(1));
