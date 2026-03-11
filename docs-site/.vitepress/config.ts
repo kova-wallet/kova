@@ -53,6 +53,7 @@ export default defineConfig({
             { text: 'Stores', link: '/guide/stores' },
             { text: 'Signers', link: '/guide/signers' },
             { text: 'Chain Adapters', link: '/guide/chain-adapters' },
+            { text: 'Price Oracles', link: '/guide/oracles' },
           ],
         },
         {

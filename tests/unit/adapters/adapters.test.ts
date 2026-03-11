@@ -91,6 +91,7 @@ function createWallet(overrides?: Partial<AgentWalletConfig>) {
     chain: createMockChain(),
     policy: new PolicyEngine([allowAllRule], store),
     store,
+    dangerouslyDisableAuth: true,
     enabledTools: new Set([
       "wallet_transfer",
       "wallet_swap",
@@ -1106,7 +1107,8 @@ describe("handleToolCall — negative, zero, and extreme amounts", () => {
       chain: "solana",
     });
     expect(result.success).toBe(false);
-    expect(result.error).toContain("invalid amount");
+    // A-02: validateToolInput now catches invalid amounts before wallet-level validation
+    expect(result.error).toContain("Invalid amount");
   });
 
   it("should fail when transfer amount is negative", async () => {
@@ -1118,7 +1120,7 @@ describe("handleToolCall — negative, zero, and extreme amounts", () => {
       chain: "solana",
     });
     expect(result.success).toBe(false);
-    expect(result.error).toContain("invalid amount");
+    expect(result.error).toContain("Invalid amount");
   });
 
   it("should fail when swap amount is '0'", async () => {
@@ -1130,7 +1132,7 @@ describe("handleToolCall — negative, zero, and extreme amounts", () => {
       chain: "solana",
     });
     expect(result.success).toBe(false);
-    expect(result.error).toContain("invalid amount");
+    expect(result.error).toContain("Invalid amount");
   });
 
   it("should fail when swap amount is negative", async () => {
@@ -1142,7 +1144,7 @@ describe("handleToolCall — negative, zero, and extreme amounts", () => {
       chain: "solana",
     });
     expect(result.success).toBe(false);
-    expect(result.error).toContain("invalid amount");
+    expect(result.error).toContain("Invalid amount");
   });
 
   it("should fail when stake amount is '0'", async () => {
@@ -1153,7 +1155,7 @@ describe("handleToolCall — negative, zero, and extreme amounts", () => {
       chain: "solana",
     });
     expect(result.success).toBe(false);
-    expect(result.error).toContain("invalid amount");
+    expect(result.error).toContain("Invalid amount");
   });
 
   it("should fail when stake amount is negative", async () => {
@@ -1164,7 +1166,7 @@ describe("handleToolCall — negative, zero, and extreme amounts", () => {
       chain: "solana",
     });
     expect(result.success).toBe(false);
-    expect(result.error).toContain("invalid amount");
+    expect(result.error).toContain("Invalid amount");
   });
 
   it("should succeed with very large transfer amount", async () => {
@@ -1199,7 +1201,8 @@ describe("handleToolCall — negative, zero, and extreme amounts", () => {
       chain: "solana",
     });
     expect(result.success).toBe(false);
-    expect(result.error).toContain("invalid amount");
+    // A-02: validateToolInput now catches invalid amounts before wallet-level validation
+    expect(result.error).toContain("Invalid amount");
   });
 
   it("should reject 'Infinity' amount with validation error (CRIT-01)", async () => {
@@ -1212,7 +1215,7 @@ describe("handleToolCall — negative, zero, and extreme amounts", () => {
     });
     // CRIT-01: Infinity amounts are now rejected — validation rejects non-finite values
     expect(result.success).toBe(false);
-    expect(result.error).toContain("invalid amount");
+    expect(result.error).toContain("Invalid amount");
   });
 
   it("should fail when transfer amount is not a number string", async () => {
@@ -1224,7 +1227,7 @@ describe("handleToolCall — negative, zero, and extreme amounts", () => {
       chain: "solana",
     });
     expect(result.success).toBe(false);
-    expect(result.error).toContain("invalid amount");
+    expect(result.error).toContain("Invalid amount");
   });
 });
 
@@ -1252,7 +1255,8 @@ describe("handleToolCall — empty string inputs", () => {
       chain: "solana",
     });
     expect(result.success).toBe(false);
-    expect(result.error).toContain("'amount' must be a non-empty string");
+    // A-02: validateToolInput now catches empty/invalid amounts before wallet-level validation
+    expect(result.error).toContain("Invalid amount");
   });
 
   it("should fail when transfer 'token' is empty string", async () => {
@@ -1300,7 +1304,8 @@ describe("handleToolCall — empty string inputs", () => {
       chain: "solana",
     });
     expect(result.success).toBe(false);
-    expect(result.error).toContain("'amount' must be a non-empty string");
+    // A-02: validateToolInput now catches empty/invalid amounts before wallet-level validation
+    expect(result.error).toContain("Invalid amount");
   });
 
   it("should fail when mint 'collection' is empty string", async () => {
@@ -1322,7 +1327,8 @@ describe("handleToolCall — empty string inputs", () => {
       chain: "solana",
     });
     expect(result.success).toBe(false);
-    expect(result.error).toContain("'metadataUri' must be a non-empty string");
+    // A-08: validateToolInput now catches invalid metadataUri scheme before wallet-level validation
+    expect(result.error).toContain("metadataUri must use https, ipfs, or ar scheme");
   });
 
   it("should fail when stake 'amount' is empty string", async () => {
@@ -1333,7 +1339,8 @@ describe("handleToolCall — empty string inputs", () => {
       chain: "solana",
     });
     expect(result.success).toBe(false);
-    expect(result.error).toContain("'amount' must be a non-empty string");
+    // A-02: validateToolInput now catches empty/invalid amounts before wallet-level validation
+    expect(result.error).toContain("Invalid amount");
   });
 
   it("should fail when stake 'token' is empty string", async () => {
@@ -1595,12 +1602,12 @@ describe("getPolicy — AllowlistRule edge cases", () => {
     expect(summary.allowlistedPrograms).toBe(0);
   });
 
-  it("should handle AllowlistRule with empty arrays", async () => {
+  it("should handle AllowlistRule with empty deny arrays and no allow arrays", async () => {
     const store = new MemoryStore();
+    // POL-04: Empty allowAddresses/allowPrograms now throw. Use undefined (omitted)
+    // for "no restriction" and empty deny arrays for "deny nothing".
     const rules: PolicyRule[] = [
       new AllowlistRule({
-        allowAddresses: [],
-        allowPrograms: [],
         denyAddresses: [],
         denyPrograms: [],
       }),
@@ -2228,22 +2235,22 @@ describe("LangChain Adapter — error handling and JSON stringification", () => 
 // ── handleToolCall: wallet_get_transaction_history edge cases ─────
 
 describe("handleToolCall — transaction history edge cases", () => {
-  it("should handle limit of 0 gracefully", async () => {
+  it("should reject limit of 0 (minimum is 1)", async () => {
     const wallet = createWallet();
     const result = await wallet.handleToolCall("wallet_get_transaction_history", {
       limit: 0,
     });
-    expect(result.success).toBe(true);
-    expect(Array.isArray(result.data)).toBe(true);
+    // MED-CROSS-01 / AUDIT-L-16: minimum constraint is now enforced server-side
+    expect(result.success).toBe(false);
   });
 
-  it("should handle negative limit gracefully", async () => {
+  it("should reject negative limit (minimum is 1)", async () => {
     const wallet = createWallet();
     const result = await wallet.handleToolCall("wallet_get_transaction_history", {
       limit: -5,
     });
-    expect(result.success).toBe(true);
-    expect(Array.isArray(result.data)).toBe(true);
+    // MED-CROSS-01 / AUDIT-L-16: minimum constraint is now enforced server-side
+    expect(result.success).toBe(false);
   });
 
   it("should handle non-numeric limit gracefully", async () => {

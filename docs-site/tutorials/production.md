@@ -175,8 +175,8 @@ interface WalletConfig {
   solanaSecretKey: string;       // Required: JSON-encoded byte array for the Solana keypair
   solanaRpcUrl: string;          // Required: Solana RPC endpoint URL
   dbPath: string;                // Required: file path for the SQLite database
-  telegramBotToken?: string;     // Optional: Telegram bot token for approval flows
-  telegramChatId?: string;       // Optional: Telegram chat ID for approval messages
+  approvalWebhookUrl?: string;    // Optional: Webhook URL for approval flows
+  approvalHmacSecret?: string;   // Optional: HMAC secret for approval webhook signing
 }
 
 // loadConfig() validates and loads all environment variables at startup.
@@ -392,7 +392,7 @@ import {
   ApprovalGateRule,
   PolicyEngine,
   AuditLogger,
-  TelegramApprovalBot,
+  CallbackApprovalChannel,
 } from "kova";
 
 // --- Configuration ---
@@ -426,13 +426,16 @@ const chain = new SolanaAdapter({
 });
 
 // --- Approval ---
-// Telegram bot for human-in-the-loop approval of high-value transactions.
-const approvalBot = new TelegramApprovalBot({
-  token: required("TELEGRAM_BOT_TOKEN"),             // Bot token from @BotFather
-  chatId: required("TELEGRAM_CHAT_ID"),               // Chat ID for approval messages
-  defaultTimeout: 300000,                              // 5 minutes to respond
-  allowedUserIds: [required("TELEGRAM_CHAT_ID")],     // Only this user can approve/reject
-  pollInterval: 2000,                                  // Check for responses every 2 seconds
+// Callback-based approval channel for human-in-the-loop approval of high-value transactions.
+const approvalBot = new CallbackApprovalChannel({
+  name: "production-approval",
+  onApprovalRequest: async (request) => {
+    await notifyApprover(request); // Send notification via your preferred channel
+  },
+  waitForDecision: async (request) => {
+    return pollForResponse(request.id); // Wait for human's response
+  },
+  defaultTimeout: 300_000,              // 5 minutes to respond
 });
 
 // --- Policy ---

@@ -359,12 +359,16 @@ The metadata URI must be accessible at mint time. If the URI returns a 404, the 
 For the 1/1 drops scenario, add an `ApprovalGateRule` to require human approval for each mint:
 
 ```typescript
-import { ApprovalGateRule, TelegramApprovalBot } from "kova";
+import { ApprovalGateRule, CallbackApprovalChannel } from "kova";
 
-const approval = new TelegramApprovalBot({
-  botToken: process.env.TELEGRAM_BOT_TOKEN!,
-  chatId: process.env.TELEGRAM_CHAT_ID!,
-  allowedUserIds: [parseInt(process.env.TELEGRAM_ADMIN_ID!)],
+const approval = new CallbackApprovalChannel({
+  name: "nft-approval",
+  onApprovalRequest: async (request) => {
+    await notifyApprover(request);
+  },
+  waitForDecision: async (request) => {
+    return pollForResponse(request.id);
+  },
 });
 
 // Add to rules array after the spending limit.

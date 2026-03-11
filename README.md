@@ -12,9 +12,9 @@
 
 <p align="center">
   <a href="https://github.com/0xKeyserSoze/kova/actions/workflows/ci.yml"><img src="https://github.com/0xKeyserSoze/kova/actions/workflows/ci.yml/badge.svg?branch=prod" alt="CI" /></a>
-  <a href="https://www.npmjs.com/package/kova-wallet"><img src="https://img.shields.io/npm/v/kova-wallet" alt="npm version" /></a>
-  <a href="https://github.com/0xKeyserSoze/kova/blob/prod/LICENSE"><img src="https://img.shields.io/npm/l/kova-wallet" alt="license" /></a>
-  <img src="https://img.shields.io/node/v/kova-wallet" alt="node version" />
+  <a href="https://www.npmjs.com/package/@kova/wallet"><img src="https://img.shields.io/npm/v/@kova/wallet" alt="npm version" /></a>
+  <a href="https://github.com/0xKeyserSoze/kova/blob/prod/LICENSE"><img src="https://img.shields.io/npm/l/@kova/wallet" alt="license" /></a>
+  <img src="https://img.shields.io/node/v/@kova/wallet" alt="node version" />
 </p>
 
 ---
@@ -66,7 +66,7 @@ Agent → Intent → Policy Engine → Build Tx → Sign → Broadcast → Audit
 ### Install
 
 ```bash
-npm install kova-wallet
+npm install @kova/wallet
 ```
 
 For persistent storage (single server):
@@ -85,7 +85,7 @@ npm install ioredis
 import { Keypair } from "@solana/web3.js";
 import {
   AgentWallet, Policy, LocalSigner, MemoryStore, SolanaAdapter,
-} from "kova-wallet";
+} from "@kova/wallet";
 
 const signer = new LocalSigner(Keypair.generate());
 const store  = new MemoryStore();
@@ -221,7 +221,7 @@ if (toolCall) {
 ### LangChain
 
 ```typescript
-import { createLangChainTools } from "kova-wallet";
+import { createLangChainTools } from "@kova/wallet";
 
 const tools = createLangChainTools(wallet);
 // Pass to any LangChain agent — policy enforcement is automatic

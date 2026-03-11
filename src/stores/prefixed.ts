@@ -58,9 +58,18 @@ const PREFIX_PATTERN = /^[a-zA-Z0-9_\-:]+$/;
  * internally. Anyone retaining a reference to the inner store can bypass prefix isolation
  * and access HMAC keys for any prefix. DO NOT share or expose the inner store reference
  * after wrapping it with PrefixedStore.
+ *
+ * ST-07 SECURITY: The inner store reference (`this.inner`) MUST never be shared or
+ * exposed outside this class. If the inner store reference leaks, an attacker can:
+ *   1. Bypass prefix isolation and read/write keys for any wallet
+ *   2. Forge HMAC values for other wallets' counters
+ *   3. Access audit logs across wallet boundaries
+ * After wrapping a store with PrefixedStore, discard all other references to the
+ * inner store instance. Do not store it in a variable, pass it to other components,
+ * or return it from any function.
  */
 export class PrefixedStore implements Store {
-  // AUDIT-L-13: Inner store reference bypass. Ensure inner store is not exposed after wrapping.
+  // ST-07: Inner store reference must never be shared. See class-level security note.
   private readonly inner: Store;
   private readonly prefix: string;
 
@@ -112,6 +121,12 @@ export class PrefixedStore implements Store {
    * outside its own prefix namespace.
    */
   private validateCombinedKeyLength(key: string): string {
+    // ST-16 fix: Reject keys containing control characters (U+0000 through U+001F).
+    // Control characters can cause log injection, terminal escape attacks, or
+    // unexpected behavior in underlying store backends.
+    if (/[\x00-\x1F]/.test(key)) {
+      throw new Error("Key contains control characters");
+    }
     // MED-T5-03 fix: Block access to internal __hmac keys via crafted key names.
     // The HMAC keys are internal to the store's counter integrity system and should
     // only be accessed by the store's own increment() method, not by callers.
@@ -196,14 +211,9 @@ export class PrefixedStore implements Store {
     return this.inner.getRecent(combinedKey, count);
   }
 
-  /**
-   * MED-T5-09 fix: Clear all entries in a list via the inner store's clearList.
-   * Delegates to the inner store if it implements clearList.
-   */
+  /** Clear all entries in a list via the inner store's clearList. */
   async clearList(key: string): Promise<void> {
     const combinedKey = this.validateCombinedKeyLength(key);
-    if (typeof this.inner.clearList === "function") {
-      return this.inner.clearList(combinedKey);
-    }
+    return this.inner.clearList(combinedKey);
   }
 }

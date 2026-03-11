@@ -197,19 +197,17 @@ try {
 
 This prevents internal error details (stack traces, database paths, internal state) from being leaked to the agent. The agent sees a generic error message, while the full error is available in the audit log for operators.
 
-## Token Redaction in Telegram Bot
+## Secret Redaction in Approval Channels
 
-The `TelegramApprovalBot` automatically redacts the bot token from all error messages:
+The `WebhookApprovalChannel` automatically redacts HMAC secrets from error messages:
 
 ```typescript
-// If the Telegram API returns an error containing the bot token, the SDK
-// automatically replaces the token with "[REDACTED]" before logging or returning the error.
-// This prevents the bot token from appearing in logs, error reports, or audit entries.
-// Before: "Telegram API sendMessage failed (401): {"ok":false} with token 123456:ABC"
-// After:  "Telegram API sendMessage failed (401): {"ok":false} with token [REDACTED]"
+// If an approval channel error contains sensitive data (like HMAC secrets or API tokens),
+// the SDK automatically replaces it with "[REDACTED]" before logging or returning the error.
+// This prevents secrets from appearing in logs, error reports, or audit entries.
 ```
 
-This prevents the bot token from appearing in logs, error reports, or audit entries.
+This prevents secrets from appearing in logs, error reports, or audit entries.
 
 ## Input Validation
 
@@ -221,7 +219,7 @@ The SDK validates all inputs at the boundary before processing:
 
 ## SSRF Protection
 
-The `SolanaAdapter` validates all URLs (RPC, Jupiter API, Jupiter Price API) at construction time:
+The `SolanaAdapter` validates all URLs (RPC endpoint) at construction time:
 
 - **HTTPS enforced** for all non-localhost URLs
 - **Private networks blocked**: RFC 1918 addresses (10.x, 172.16-31.x, 192.168.x), link-local (169.254.x), and zero addresses are rejected
@@ -392,9 +390,9 @@ Review this checklist before deploying with real funds.
 
 ### Approval Channel
 
-- [ ] Set `allowedUserIds` on the `TelegramApprovalBot` to restrict who can approve.
-- [ ] Use a private Telegram chat or channel, not a public group.
-- [ ] Store the bot token in environment variables, never in source code.
+- [ ] Restrict who can approve transactions in your approval channel implementation.
+- [ ] Use HMAC-signed webhooks (`WebhookApprovalChannel`) to prevent tampering.
+- [ ] Store HMAC secrets and API tokens in environment variables, never in source code.
 - [ ] Test the approval flow before deploying.
 
 ### Persistence
@@ -419,7 +417,7 @@ Review this checklist before deploying with real funds.
 - [ ] Use a private or rate-limited RPC endpoint, not a public one.
 - [ ] Use HTTPS for all RPC and API endpoints (enforced by `SolanaAdapter`).
 - [ ] Run the agent process in an isolated environment (container, VM).
-- [ ] Restrict network egress to only the required endpoints (RPC, Telegram API, Jupiter API).
+- [ ] Restrict network egress to only the required endpoints (RPC, approval webhook endpoints).
 - [ ] Be aware that `SolanaAdapter` blocks connections to private/internal network addresses (SSRF protection).
 
 ### Testing

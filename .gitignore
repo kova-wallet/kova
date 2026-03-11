@@ -4,13 +4,11 @@ coverage/
 *.log
 .env
 .env.*
-!.env.example
 .DS_Store
 
 # Local dev (scripts/local-dev.sh)
 .local-keypair.json
 .local-recipient.json
-.devnet-keypair.json
 .validator.pid
 .validator.log
 test-ledger/

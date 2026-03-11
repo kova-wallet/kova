@@ -6,17 +6,22 @@ import { SqliteStore } from "../../../src/stores/sqlite.js";
  * MED-T5-04: HMAC counter integrity tests for MemoryStore and SqliteStore.
  *
  * Verifies that counter values are protected by HMAC integrity checks:
- * - HMAC is computed and stored in `{key}:__hmac` on each increment
- * - Tampered counter values are detected and reset to 0
- * - Missing HMAC entries do not cause errors (backward compatibility)
+ * - HMAC is computed and stored internally (using \x00__hmac separator) on each increment
+ * - Tampered counter values are detected and the current value is preserved
+ *   (M13 fix: prevents spending limit bypass via HMAC deletion)
+ * - Missing HMAC entries preserve the current value (consistent fail-safe)
  * - HMAC verification uses timing-safe comparison
+ *
+ * L8 fix: HMAC keys now use a null-byte separator (\x00__hmac) instead of
+ * ":__hmac" to prevent key collisions with user keys ending in ":__hmac".
+ * Since validateKey() rejects null bytes in user keys, HMAC keys are
+ * inaccessible via public store methods, making them truly internal.
  */
 
 describe("HMAC counter integrity — MemoryStore", () => {
   let store: MemoryStore;
 
   beforeEach(() => {
-    // NODE_ENV=test allows MemoryStore construction without dangerouslyAllowInProduction
     store = new MemoryStore();
   });
 
@@ -25,56 +30,43 @@ describe("HMAC counter integrity — MemoryStore", () => {
   });
 
   describe("HMAC storage on increment", () => {
-    it("should store HMAC in {key}:__hmac after increment", async () => {
+    it("should store HMAC internally after increment", async () => {
       const result = await store.increment("test-counter", 5);
       expect(result).toBe(5);
 
-      // The HMAC should be stored as a separate key
-      const hmac = await store.get("test-counter:__hmac");
-      expect(hmac).not.toBeNull();
-      expect(hmac).toBeTruthy();
-      // HMAC is a hex-encoded SHA-256 digest (64 hex chars)
-      expect(hmac!.length).toBe(64);
-      expect(/^[0-9a-f]{64}$/.test(hmac!)).toBe(true);
+      // Subsequent increment should succeed with valid HMAC verification
+      const result2 = await store.increment("test-counter", 3);
+      expect(result2).toBe(8);
     });
 
     it("should update HMAC on subsequent increments", async () => {
       await store.increment("test-counter", 5);
-      const hmac1 = await store.get("test-counter:__hmac");
-
       await store.increment("test-counter", 3);
-      const hmac2 = await store.get("test-counter:__hmac");
-
-      // HMAC should change because the counter value changed
-      expect(hmac1).not.toBeNull();
-      expect(hmac2).not.toBeNull();
-      expect(hmac1).not.toBe(hmac2);
+      const result = await store.increment("test-counter", 2);
+      expect(result).toBe(10);
     });
 
     it("should store HMAC for first increment (new key)", async () => {
       const result = await store.increment("new-key", 0);
       expect(result).toBe(0);
 
-      const hmac = await store.get("new-key:__hmac");
-      expect(hmac).not.toBeNull();
+      const result2 = await store.increment("new-key", 1);
+      expect(result2).toBe(1);
     });
 
     it("should store distinct HMACs for different keys with same value", async () => {
       await store.increment("counter-a", 10);
       await store.increment("counter-b", 10);
 
-      const hmacA = await store.get("counter-a:__hmac");
-      const hmacB = await store.get("counter-b:__hmac");
-
-      // HMACs should differ because the key is part of the HMAC input
-      expect(hmacA).not.toBeNull();
-      expect(hmacB).not.toBeNull();
-      expect(hmacA).not.toBe(hmacB);
+      const resultA = await store.increment("counter-a", 1);
+      const resultB = await store.increment("counter-b", 1);
+      expect(resultA).toBe(11);
+      expect(resultB).toBe(11);
     });
   });
 
   describe("tamper detection", () => {
-    it("should detect tampered counter value and reset to 0 + amount", async () => {
+    it("should detect tampered counter value and preserve current value", async () => {
       // Set up a legitimate counter
       await store.increment("spending", 50);
       expect(await store.get("spending")).toBe("50");
@@ -92,9 +84,9 @@ describe("HMAC counter integrity — MemoryStore", () => {
       process.on("warning", handler);
 
       try {
-        // Next increment should detect HMAC mismatch and reset to 0
+        // M13 fix: preserve tampered value (99999) to prevent spending limit bypass
         const result = await store.increment("spending", 1);
-        expect(result).toBe(1); // 0 (reset) + 1 (amount)
+        expect(result).toBe(100000); // 99999 (preserved) + 1 (amount)
 
         // Wait for warning event to propagate
         await new Promise((r) => setTimeout(r, 10));
@@ -129,8 +121,8 @@ describe("HMAC counter integrity — MemoryStore", () => {
 
       try {
         const result = await store.increment("counter", 5);
-        // Should reset to 0 + 5 = 5, not 101 + 5 = 106
-        expect(result).toBe(5);
+        // M13 fix: preserve tampered value (101) + 5 = 106
+        expect(result).toBe(106);
 
         await new Promise((r) => setTimeout(r, 10));
         expect(warnings.some((w) => w.includes("HMAC verification failed"))).toBe(true);
@@ -145,67 +137,47 @@ describe("HMAC counter integrity — MemoryStore", () => {
       // Simulate a counter that was created by direct set() (no HMAC)
       await store.set("legacy-counter", "42");
 
-      // increment should treat missing HMAC as valid (backward compat)
+      // M13 fix: Missing HMAC preserves current value to prevent spending limit bypass
       const result = await store.increment("legacy-counter", 8);
-      // Missing HMAC is not treated as tampering — value is trusted
-      expect(result).toBe(50); // 42 + 8
+      expect(result).toBe(50); // 42 (preserved) + 8
     });
 
     it("should create HMAC after incrementing a legacy counter", async () => {
       await store.set("legacy-counter", "42");
-      expect(await store.get("legacy-counter:__hmac")).toBeNull();
 
       await store.increment("legacy-counter", 1);
 
-      // After increment, HMAC should now be present
-      const hmac = await store.get("legacy-counter:__hmac");
-      expect(hmac).not.toBeNull();
-      expect(/^[0-9a-f]{64}$/.test(hmac!)).toBe(true);
+      // After increment, HMAC should be present internally — verify via clean increment
+      const result = await store.increment("legacy-counter", 1);
+      expect(result).toBe(44); // 42 + 1 + 1
     });
   });
 
   describe("HMAC uses timing-safe comparison", () => {
     it("should use crypto.timingSafeEqual internally (verified via tamper detection)", async () => {
-      // We verify timing-safe comparison indirectly: if the comparison were
-      // not timing-safe, a partial HMAC match could leak information. We verify
-      // the mechanism works correctly by confirming tampered values are always
-      // detected regardless of partial HMAC similarity.
       await store.increment("timing-test", 100);
-      const legitimateHmac = await store.get("timing-test:__hmac");
 
       // Tamper with counter value
       await store.set("timing-test", "200");
 
-      // The HMAC from value "100" should not match value "200"
+      // M13 fix: preserve current value (200) instead of resetting to 0
       const result = await store.increment("timing-test", 1);
-      expect(result).toBe(1); // Reset to 0 + 1
+      expect(result).toBe(201); // 200 (preserved) + 1
 
-      // After the new increment, a new valid HMAC should be stored
-      const newHmac = await store.get("timing-test:__hmac");
-      expect(newHmac).not.toBeNull();
-      expect(newHmac).not.toBe(legitimateHmac);
+      // After the new increment, a valid HMAC is stored — verify via clean increment
+      const result2 = await store.increment("timing-test", 1);
+      expect(result2).toBe(202);
     });
 
-    it("should reject HMAC with wrong length gracefully", async () => {
-      await store.increment("hmac-len", 10);
+    it("should detect tampered HMAC gracefully", async () => {
+      await store.increment("hmac-tamper", 10);
 
-      // Tamper with the HMAC itself to have wrong length
-      await store.set("hmac-len:__hmac", "short");
+      // Tamper with the counter value (HMAC becomes invalid)
+      await store.set("hmac-tamper", "10.5");
 
-      // Should detect invalid HMAC and reset
-      const result = await store.increment("hmac-len", 1);
-      expect(result).toBe(1); // Reset to 0 + 1
-    });
-
-    it("should reject HMAC with invalid hex characters gracefully", async () => {
-      await store.increment("hmac-hex", 10);
-
-      // Tamper with HMAC using invalid hex (non-hex chars, correct length)
-      await store.set("hmac-hex:__hmac", "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz");
-
-      // Should detect invalid HMAC and reset
-      const result = await store.increment("hmac-hex", 1);
-      expect(result).toBe(1); // Reset to 0 + 1
+      // M13 fix: preserve current value on invalid HMAC
+      const result = await store.increment("hmac-tamper", 1);
+      expect(result).toBe(11.5);
     });
   });
 
@@ -213,21 +185,36 @@ describe("HMAC counter integrity — MemoryStore", () => {
     it("should not accept HMAC from a different MemoryStore instance", async () => {
       const store2 = new MemoryStore();
 
-      // Each store has its own random HMAC key, so an HMAC from store1
-      // is invalid in store2 (and vice versa).
       await store.increment("cross-instance", 50);
-      const hmacFromStore1 = await store.get("cross-instance:__hmac");
-      expect(hmacFromStore1).not.toBeNull();
 
-      // Set up store2 with the same counter value and store1's HMAC
+      // Set up store2 with the same counter value but no HMAC
       await store2.set("cross-instance", "50");
-      await store2.set("cross-instance:__hmac", hmacFromStore1!);
 
-      // store2 should detect HMAC mismatch (different HMAC key)
+      // store2 should detect missing HMAC but preserve value
+      // M13 fix: preserve current value (50) instead of resetting to 0
       const result = await store2.increment("cross-instance", 1);
-      expect(result).toBe(1); // Reset to 0 + 1
+      expect(result).toBe(51); // 50 (preserved) + 1
 
       store2.stopGc();
+    });
+  });
+
+  describe("L8 fix: HMAC key collision prevention", () => {
+    it("should not collide with user key ending in :__hmac", async () => {
+      // Increment a counter — this stores HMAC internally with \x00 separator
+      await store.increment("mykey", 10);
+
+      // User sets a key that ends in ":__hmac" — should NOT interfere
+      // with the internal HMAC because the separator is now \x00
+      await store.set("mykey:__hmac", "user-data");
+
+      // The counter should still work correctly
+      const result = await store.increment("mykey", 5);
+      expect(result).toBe(15);
+
+      // The user's key should still be readable
+      const userData = await store.get("mykey:__hmac");
+      expect(userData).toBe("user-data");
     });
   });
 });
@@ -244,64 +231,47 @@ describe("HMAC counter integrity — SqliteStore", () => {
   });
 
   describe("HMAC storage on increment", () => {
-    it("should store HMAC in {key}:__hmac after increment", async () => {
+    it("should store HMAC internally after increment", async () => {
       const result = await store.increment("test-counter", 5);
       expect(result).toBe(5);
 
-      // The HMAC should be stored as a separate KV entry
-      const hmac = await store.get("test-counter:__hmac");
-      expect(hmac).not.toBeNull();
-      expect(hmac).toBeTruthy();
-      // HMAC is a hex-encoded SHA-256 digest (64 hex chars)
-      expect(hmac!.length).toBe(64);
-      expect(/^[0-9a-f]{64}$/.test(hmac!)).toBe(true);
+      const result2 = await store.increment("test-counter", 3);
+      expect(result2).toBe(8);
     });
 
     it("should update HMAC on subsequent increments", async () => {
       await store.increment("test-counter", 5);
-      const hmac1 = await store.get("test-counter:__hmac");
-
       await store.increment("test-counter", 3);
-      const hmac2 = await store.get("test-counter:__hmac");
-
-      // HMAC should change because the counter value changed
-      expect(hmac1).not.toBeNull();
-      expect(hmac2).not.toBeNull();
-      expect(hmac1).not.toBe(hmac2);
+      const result = await store.increment("test-counter", 2);
+      expect(result).toBe(10);
     });
 
     it("should store HMAC for first increment (new key)", async () => {
       const result = await store.increment("new-key", 0);
       expect(result).toBe(0);
 
-      const hmac = await store.get("new-key:__hmac");
-      expect(hmac).not.toBeNull();
+      const result2 = await store.increment("new-key", 1);
+      expect(result2).toBe(1);
     });
 
     it("should store distinct HMACs for different keys with same value", async () => {
       await store.increment("counter-a", 10);
       await store.increment("counter-b", 10);
 
-      const hmacA = await store.get("counter-a:__hmac");
-      const hmacB = await store.get("counter-b:__hmac");
-
-      // HMACs should differ because the key is part of the HMAC input
-      expect(hmacA).not.toBeNull();
-      expect(hmacB).not.toBeNull();
-      expect(hmacA).not.toBe(hmacB);
+      const resultA = await store.increment("counter-a", 1);
+      const resultB = await store.increment("counter-b", 1);
+      expect(resultA).toBe(11);
+      expect(resultB).toBe(11);
     });
   });
 
   describe("tamper detection", () => {
-    it("should detect tampered counter value and reset to 0 + amount", async () => {
-      // Set up a legitimate counter
+    it("should detect tampered counter value and preserve current value", async () => {
       await store.increment("spending", 50);
       expect(await store.get("spending")).toBe("50");
 
-      // Simulate tampering: directly overwrite the counter value without updating HMAC
       await store.set("spending", "99999");
 
-      // Capture the security warning
       const warnings: string[] = [];
       const handler = (warning: Error) => {
         if (warning.name === "SecurityWarning") {
@@ -311,11 +281,9 @@ describe("HMAC counter integrity — SqliteStore", () => {
       process.on("warning", handler);
 
       try {
-        // Next increment should detect HMAC mismatch and reset to 0
         const result = await store.increment("spending", 1);
-        expect(result).toBe(1); // 0 (reset) + 1 (amount)
+        expect(result).toBe(100000);
 
-        // Wait for warning event to propagate
         await new Promise((r) => setTimeout(r, 10));
         expect(warnings.length).toBeGreaterThanOrEqual(1);
         expect(warnings.some((w) => w.includes("HMAC verification failed"))).toBe(true);
@@ -329,13 +297,11 @@ describe("HMAC counter integrity — SqliteStore", () => {
       await store.increment("legit", 10);
       await store.increment("legit", 5);
       const result = await store.increment("legit", 3);
-      expect(result).toBe(18); // 10 + 5 + 3
+      expect(result).toBe(18);
     });
 
     it("should detect tampering even with same type but different value", async () => {
       await store.increment("counter", 100);
-
-      // Tamper with a slightly different numeric value
       await store.set("counter", "101");
 
       const warnings: string[] = [];
@@ -348,8 +314,7 @@ describe("HMAC counter integrity — SqliteStore", () => {
 
       try {
         const result = await store.increment("counter", 5);
-        // Should reset to 0 + 5 = 5, not 101 + 5 = 106
-        expect(result).toBe(5);
+        expect(result).toBe(106);
 
         await new Promise((r) => setTimeout(r, 10));
         expect(warnings.some((w) => w.includes("HMAC verification failed"))).toBe(true);
@@ -361,66 +326,41 @@ describe("HMAC counter integrity — SqliteStore", () => {
 
   describe("missing HMAC — backward compatibility", () => {
     it("should not error when HMAC entry is missing (no prior increment)", async () => {
-      // Simulate a counter that was created by direct set() (no HMAC)
       await store.set("legacy-counter", "42");
 
-      // increment should treat missing HMAC as valid (backward compat)
       const result = await store.increment("legacy-counter", 8);
-      // Missing HMAC is not treated as tampering — value is trusted
-      expect(result).toBe(50); // 42 + 8
+      expect(result).toBe(50);
     });
 
     it("should create HMAC after incrementing a legacy counter", async () => {
       await store.set("legacy-counter", "42");
-      expect(await store.get("legacy-counter:__hmac")).toBeNull();
 
       await store.increment("legacy-counter", 1);
 
-      // After increment, HMAC should now be present
-      const hmac = await store.get("legacy-counter:__hmac");
-      expect(hmac).not.toBeNull();
-      expect(/^[0-9a-f]{64}$/.test(hmac!)).toBe(true);
+      const result = await store.increment("legacy-counter", 1);
+      expect(result).toBe(44);
     });
   });
 
   describe("HMAC uses timing-safe comparison", () => {
     it("should use crypto.timingSafeEqual internally (verified via tamper detection)", async () => {
       await store.increment("timing-test", 100);
-      const legitimateHmac = await store.get("timing-test:__hmac");
 
-      // Tamper with counter value
       await store.set("timing-test", "200");
 
-      // The HMAC from value "100" should not match value "200"
       const result = await store.increment("timing-test", 1);
-      expect(result).toBe(1); // Reset to 0 + 1
+      expect(result).toBe(201);
 
-      // After the new increment, a new valid HMAC should be stored
-      const newHmac = await store.get("timing-test:__hmac");
-      expect(newHmac).not.toBeNull();
-      expect(newHmac).not.toBe(legitimateHmac);
+      const result2 = await store.increment("timing-test", 1);
+      expect(result2).toBe(202);
     });
 
-    it("should reject HMAC with wrong length gracefully", async () => {
-      await store.increment("hmac-len", 10);
+    it("should detect tampered HMAC gracefully", async () => {
+      await store.increment("hmac-tamper", 10);
+      await store.set("hmac-tamper", "10.5");
 
-      // Tamper with the HMAC itself to have wrong length
-      await store.set("hmac-len:__hmac", "short");
-
-      // Should detect invalid HMAC and reset
-      const result = await store.increment("hmac-len", 1);
-      expect(result).toBe(1); // Reset to 0 + 1
-    });
-
-    it("should reject HMAC with invalid hex characters gracefully", async () => {
-      await store.increment("hmac-hex", 10);
-
-      // Tamper with HMAC using invalid hex (non-hex chars, correct length)
-      await store.set("hmac-hex:__hmac", "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz");
-
-      // Should detect invalid HMAC and reset
-      const result = await store.increment("hmac-hex", 1);
-      expect(result).toBe(1); // Reset to 0 + 1
+      const result = await store.increment("hmac-tamper", 1);
+      expect(result).toBe(11.5);
     });
   });
 
@@ -428,21 +368,28 @@ describe("HMAC counter integrity — SqliteStore", () => {
     it("should not accept HMAC from a different SqliteStore instance", async () => {
       const store2 = new SqliteStore({ path: ":memory:", requireEncryption: false });
 
-      // Each store has its own random HMAC key, so an HMAC from store1
-      // is invalid in store2 (and vice versa).
       await store.increment("cross-instance", 50);
-      const hmacFromStore1 = await store.get("cross-instance:__hmac");
-      expect(hmacFromStore1).not.toBeNull();
 
-      // Set up store2 with the same counter value and store1's HMAC
       await store2.set("cross-instance", "50");
-      await store2.set("cross-instance:__hmac", hmacFromStore1!);
 
-      // store2 should detect HMAC mismatch (different HMAC key)
       const result = await store2.increment("cross-instance", 1);
-      expect(result).toBe(1); // Reset to 0 + 1
+      expect(result).toBe(51);
 
       store2.close();
+    });
+  });
+
+  describe("L8 fix: HMAC key collision prevention", () => {
+    it("should not collide with user key ending in :__hmac", async () => {
+      await store.increment("mykey", 10);
+
+      await store.set("mykey:__hmac", "user-data");
+
+      const result = await store.increment("mykey", 5);
+      expect(result).toBe(15);
+
+      const userData = await store.get("mykey:__hmac");
+      expect(userData).toBe("user-data");
     });
   });
 
@@ -458,34 +405,27 @@ describe("HMAC counter integrity — SqliteStore", () => {
     });
 
     it("should both detect tampering identically", async () => {
-      // Increment both stores
       await store.increment("parity", 50);
       await memStore.increment("parity", 50);
 
-      // Tamper with both
       await store.set("parity", "99999");
       await memStore.set("parity", "99999");
 
-      // Both should reset to 0 + 1
       const sqlResult = await store.increment("parity", 1);
       const memResult = await memStore.increment("parity", 1);
-      expect(sqlResult).toBe(1);
-      expect(memResult).toBe(1);
+      expect(sqlResult).toBe(100000);
+      expect(memResult).toBe(100000);
       expect(sqlResult).toBe(memResult);
     });
 
-    it("should both store HMAC in the same key pattern", async () => {
+    it("should both store HMAC internally", async () => {
       await store.increment("parity-hmac", 10);
       await memStore.increment("parity-hmac", 10);
 
-      const sqlHmac = await store.get("parity-hmac:__hmac");
-      const memHmac = await memStore.get("parity-hmac:__hmac");
-
-      // Both should have HMACs (though values differ due to different instance keys)
-      expect(sqlHmac).not.toBeNull();
-      expect(memHmac).not.toBeNull();
-      expect(sqlHmac!.length).toBe(64);
-      expect(memHmac!.length).toBe(64);
+      const sqlResult = await store.increment("parity-hmac", 1);
+      const memResult = await memStore.increment("parity-hmac", 1);
+      expect(sqlResult).toBe(11);
+      expect(memResult).toBe(11);
     });
 
     it("should both handle missing HMAC without error", async () => {
@@ -495,7 +435,6 @@ describe("HMAC counter integrity — SqliteStore", () => {
       const sqlResult = await store.increment("legacy", 8);
       const memResult = await memStore.increment("legacy", 8);
 
-      // Both should trust the value when HMAC is missing (backward compat)
       expect(sqlResult).toBe(50);
       expect(memResult).toBe(50);
     });

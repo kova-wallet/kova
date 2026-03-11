@@ -3,8 +3,8 @@
 ::: info What you'll learn
 - The `ApprovalChannel` interface and how to implement custom approval backends
 - The complete `ApprovalRequest` and `ApprovalResult` data structures
-- How to set up and configure the `TelegramApprovalBot`
-- The polling-based approval flow from request to decision
+- How to use `CallbackApprovalChannel` for flexible approval flows
+- How to use `WebhookApprovalChannel` for HTTP-based approval
 - How to build a custom approval channel (e.g., Slack)
 :::
 
@@ -85,10 +85,20 @@ interface ApprovalRequest {
     dailyLimit: string;  // The configured daily spending cap
     token: string;       // The token the budget is denominated in
   };
+  /** User ID of the person who initiated this transaction */
+  // Used for self-approval prevention — if set, this user cannot also
+  // approve the request. The value must be in the same identity space as
+  // the approval channel (e.g., Telegram user ID, Slack user ID).
+  requestedByUserId?: string;
   /** When this request expires */
   // Unix timestamp (milliseconds) after which the request automatically
   // times out and is treated as rejected. Prevents indefinite blocking.
   expiresAt: number;
+  /** SHA-256 hash of the transaction parameters */
+  // Cryptographically binds the approval to the specific transaction,
+  // preventing TOCTOU attacks where the intent could be modified after
+  // approval but before execution.
+  intentHash: string;
 }
 ```
 
@@ -102,8 +112,10 @@ interface ApprovalRequest {
 | `target` | `string` | Recipient address |
 | `reason` | `string?` | Why the agent wants to do this (from intent metadata) |
 | `agentId` | `string?` | Which agent initiated the request |
+| `requestedByUserId` | `string?` | User ID of requester; used for self-approval prevention |
 | `budgetContext` | `object?` | Current spending vs limits |
 | `expiresAt` | `number` | Unix timestamp when the request expires |
+| `intentHash` | `string` | SHA-256 hash of transaction parameters; binds approval to specific transaction |
 
 ## ApprovalResult and ApprovalDecision
 
@@ -126,6 +138,9 @@ interface ApprovalResult {
   decidedBy?: string;
   // Unix timestamp (milliseconds) of when the decision was made.
   decidedAt: number;
+  // Echo back the intent hash that was approved. The approval gate verifies
+  // this matches the original intent to prevent TOCTOU attacks.
+  intentHash?: string;
 }
 ```
 
@@ -135,150 +150,96 @@ interface ApprovalResult {
 | `rejected` | Human rejected the transaction | Policy returns `DENY` |
 | `timeout` | No response within the timeout period | Policy returns `DENY` |
 
-## TelegramApprovalBot
+## Built-in Approval Channels
 
-The `TelegramApprovalBot` sends approval requests to a Telegram chat and waits for the human to tap an Approve or Reject button.
+The SDK ships two generic approval channels that cover the most common integration patterns. Both handle timeout, fail-closed behavior, and intent hash echoing automatically.
 
-### Setup Guide
+### CallbackApprovalChannel
 
-#### 1. Create a Telegram Bot
-
-1. Open Telegram and search for **@BotFather**
-2. Send `/newbot` and follow the prompts
-3. BotFather gives you a bot token like `123456789:ABCdefGHIjklMNOpqrsTUVwxyz`
-
-#### 2. Get Your Chat ID
-
-1. Start a conversation with your new bot (send any message)
-2. Open `https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates` in your browser
-3. Find the `"chat":{"id":` value in the JSON response -- this is your chat ID
-
-::: tip
-For group chats, add the bot to the group and send a message. The chat ID for groups is typically a negative number (e.g., `-1001234567890`).
-:::
-
-#### 3. Configure the Bot
+The most flexible option -- you provide two callbacks: one to notify a human, and one to wait for their decision. Works with any notification mechanism (Telegram, Slack, Discord, email, SMS, in-app UI, push notifications).
 
 ```typescript
-// Import the built-in Telegram approval channel from kova.
-import { TelegramApprovalBot } from "kova";
+import { CallbackApprovalChannel } from "kova";
+import type { CallbackApprovalChannelConfig } from "kova";
 
-// Create a TelegramApprovalBot instance with your bot credentials and settings.
-const approval = new TelegramApprovalBot({
-  // The bot token from BotFather. Store this in an environment variable --
-  // never hardcode tokens in source code. The "!" asserts the value is defined.
-  token: process.env.TELEGRAM_BOT_TOKEN!,
-  // The Telegram chat ID where approval messages will be sent.
-  // Can be a private chat or a group chat.
-  chatId: process.env.TELEGRAM_CHAT_ID!,
-  // How long to wait for a human response before auto-rejecting (milliseconds).
-  // 300,000ms = 5 minutes. After this, the transaction is denied.
-  defaultTimeout: 300_000,       // 5 minutes
-  // Restrict who can tap the Approve/Reject buttons.
-  // Only the Telegram user with this numeric ID can respond.
-  // Other users who tap the buttons get an "unauthorized" error.
-  allowedUserIds: [123456789],   // Only this user can approve/reject
-  // How frequently the bot polls Telegram's getUpdates API for new button clicks.
-  // 2000ms = every 2 seconds. Lower values mean faster response but more API calls.
-  pollInterval: 2_000,           // Check for responses every 2 seconds
+const approval = new CallbackApprovalChannel({
+  // Optional channel name for audit logs. Defaults to "callback".
+  name: "telegram",
+
+  // Called when an approval request is created. Use this to notify a human.
+  // If this throws, the transaction is DENIED (fail-closed).
+  onApprovalRequest: async (request) => {
+    await sendTelegramMessage(chatId, formatApprovalMessage(request));
+  },
+
+  // Called to wait for the human's decision. Must return a Promise that
+  // resolves with an ApprovalResult when the human approves or rejects.
+  // The channel races this against the timeout automatically.
+  waitForDecision: async (request) => {
+    return pollForTelegramResponse(request.id);
+  },
+
+  // Default timeout in milliseconds. Defaults to 300_000 (5 minutes).
+  defaultTimeout: 300_000,
 });
 ```
 
-### TelegramApprovalBotConfig
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `name` | `string` | No | `"callback"` | Channel name for audit logs |
+| `onApprovalRequest` | `(request: ApprovalRequest) => Promise<void>` | Yes | -- | Callback to notify a human approver |
+| `waitForDecision` | `(request: ApprovalRequest) => Promise<ApprovalResult>` | Yes | -- | Callback to wait for the human's decision |
+| `defaultTimeout` | `number` | No | `300,000` (5 min) | Timeout in milliseconds |
+
+### WebhookApprovalChannel
+
+HTTP webhook-based approval for systems that communicate via HTTP callbacks (e.g., external approval dashboards, Slack webhooks, custom internal tools).
+
+**Flow:**
+1. SDK POSTs the `ApprovalRequest` as JSON to your `webhookUrl` with an `X-Kova-Signature` header (HMAC-SHA256)
+2. Your external system presents the request to a human
+3. Your system POSTs the decision back to the channel's callback server with an `X-Kova-Signature` header
+
+```typescript
+import { WebhookApprovalChannel } from "kova";
+
+const approval = new WebhookApprovalChannel({
+  // URL to POST approval requests to. Must be HTTPS (HTTP allowed for localhost).
+  webhookUrl: "https://your-approval-service.com/approve",
+  // Shared secret for HMAC-SHA256 signing (at least 16 characters).
+  hmacSecret: process.env.APPROVAL_HMAC_SECRET!,
+  // Port for the callback HTTP server (0 = OS-assigned ephemeral port).
+  callbackPort: 0,
+  // Path for incoming decision callbacks.
+  callbackPath: "/approval/callback",
+  // Default timeout.
+  defaultTimeout: 300_000,
+});
+
+// Start the callback server before using the channel.
+await approval.start();
+
+// After setup, discover the callback URL to share with your external system:
+console.log("Callback URL:", approval.getCallbackUrl());
+```
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `token` | `string` | Yes | -- | Bot token from BotFather |
-| `chatId` | `string` | Yes | -- | Telegram chat ID to send requests to |
-| `defaultTimeout` | `number` | No | `300,000` (5 min) | Default timeout in milliseconds |
-| `allowedUserIds` | `number[]` | No | `undefined` | Whitelist of Telegram user IDs allowed to respond. Required unless `allowAllUsers: true` |
-| `allowAllUsers` | `boolean` | No | `undefined` | Explicitly opt in to allowing any chat member to approve/reject. Must be `true` if `allowedUserIds` is not provided |
-| `pollInterval` | `number` | No | `2,000` | Milliseconds between getUpdates polls |
-| `requestTimeoutMs` | `number` | No | `15,000` | HTTP timeout for Telegram API requests |
+| `name` | `string` | No | `"webhook"` | Channel name for audit logs |
+| `webhookUrl` | `string` | Yes | -- | URL to POST approval requests to |
+| `hmacSecret` | `string` | Yes | -- | Shared secret for HMAC-SHA256 signing (min 16 chars) |
+| `callbackPort` | `number` | No | `0` | Port for callback server (0 = OS-assigned) |
+| `callbackPath` | `string` | No | `"/approval/callback"` | Path for incoming decision callbacks |
+| `defaultTimeout` | `number` | No | `300,000` (5 min) | Timeout in milliseconds |
 
-### How Polling Works
-
-The `TelegramApprovalBot` uses Telegram's long-polling mechanism:
-
-1. **Send message**: Posts an HTML-formatted message to the chat with inline keyboard buttons (Approve / Reject)
-2. **Poll for updates**: Calls `getUpdates` with a long-poll timeout of 2 seconds
-3. **Match callback**: When a user taps a button, Telegram sends a `callback_query` update. The bot matches it to the pending request via the callback data
-4. **Validate user**: If `allowedUserIds` is configured, only whitelisted users can respond. Unauthorized button taps are acknowledged with an error message but ignored
-5. **Return result**: The bot answers the callback query, removes the inline keyboard, and returns the `ApprovalResult`
-
-### Approval Flow Diagram
-
-```
-Agent                  SDK                  Telegram
-  │                      │                     │
-  │  execute(intent)     │                     │
-  │─────────────────────►│                     │
-  │                      │                     │
-  │                      │  sendMessage         │
-  │                      │  (with Approve/      │
-  │                      │   Reject buttons)    │
-  │                      │────────────────────►│
-  │                      │                     │
-  │                      │     (waiting...)     │  Human sees message
-  │                      │                     │
-  │                      │  getUpdates (poll)   │
-  │                      │────────────────────►│
-  │                      │                     │  Human taps "Approve"
-  │                      │  callback_query     │
-  │                      │◄────────────────────│
-  │                      │                     │
-  │                      │  answerCallbackQuery │
-  │                      │────────────────────►│
-  │                      │                     │
-  │  TransactionResult   │                     │
-  │◄─────────────────────│                     │
-```
-
-### allowedUserIds Security
-
-The `allowedUserIds` field restricts who can respond to approval requests. When set:
-
-- Only Telegram users whose user ID is in the list can approve or reject
-- Other users who tap the buttons see an error message: "You are not authorized to respond to this request"
-- The bot continues polling until an authorized user responds or the timeout expires
-
-::: danger
-If `allowedUserIds` is not configured, **any user** who has access to the chat can approve or reject transactions. In a group chat, this means anyone in the group can approve. Always set `allowedUserIds` in production.
-:::
-
-### Known Limitations
-
-::: warning Polling Architecture (API-010)
-The `TelegramApprovalBot` uses `getUpdates` long-polling, which has two important limitations:
-
-1. **Single-process only** — Telegram's `getUpdates` is globally destructive: acknowledging an `update_id` discards all lower IDs server-side. Only one process can poll a given bot token at a time. For multi-instance deployments, use Telegram webhooks with a shared message queue (e.g., Redis pub/sub) instead.
-
-2. **Lost updates on restart** — The `lastUpdateOffset` is stored in memory and is not persisted to disk. If the process restarts while an approval request is pending, the bot may miss the human's response. The request will time out and the transaction will be denied (safe failure mode).
-:::
-
-### Security Hardening
-
-The TelegramApprovalBot includes several security measures:
-
-- **HMAC-SHA-256 signing**: Callback data is signed using HMAC-SHA-256 (via `crypto.createHmac("sha256", key)`) to prevent forgery
-- **HMAC tags**: Each approval callback carries an HMAC-SHA-256 tag to prevent forgery
-- **HMAC failure counting**: After 10 failed HMAC verification attempts for a single request, it is automatically rejected
-- **Secure token storage**: The bot token is stored as a `Buffer` and zero-filled on `destroy()`, preventing the token from lingering in V8's heap
+**Security features:**
+- **HMAC-SHA256 signatures** on both outbound requests and inbound callbacks prevent tampering
+- **SSRF protection** blocks webhook URLs that resolve to private/reserved IP addresses
+- **HTTPS enforcement** for non-localhost URLs
+- **Fail-closed timeout** -- no response means DENY
 
 ::: warning
-You must either provide `allowedUserIds` to restrict approvers, or explicitly set `allowAllUsers: true`. Without either, the constructor throws an error.
-:::
-
-### Token Redaction
-
-The `TelegramApprovalBot` automatically redacts the bot token from error messages. If a Telegram API call fails, the error message replaces the token with `[REDACTED]` to prevent accidental exposure in logs.
-
-### Known Limitations (API-010)
-
-::: warning Polling Architecture Constraints
-- **Single-process only**: Telegram's `getUpdates` long-polling is globally destructive — acknowledging an `update_id` discards all lower IDs server-side. Only **one process** can poll a given bot token at a time. For multi-instance deployments, use Telegram webhooks with a shared message queue (e.g., Redis pub/sub) instead.
-- **Lost updates on restart**: The `lastUpdateOffset` is held in memory and **not persisted to disk**. Restarting the process may re-consume stale updates or miss updates that arrived during downtime.
-- **Blocking during approval**: While waiting for a human response (up to 5 minutes by default), the wallet's execute mutex is held. All other `execute()` calls queue behind the approval wait.
+Call `await approval.start()` before using the channel, and `await approval.destroy()` when shutting down to clean up the HTTP server and pending requests.
 :::
 
 ## Implementing a Custom ApprovalChannel

@@ -129,6 +129,7 @@ describe("Agent Demo — E2E Workflow", () => {
         chain: createMockChain(),
         policy,
         store,
+        dangerouslyDisableAuth: true,
       });
 
       const summary = await wallet.getPolicy();
@@ -159,6 +160,7 @@ describe("Agent Demo — E2E Workflow", () => {
         chain: createMockChain(),
         policy,
         store,
+        dangerouslyDisableAuth: true,
       });
 
       const address = await wallet.getAddress();
@@ -179,6 +181,7 @@ describe("Agent Demo — E2E Workflow", () => {
         chain: createMockChain(),
         policy,
         store,
+        dangerouslyDisableAuth: true,
       });
 
       const result = await wallet.execute(createTransferIntent());
@@ -200,6 +203,7 @@ describe("Agent Demo — E2E Workflow", () => {
         policy,
         store,
         logger,
+        dangerouslyDisableAuth: true,
       });
 
       await wallet.execute(createTransferIntent());
@@ -225,6 +229,7 @@ describe("Agent Demo — E2E Workflow", () => {
         policy,
         store,
         logger,
+        dangerouslyDisableAuth: true,
       });
 
       await wallet.execute(createTransferIntent());
@@ -261,6 +266,7 @@ describe("Agent Demo — E2E Workflow", () => {
         chain: createMockChain(),
         policy,
         store,
+        dangerouslyDisableAuth: true,
       });
 
       const result = await wallet.execute(
@@ -287,6 +293,7 @@ describe("Agent Demo — E2E Workflow", () => {
         chain: createMockChain(),
         policy,
         store,
+        dangerouslyDisableAuth: true,
       });
 
       const result = await wallet.execute(
@@ -323,6 +330,7 @@ describe("Agent Demo — E2E Workflow", () => {
         chain: createMockChain(),
         policy,
         store,
+        dangerouslyDisableAuth: true,
       });
 
       // Execute 3 transfers (should all succeed)
@@ -353,6 +361,7 @@ describe("Agent Demo — E2E Workflow", () => {
         chain: createMockChain(),
         policy,
         store,
+        dangerouslyDisableAuth: true,
       });
 
       // First transfer of 0.4 SOL -- within daily limit of 0.5
@@ -409,6 +418,7 @@ describe("Agent Demo — E2E Workflow", () => {
         policy: engine,
         store,
         approval: mockApproval,
+        dangerouslyDisableAuth: true,
       });
 
       // 0.5 SOL > 0.3 threshold, should trigger approval
@@ -453,6 +463,7 @@ describe("Agent Demo — E2E Workflow", () => {
         policy: engine,
         store,
         approval: mockApproval,
+        dangerouslyDisableAuth: true,
       });
 
       const result = await wallet.execute(
@@ -500,6 +511,7 @@ describe("Agent Demo — E2E Workflow", () => {
         policy: engine,
         store,
         approval: mockApproval,
+        dangerouslyDisableAuth: true,
       });
 
       // 0.2 SOL <= 0.3 threshold, should NOT trigger approval
@@ -537,6 +549,7 @@ describe("Agent Demo — E2E Workflow", () => {
         policy,
         store,
         circuitBreaker: { threshold: 5, cooldownMs: 60_000 },
+        dangerouslyDisableAuth: true,
       });
 
       // 5 denials through the policy engine
@@ -570,6 +583,7 @@ describe("Agent Demo — E2E Workflow", () => {
         policy,
         store,
         circuitBreaker: { threshold: 5, cooldownMs: 1000 },
+        dangerouslyDisableAuth: true,
       });
 
       // Trigger circuit breaker
@@ -619,6 +633,7 @@ describe("Agent Demo — E2E Workflow", () => {
         policy,
         store,
         circuitBreaker: { threshold: 5, cooldownMs: 60_000 },
+        dangerouslyDisableAuth: true,
       });
 
       // 3 denials (denyCount goes to 1, 2, 3)
@@ -660,6 +675,7 @@ describe("Agent Demo — E2E Workflow", () => {
           "wallet_execute_custom", "wallet_get_balance", "wallet_get_policy",
           "wallet_get_transaction_history",
         ]),
+        dangerouslyDisableAuth: true,
       });
     }
 
@@ -763,6 +779,7 @@ describe("Agent Demo — E2E Workflow", () => {
         chain: createMockChain(),
         policy,
         store,
+        dangerouslyDisableAuth: true,
       });
 
       // 1. Confirmed transfer
@@ -796,6 +813,7 @@ describe("Agent Demo — E2E Workflow", () => {
         chain: createMockChain(),
         policy,
         store,
+        dangerouslyDisableAuth: true,
       });
 
       await wallet.execute(createTransferIntent({ id: "hist-check-1" }));
@@ -827,6 +845,7 @@ describe("Agent Demo — E2E Workflow", () => {
         chain,
         policy,
         store,
+        dangerouslyDisableAuth: true,
       });
 
       const intent = createTransferIntent({ id: "idempotent-e2e-1" });
@@ -890,6 +909,7 @@ describe("Agent Demo — E2E Workflow", () => {
         policy,
         store,
         logger,
+        dangerouslyDisableAuth: true,
       });
 
       // Execute several transactions to build a hash chain
@@ -921,6 +941,7 @@ describe("Agent Demo — E2E Workflow", () => {
         policy,
         store,
         logger,
+        dangerouslyDisableAuth: true,
       });
 
       await wallet.execute(createTransferIntent({ id: "chain-1" }));

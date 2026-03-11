@@ -1,9 +1,12 @@
+[extend]
+useDefault = true
+
 # T8-F1 fix: Gitleaks configuration for pre-commit secret scanning.
 # Detects private keys, tokens, and other secrets before they are committed.
 # Install: brew install gitleaks (or see https://github.com/gitleaks/gitleaks)
 # Usage: gitleaks protect --staged (as a pre-commit hook)
 
-title = "kova-wallet gitleaks config"
+title = "@kova/wallet gitleaks config"
 
 [[rules]]
 id = "solana-keypair-json"
@@ -22,6 +25,24 @@ id = "generic-private-key"
 description = "Generic private key pattern"
 regex = '''(?i)(private[_-]?key|secret[_-]?key)\s*[:=]\s*['"][^'"]{16,}['"]'''
 tags = ["key"]
+
+[[rules]]
+id = "turnkey-api-private-key"
+description = "Turnkey API private key"
+regex = '''(?i)(turnkey[_-]?api[_-]?private[_-]?key|turnkey[_-]?private[_-]?key)\s*[:=]\s*['"]?[A-Za-z0-9+/=\-_]{32,}['"]?'''
+tags = ["key", "turnkey"]
+
+[[rules]]
+id = "solana-base58-private-key"
+description = "Solana base58-encoded private key (88 characters)"
+regex = '''[1-9A-HJ-NP-Za-km-z]{87,88}'''
+tags = ["key", "solana"]
+
+[[rules]]
+id = "hex-hmac-encryption-key"
+description = "Hex-encoded HMAC or encryption key (64+ hex chars)"
+regex = '''(?i)(hmac[_-]?key|encryption[_-]?key|secret[_-]?key|signing[_-]?key)\s*[:=]\s*['"]?[0-9a-fA-F]{64,}['"]?'''
+tags = ["key", "crypto"]
 
 [allowlist]
 paths = [

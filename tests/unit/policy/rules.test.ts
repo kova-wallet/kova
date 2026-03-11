@@ -161,8 +161,16 @@ describe("AllowlistRule", () => {
 // ─────────────────────────────────────────────────
 describe("SpendingLimitRule", () => {
   it("should instantiate with a name of 'spending-limit'", () => {
-    const rule = new SpendingLimitRule({});
+    const rule = new SpendingLimitRule({
+      perTransaction: { amount: "10", token: "SOL" },
+    });
     expect(rule.name).toBe("spending-limit");
+  });
+
+  it("should throw when no limits are configured", () => {
+    expect(() => new SpendingLimitRule({})).toThrow(
+      "SpendingLimitRule: no limits configured",
+    );
   });
 
   it("should ALLOW when amount is within per-transaction limit", async () => {
@@ -192,7 +200,9 @@ describe("SpendingLimitRule", () => {
     // Cross-token bypass prevention denies untracked tokens.
     const result = await rule.evaluate(makeIntent(), makeContext());
     expect(result.decision).toBe("DENY");
-    expect(result.reason).toContain("no configured spending limit");
+    if (result.decision === "DENY") {
+      expect(result.reason).toContain("no configured spending limit");
+    }
   });
 
   it("should DENY when daily limit is exceeded", async () => {
@@ -653,14 +663,14 @@ describe("SpendingLimitRule — Edge Cases", () => {
     expect(result.decision).toBe("DENY");
   });
 
-  it("should ALLOW when amount exactly equals per-transaction limit", async () => {
+  it("should DENY when amount exactly equals per-transaction limit", async () => {
     const rule = new SpendingLimitRule({
       perTransaction: { amount: "1.0", token: "SOL" },
     });
     const intent = makeIntent({ params: { to: "addr", amount: "1.0", token: "SOL" } });
     const result = await rule.evaluate(intent, makeContext());
-    // 1.0 > 1.0 is false, so ALLOW
-    expect(result.decision).toBe("ALLOW");
+    // 1.0 >= 1.0 is true, so DENY (L18 fix: consistent >= boundary)
+    expect(result.decision).toBe("DENY");
   });
 
   it("should DENY when amount is just above per-transaction limit", async () => {
@@ -773,7 +783,9 @@ describe("SpendingLimitRule — Edge Cases", () => {
       ctx,
     );
     expect(r2.decision).toBe("DENY");
-    expect(r2.reason).toContain("no configured spending limit");
+    if (r2.decision === "DENY") {
+      expect(r2.reason).toContain("no configured spending limit");
+    }
   });
 
   it("should handle very large amounts", async () => {
@@ -789,10 +801,10 @@ describe("SpendingLimitRule — Edge Cases", () => {
     const rule = new SpendingLimitRule({
       perTransaction: { amount: "0.1", token: "SOL" },
     });
-    // 0.1 > 0.1 is false
+    // 0.1 >= 0.1 is true (L18 fix: consistent >= boundary)
     const intent = makeIntent({ params: { to: "addr", amount: "0.1", token: "SOL" } });
     const result = await rule.evaluate(intent, makeContext());
-    expect(result.decision).toBe("ALLOW");
+    expect(result.decision).toBe("DENY");
   });
 });
 
@@ -814,7 +826,7 @@ describe("AllowlistRule — Edge Cases", () => {
     expect(result.decision).toBe("DENY");
   });
 
-  it("should DENY swap intent when address allowlist is configured but swap tokens are not addresses in the list (M-03 fix)", async () => {
+  it("should ALLOW swap intent when swap tokens are short symbols, not base58 addresses (M-02 fix)", async () => {
     const rule = new AllowlistRule({
       allowAddresses: ["SomeAddress"],
       allowTokens: ["SOL", "USDC"],
@@ -824,9 +836,9 @@ describe("AllowlistRule — Edge Cases", () => {
       params: { fromToken: "SOL", toToken: "USDC", amount: "1.0" },
     });
     const result = await rule.evaluate(intent, makeContext());
-    // M-03 fix: checkSwapAddresses runs before token checks. Since swap token symbols
-    // (SOL, USDC) are not in the address allowlist, this is denied.
-    expect(result.decision).toBe("DENY");
+    // M-02 fix: checkSwapAddresses only validates base58-like tokens (32+ chars).
+    // Short symbols like SOL/USDC are not addresses, so they bypass the address check.
+    expect(result.decision).toBe("ALLOW");
   });
 
   it("should DENY when target address is empty string (POLICY-005 fix rejects empty addresses)", async () => {
@@ -839,13 +851,23 @@ describe("AllowlistRule — Edge Cases", () => {
     expect(result.decision).toBe("DENY");
   });
 
-  it("should handle empty allowAddresses array (no whitelist restriction)", async () => {
-    const rule = new AllowlistRule({
-      allowAddresses: [],
-    });
-    const result = await rule.evaluate(makeIntent(), makeContext());
-    // hasAllowAddresses is false (empty set), so no whitelist check
-    expect(result.decision).toBe("ALLOW");
+  it("should throw on empty allowAddresses array (POL-04 fix)", () => {
+    // POL-04: An empty allowlist is a dangerous misconfiguration — it silently allows all addresses.
+    expect(() => new AllowlistRule({ allowAddresses: [] })).toThrow(
+      "AllowlistRule: allowAddresses is set but empty",
+    );
+  });
+
+  it("should throw on empty allowPrograms array (POL-04 fix)", () => {
+    expect(() => new AllowlistRule({ allowPrograms: [] })).toThrow(
+      "AllowlistRule: allowPrograms is set but empty",
+    );
+  });
+
+  it("should throw on empty allowTokens array (POL-04 fix)", () => {
+    expect(() => new AllowlistRule({ allowTokens: [] })).toThrow(
+      "AllowlistRule: allowTokens is set but empty",
+    );
   });
 
   it("should deny when both allow and deny have the same address (deny takes precedence)", async () => {
@@ -1560,5 +1582,262 @@ describe("ApprovalGateRule — Edge Cases", () => {
     if (result.decision === "DENY") {
       expect(result.reason).toContain("no approval channel");
     }
+  });
+});
+
+// ─────────────────────────────────────────────────
+// M46: TTL expiration and window boundary tests
+// ─────────────────────────────────────────────────
+describe("RateLimitRule — TTL expiration and window boundaries", () => {
+  it("should reset counter after TTL expires (rate limit window resets)", async () => {
+    const store = new MemoryStore();
+    const rule = new RateLimitRule({ maxTransactionsPerMinute: 2 });
+    const context = makeContext({ store });
+
+    // Use up the rate limit
+    const r1 = await rule.evaluate(makeIntent(), context);
+    expect(r1.decision).toBe("ALLOW");
+    const r2 = await rule.evaluate(makeIntent(), context);
+    expect(r2.decision).toBe("ALLOW");
+    const r3 = await rule.evaluate(makeIntent(), context);
+    expect(r3.decision).toBe("DENY");
+
+    // Simulate TTL expiration by directly setting the counter key to expired
+    // Access the store's internal set method with a past TTL
+    await store.set("ratelimit:minute", "0", 60);
+    // Manually expire by setting a key with an already-past expiresAt
+    // We re-create the key with value "0" and TTL that has already elapsed
+    // by directly manipulating via set (which resets the value)
+    await store.set("ratelimit:minute", "0", 1);
+
+    // Wait briefly for the TTL to pass (1 second)
+    await new Promise((r) => setTimeout(r, 1100));
+
+    // Counter should be expired now — new requests should be allowed
+    const r4 = await rule.evaluate(makeIntent(), context);
+    expect(r4.decision).toBe("ALLOW");
+  });
+
+  it("should allow requests at window boundary (end of window + start of next)", async () => {
+    const store = new MemoryStore();
+    const rule = new RateLimitRule({ maxTransactionsPerMinute: 2 });
+    const context = makeContext({ store });
+
+    // Fill up the rate limit window
+    await rule.evaluate(makeIntent(), context);
+    await rule.evaluate(makeIntent(), context);
+    const denied = await rule.evaluate(makeIntent(), context);
+    expect(denied.decision).toBe("DENY");
+
+    // Simulate window expiration by setting a very short TTL and waiting
+    await store.set("ratelimit:minute", "0", 1);
+    await new Promise((r) => setTimeout(r, 1100));
+
+    // New window — should allow again up to limit
+    const r1 = await rule.evaluate(makeIntent(), context);
+    expect(r1.decision).toBe("ALLOW");
+    const r2 = await rule.evaluate(makeIntent(), context);
+    expect(r2.decision).toBe("ALLOW");
+    const r3 = await rule.evaluate(makeIntent(), context);
+    expect(r3.decision).toBe("DENY");
+  });
+});
+
+describe("TimeWindowRule — time-of-day opening and closing", () => {
+  it("should ALLOW transactions within the active window", async () => {
+    const rule = new TimeWindowRule({
+      timezone: "UTC",
+      windows: [{ days: ["mon", "tue", "wed", "thu", "fri"], start: "09:00", end: "17:00" }],
+    });
+
+    // Wednesday at 12:00 UTC (noon) — should be within window
+    // 2024-01-03 is a Wednesday
+    const noonWednesday = new Date("2024-01-03T12:00:00Z").getTime();
+    const result = await rule.evaluate(makeIntent(), makeContext({ now: noonWednesday }));
+    expect(result.decision).toBe("ALLOW");
+  });
+
+  it("should DENY transactions outside the active window", async () => {
+    const rule = new TimeWindowRule({
+      timezone: "UTC",
+      windows: [{ days: ["mon", "tue", "wed", "thu", "fri"], start: "09:00", end: "17:00" }],
+    });
+
+    // Wednesday at 20:00 UTC (8 PM) — outside window
+    const eveningWednesday = new Date("2024-01-03T20:00:00Z").getTime();
+    const result = await rule.evaluate(makeIntent(), makeContext({ now: eveningWednesday }));
+    expect(result.decision).toBe("DENY");
+  });
+
+  it("should DENY transactions on non-configured days", async () => {
+    const rule = new TimeWindowRule({
+      timezone: "UTC",
+      windows: [{ days: ["mon", "tue", "wed", "thu", "fri"], start: "09:00", end: "17:00" }],
+    });
+
+    // Saturday at 12:00 UTC — weekend, not in configured days
+    // 2024-01-06 is a Saturday
+    const noonSaturday = new Date("2024-01-06T12:00:00Z").getTime();
+    const result = await rule.evaluate(makeIntent(), makeContext({ now: noonSaturday }));
+    expect(result.decision).toBe("DENY");
+  });
+
+  it("should handle window boundary exactly at start time (inclusive)", async () => {
+    const rule = new TimeWindowRule({
+      timezone: "UTC",
+      windows: [{ days: ["wed"], start: "09:00", end: "17:00" }],
+    });
+
+    // Exactly at 09:00 — should be allowed (start is inclusive)
+    const startTime = new Date("2024-01-03T09:00:00Z").getTime();
+    const result = await rule.evaluate(makeIntent(), makeContext({ now: startTime }));
+    expect(result.decision).toBe("ALLOW");
+  });
+
+  it("should handle window boundary exactly at end time (exclusive)", async () => {
+    const rule = new TimeWindowRule({
+      timezone: "UTC",
+      windows: [{ days: ["wed"], start: "09:00", end: "17:00" }],
+    });
+
+    // Exactly at 17:00 — should be denied (end is exclusive)
+    const endTime = new Date("2024-01-03T17:00:00Z").getTime();
+    const result = await rule.evaluate(makeIntent(), makeContext({ now: endTime }));
+    expect(result.decision).toBe("DENY");
+  });
+});
+
+// ─────────────────────────────────────────────────
+// RateLimitRule (sliding window)
+// ─────────────────────────────────────────────────
+describe("RateLimitRule (sliding window)", () => {
+  it("should allow transactions within limit", async () => {
+    const store = new MemoryStore();
+    const rule = new RateLimitRule({
+      maxTransactionsPerMinute: 3,
+      algorithm: "sliding-window",
+      keyPrefix: "test",
+    });
+    const now = Date.now();
+    const ctx = makeContext({ store, now });
+
+    const r1 = await rule.evaluate(makeIntent(), ctx);
+    expect(r1.decision).toBe("ALLOW");
+
+    const r2 = await rule.evaluate(makeIntent(), ctx);
+    expect(r2.decision).toBe("ALLOW");
+
+    const r3 = await rule.evaluate(makeIntent(), ctx);
+    expect(r3.decision).toBe("ALLOW");
+  });
+
+  it("should deny when per-minute limit exceeded", async () => {
+    const store = new MemoryStore();
+    const rule = new RateLimitRule({
+      maxTransactionsPerMinute: 3,
+      algorithm: "sliding-window",
+      keyPrefix: "test",
+    });
+    const now = Date.now();
+    const ctx = makeContext({ store, now });
+
+    // Use up the limit
+    await rule.evaluate(makeIntent(), ctx);
+    await rule.evaluate(makeIntent(), ctx);
+    await rule.evaluate(makeIntent(), ctx);
+
+    // 4th should be denied
+    const r4 = await rule.evaluate(makeIntent(), ctx);
+    expect(r4.decision).toBe("DENY");
+    if (r4.decision === "DENY") {
+      expect(r4.reason).toContain("sliding window");
+      expect(r4.reason).toContain("per minute");
+    }
+  });
+
+  it("should deny when per-hour limit exceeded", async () => {
+    const store = new MemoryStore();
+    const rule = new RateLimitRule({
+      maxTransactionsPerHour: 2,
+      algorithm: "sliding-window",
+      keyPrefix: "test",
+    });
+    const now = Date.now();
+    const ctx = makeContext({ store, now });
+
+    await rule.evaluate(makeIntent(), ctx);
+    await rule.evaluate(makeIntent(), ctx);
+
+    // 3rd should be denied
+    const r3 = await rule.evaluate(makeIntent(), ctx);
+    expect(r3.decision).toBe("DENY");
+    if (r3.decision === "DENY") {
+      expect(r3.reason).toContain("sliding window");
+      expect(r3.reason).toContain("per hour");
+    }
+  });
+
+  it("should allow new transactions after old ones expire (manipulate context.now)", async () => {
+    const store = new MemoryStore();
+    const rule = new RateLimitRule({
+      maxTransactionsPerMinute: 2,
+      algorithm: "sliding-window",
+      keyPrefix: "test",
+    });
+    const baseTime = Date.now();
+
+    // Fill up the limit at baseTime
+    const ctx1 = makeContext({ store, now: baseTime });
+    await rule.evaluate(makeIntent(), ctx1);
+    await rule.evaluate(makeIntent(), ctx1);
+
+    // Should be denied at the same time
+    const r3 = await rule.evaluate(makeIntent(), ctx1);
+    expect(r3.decision).toBe("DENY");
+
+    // Advance time by 61 seconds (past the 60s minute window)
+    const ctx2 = makeContext({ store, now: baseTime + 61_000 });
+    const r4 = await rule.evaluate(makeIntent(), ctx2);
+    expect(r4.decision).toBe("ALLOW");
+  });
+
+  it("should eliminate boundary burst (the key advantage over fixed-window)", async () => {
+    const store = new MemoryStore();
+    const rule = new RateLimitRule({
+      maxTransactionsPerMinute: 3,
+      algorithm: "sliding-window",
+      keyPrefix: "test",
+    });
+
+    // Simulate 3 transactions at the very end of a "window" (t = 59s)
+    const baseTime = Date.now();
+    const lateInWindow = baseTime + 59_000;
+    const ctxLate = makeContext({ store, now: lateInWindow });
+
+    await rule.evaluate(makeIntent(), ctxLate);
+    await rule.evaluate(makeIntent(), ctxLate);
+    await rule.evaluate(makeIntent(), ctxLate);
+
+    // With fixed-window, a new window would start at baseTime + 60s,
+    // resetting the counter and allowing another burst of 3.
+    // With sliding window, those 3 transactions at t=59s are still within
+    // the 60s sliding window at t=61s (59s + 60s = 119s > 61s), so the
+    // next transaction should be DENIED.
+    const justAfterBoundary = baseTime + 61_000;
+    const ctxEarly = makeContext({ store, now: justAfterBoundary });
+
+    const result = await rule.evaluate(makeIntent(), ctxEarly);
+    expect(result.decision).toBe("DENY");
+    if (result.decision === "DENY") {
+      expect(result.reason).toContain("sliding window");
+    }
+
+    // But once the full 60s window has passed since the original transactions,
+    // they should expire and new ones should be allowed again.
+    const afterExpiry = lateInWindow + 60_001;
+    const ctxAfter = makeContext({ store, now: afterExpiry });
+
+    const rAllowed = await rule.evaluate(makeIntent(), ctxAfter);
+    expect(rAllowed.decision).toBe("ALLOW");
   });
 });

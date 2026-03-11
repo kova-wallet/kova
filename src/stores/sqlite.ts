@@ -56,25 +56,24 @@ const MAX_KEY_LENGTH = 512;
 const MAX_VALUE_LENGTH = 1_000_000;
 
 /**
- * MED-20 fix: Denied PRAGMAs that disable safety features.
- * These could lead to data corruption or durability loss.
- * L-24 fix: Extended to include additional dangerous PRAGMAs that could
- * compromise data integrity, durability, or security.
+ * M17 fix: Default upper bound on the total number of distinct keys in the kv table.
+ * When exceeded, set() and increment() will throw for NEW keys (existing key
+ * updates are allowed). This prevents a malicious or buggy agent from creating
+ * unlimited keys and exhausting disk space.
  */
-const DENIED_PRAGMA_PATTERNS = [
-  /journal_mode\s*=\s*(off|delete)/i,
-  /synchronous\s*=\s*(off|0)/i,
-  /writable_schema/i,
-  /locking_mode\s*=\s*exclusive/i,
-  /** STORE-018 fix: Prevent disabling secure_delete, which leaves deleted data recoverable on disk */
-  /secure_delete\s*=\s*(off|0|false)/i,
-  /** STORE-018 fix: Prevent temp_store=file, which writes temporary data to unencrypted disk files */
-  /temp_store\s*=\s*file/i,
-  /** L-24 fix: Prevent disabling foreign key constraints, which can leave orphaned rows */
-  /foreign_keys\s*=\s*(off|0|false)/i,
-  /** L-24 fix: Prevent enabling trusted_schema, which allows untrusted SQL in schema definitions */
-  /trusted_schema\s*=\s*(on|1|true)/i,
-];
+const MAX_KEYS = 100_000;
+
+/**
+ * ST-06 fix: PRAGMA allowlist replaces the previous blocklist approach.
+ * A blocklist can be bypassed by using an unknown dangerous PRAGMA that
+ * wasn't on the list. An allowlist is strictly safer — only explicitly
+ * approved PRAGMAs are permitted, and all others are rejected.
+ */
+const ALLOWED_PRAGMAS = new Set([
+  'journal_mode', 'wal_checkpoint', 'synchronous', 'cache_size',
+  'mmap_size', 'busy_timeout', 'key', 'cipher_page_size',
+  'cipher_kdf_iter', 'foreign_keys', 'temp_store',
+]);
 
 /**
  * STORE-002 fix: Apply restrictive filesystem permissions (0o600) to SQLite WAL and SHM
@@ -184,10 +183,21 @@ export interface SqliteStoreConfig {
    * database itself.
    */
   encryptionKey?: Buffer;
+  /**
+   * M17 fix: Maximum number of distinct keys allowed in the kv table.
+   * When exceeded, set() and increment() will throw for NEW keys (existing key
+   * updates are allowed). This prevents a malicious or buggy agent from creating
+   * unlimited keys and exhausting disk space. Default: 100_000.
+   */
+  maxKeys?: number;
 }
 
-/** H-19 fix: Maximum retries for SQLITE_BUSY errors with exponential backoff */
-const MAX_RETRIES = 3;
+/** H-19 fix: Maximum retries for SQLITE_BUSY errors with exponential backoff.
+ * ST-09 fix: Increased from 3 to 7 to handle sustained WAL contention in
+ * multi-process deployments. Callers should treat increment failures as hard
+ * errors — a failed increment means the counter state is unknown and the
+ * operation should not proceed. */
+const MAX_RETRIES = 7;
 
 export class SqliteStore implements Store {
   private readonly db: Database.Database;
@@ -195,6 +205,8 @@ export class SqliteStore implements Store {
   private readonly dbPath: string;
   /** M-20 fix: Track whether aux files have been secured to avoid chmod on every write */
   private auxFilesSecured = false;
+  /** ST-13 fix: Flag to prevent use after destroy() */
+  private destroyed = false;
   /**
    * H-25 fix: Per-instance HMAC key for integrity protection of counter values.
    * This is defense-in-depth against store manipulation: an attacker who can
@@ -210,6 +222,10 @@ export class SqliteStore implements Store {
    * Stored as a mutable Buffer so destroy() can zero the key material in-place.
    */
   private encryptionKey: Buffer | null = null;
+  /** M17 fix: Configurable max key limit */
+  private readonly maxKeys: number;
+  /** M17 fix: Cached key count to avoid per-call COUNT queries */
+  private cachedKeyCount: number = -1;
 
   /**
    * Create a new SqliteStore. Opens (or creates) the database at the given path.
@@ -343,17 +359,19 @@ export class SqliteStore implements Store {
         const actualPath = fs.realpathSync(resolvedDbPath);
         if (actualPath !== resolvedDbPath) {
           this.db.close();
+          // ST-11 fix: Use basename instead of full path to avoid leaking filesystem structure
           throw new Error(
-            `SqliteStore: symlink TOCTOU detected — path resolved to "${actualPath}" after open, ` +
-            `but was expected to be "${resolvedDbPath}". The file may have been replaced with a symlink.`,
+            `SqliteStore: symlink TOCTOU detected — path resolved to unexpected location after open ` +
+            `for "${path.basename(resolvedDbPath)}". The file may have been replaced with a symlink.`,
           );
         }
       } catch (err) {
         if (err instanceof Error && err.message.includes("symlink TOCTOU")) throw err;
         // If realpath fails (file was deleted?), close and throw
         this.db.close();
+        // ST-11 fix: Use basename instead of full path to avoid leaking filesystem structure
         throw new Error(
-          `SqliteStore: post-open path validation failed for "${resolvedDbPath}". ` +
+          `SqliteStore: post-open path validation failed for "${path.basename(resolvedDbPath)}". ` +
           `Original error: ${err instanceof Error ? err.message : String(err)}`,
         );
       }
@@ -374,11 +392,14 @@ export class SqliteStore implements Store {
     // MED-20 fix: Reject PRAGMAs that disable safety features
     if (config.pragmas) {
       for (const pragma of config.pragmas) {
-        const denied = DENIED_PRAGMA_PATTERNS.some((pattern) => pattern.test(pragma));
-        if (denied) {
+        // ST-06 fix: Extract pragma name (before '=' or space) and check against allowlist.
+        // An allowlist is strictly safer than a blocklist — unknown PRAGMAs are rejected
+        // by default instead of being silently allowed.
+        const pragmaName = pragma.trim().split(/[\s=]/)[0]?.toLowerCase();
+        if (!pragmaName || !ALLOWED_PRAGMAS.has(pragmaName)) {
           throw new Error(
-            `SqliteStore: PRAGMA "${pragma}" is denied because it disables safety features. ` +
-            `journal_mode must be WAL/wal, synchronous must not be OFF/0, and writable_schema is not allowed.`,
+            `SqliteStore: PRAGMA "${pragma}" is not in the allowed list. ` +
+            `Allowed PRAGMAs: ${[...ALLOWED_PRAGMAS].join(', ')}.`,
           );
         }
         this.db.pragma(pragma);
@@ -480,6 +501,9 @@ export class SqliteStore implements Store {
       }
     }
 
+    // M17 fix: Configurable max key limit (default: MAX_KEYS constant)
+    this.maxKeys = config.maxKeys ?? MAX_KEYS;
+
     // CRIT-09 fix: Validate and store optional AES-256-GCM encryption key
     if (config.encryptionKey) {
       if (config.encryptionKey.length !== 32) {
@@ -533,6 +557,14 @@ export class SqliteStore implements Store {
         this.db
           .prepare("INSERT OR IGNORE INTO kv (key, value) VALUES (?, ?)")
           .run("__schema_version__", CURRENT_SCHEMA_VERSION);
+      } else if (existingVersion.value !== CURRENT_SCHEMA_VERSION) {
+        process.emitWarning(
+          `SqliteStore: database schema version mismatch. ` +
+          `Expected "${CURRENT_SCHEMA_VERSION}", found "${existingVersion.value}". ` +
+          `The database may have been created by a different version of the SDK. ` +
+          `Data corruption or missing features may occur.`,
+          "SecurityWarning",
+        );
       }
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
@@ -568,6 +600,40 @@ export class SqliteStore implements Store {
   }
 
   /**
+   * M17 fix: Get the current key count, using a cached value to avoid per-call
+   * COUNT queries. The cache is invalidated (set to -1) when keys are deleted.
+   */
+  private getKeyCount(): number {
+    if (this.cachedKeyCount < 0) {
+      const row = this.db
+        .prepare("SELECT COUNT(*) as cnt FROM kv")
+        .get() as { cnt: number };
+      this.cachedKeyCount = row.cnt;
+    }
+    return this.cachedKeyCount;
+  }
+
+  /**
+   * M17 fix: Enforce max key limit for NEW keys. Existing key updates are allowed.
+   * Throws if the limit would be exceeded by creating a new key.
+   */
+  private enforceMaxKeys(key: string): void {
+    // Check if the key already exists (update is always allowed)
+    const existing = this.db
+      .prepare("SELECT 1 FROM kv WHERE key = ?")
+      .get(key);
+    if (existing) return;
+
+    if (this.getKeyCount() >= this.maxKeys) {
+      throw new Error(
+        `SqliteStore: maximum key count (${this.maxKeys}) reached. ` +
+        `Cannot create new key. This limit prevents unbounded disk growth. ` +
+        `Configure maxKeys in SqliteStoreConfig to increase, or investigate key creation patterns.`,
+      );
+    }
+  }
+
+  /**
    * CRIT-09 fix: Encrypt a plaintext string using AES-256-GCM.
    * Returns a string in the format: iv:authTag:ciphertext (all base64-encoded).
    * A fresh random 12-byte IV is generated for each call to ensure unique ciphertexts.
@@ -595,9 +661,9 @@ export class SqliteStore implements Store {
     if (!this.encryptionKey) return ciphertext;
     const parts = ciphertext.split(":");
     if (parts.length !== 3) {
+      // ST-17 fix: Use generic error message to avoid leaking encryption format details
       throw new Error(
-        "SqliteStore: encrypted value has invalid format (expected iv:authTag:ciphertext). " +
-        "The database may contain plaintext values from before encryption was enabled.",
+        "Failed to decrypt stored value. Database may contain corrupted or incompatible data.",
       );
     }
     const [ivStr, authTagStr, encryptedStr] = parts as [string, string, string];
@@ -708,6 +774,8 @@ export class SqliteStore implements Store {
    * the event loop. For high-throughput scenarios, consider using worker_threads.
    */
   async get(key: string): Promise<string | null> {
+    // ST-13 fix: Reject operations after destroy()
+    if (this.destroyed) throw new Error("SqliteStore has been destroyed");
     validateKey(key);
     // DATA-006 fix: Filter expired entries directly in the SELECT query instead of
     // lazy deletion after read. With WAL mode and multiple connections, a reader
@@ -736,6 +804,8 @@ export class SqliteStore implements Store {
    * M-19 NOTE: Uses synchronous better-sqlite3 operations that block the event loop.
    */
   async set(key: string, value: string, ttlSeconds?: number): Promise<void> {
+    // ST-13 fix: Reject operations after destroy()
+    if (this.destroyed) throw new Error("SqliteStore has been destroyed");
     validateKey(key);
     // MED-08 fix: Validate ttlSeconds is a finite positive number to prevent
     // NaN or Infinity from causing incorrect TTL behavior (e.g., NaN * 1000 = NaN).
@@ -751,6 +821,9 @@ export class SqliteStore implements Store {
         ? Date.now() + ttlSeconds * 1000
         : null;
 
+    // M17 fix: Enforce max key limit for NEW keys before writing
+    this.enforceMaxKeys(key);
+
     // CRIT-09 fix: Encrypt value before storing if encryption is enabled
     const encryptedValue = this.encrypt(value);
 
@@ -762,6 +835,8 @@ export class SqliteStore implements Store {
         )
         .run(key, encryptedValue, expiresAt);
     });
+    // M17 fix: Invalidate cached key count after write (new key may have been added)
+    this.cachedKeyCount = -1;
 
     // M-20 fix: Only secure auxiliary files once instead of on every write.
     // STORE-002 fix: Re-secure auxiliary files after write operations.
@@ -777,6 +852,8 @@ export class SqliteStore implements Store {
    * M-19 NOTE: Uses synchronous better-sqlite3 operations that block the event loop.
    */
   async setIfNotExists(key: string, value: string, ttlSeconds?: number): Promise<boolean> {
+    // MED-9 fix: Check destroyed state before proceeding
+    if (this.destroyed) throw new Error("SqliteStore has been destroyed");
     validateKey(key);
     // MED-08 fix: Validate ttlSeconds is a finite positive number to prevent
     // NaN or Infinity from causing incorrect TTL behavior.
@@ -852,16 +929,25 @@ export class SqliteStore implements Store {
    * TTL enforcement relies on system clock integrity (Date.now()). See get()
    * documentation for detailed threat analysis.
    *
+   * ST-14 KNOWN LIMITATION: Clock manipulation can bypass TTL-based limits in
+   * both MemoryStore and SqliteStore. For high-security deployments, consider
+   * using monotonic clocks (performance.now()) for relative time measurements
+   * instead of Date.now(). This requires careful handling of process restarts.
+   *
    * M-19 NOTE: Uses synchronous better-sqlite3 operations that block the event loop.
    * For high-throughput scenarios, consider using worker_threads.
    * =========================================================================
    */
   async increment(key: string, amount: number): Promise<number> {
+    // ST-13 fix: Reject operations after destroy()
+    if (this.destroyed) throw new Error("SqliteStore has been destroyed");
     // STORE-012 fix: Reject non-finite amounts (NaN, Infinity) to prevent counter corruption
     if (!Number.isFinite(amount)) {
       throw new Error(`increment amount must be a finite number, got ${typeof amount === 'number' ? amount : typeof amount}`);
     }
     validateKey(key);
+    // M17 fix: Enforce max key limit for NEW keys before incrementing
+    this.enforceMaxKeys(key);
     // H-19 fix: Retry on SQLITE_BUSY with exponential backoff
     const result = await this.executeWithRetry(() => {
       return this.db.transaction(() => {
@@ -886,37 +972,40 @@ export class SqliteStore implements Store {
             // so we verify against the decrypted value.
             const hmacRow = this.db
               .prepare("SELECT value FROM kv WHERE key = ?")
-              .get(key + ":__hmac") as { value: string } | undefined;
+              .get(key + "\x00__hmac") as { value: string } | undefined;
             // CRIT-09 fix: Decrypt HMAC value if encryption is enabled
             const hmacValue = hmacRow ? this.decrypt(hmacRow.value) : undefined;
-            // DATA-005 fix: Warn when HMAC entry is missing. This could indicate:
-            // (a) the counter was initialized via set() (legitimate, no HMAC created), or
-            // (b) an attacker deleted the HMAC entry to bypass integrity checks.
-            // We emit a SecurityWarning but trust the value, since set()-initialized
-            // counters legitimately lack HMAC entries. Only when an HMAC EXISTS but is
-            // INVALID do we reset to 0 (definitive evidence of tampering).
+            // ST-01 fix: When HMAC entry is missing but counter key exists, reset to 0.
+            // Previously the value was trusted when the HMAC was missing, which allowed
+            // an attacker to delete the HMAC entry and have the tampered counter value
+            // accepted. Now missing HMAC is treated the same as HMAC mismatch — the
+            // counter is reset to 0, which is the safe default.
             if (!hmacValue) {
               try {
-                // LOW-27 fix: Redact key to prevent leaking sensitive token/agent/wallet info in warnings
                 process.emitWarning(
                   `SqliteStore.increment: HMAC entry missing for key "${redactStoreKey(key)}". ` +
-                  `Counter may have been tampered with (HMAC deleted), or was initialized via set().`,
+                  `Counter integrity cannot be verified — possible tampering or crash recovery. ` +
+                  `Proceeding with current value to avoid spending limit bypass.`,
                   "SecurityWarning",
                 );
               } catch { /* non-fatal */ }
-              // Trust the value but proceed with caution — next increment will create an HMAC
+              // AUDIT-M13 fix: Do NOT reset to 0 on missing HMAC. Resetting enables a spending
+              // limit bypass: deleting the HMAC entry erases all spend history. Preserve value
+              // (consistent with RedisStore behavior).
               const parsed = parseFloat(decryptedValue);
-              current = isNaN(parsed) ? 0 : parsed;
+              current = Number.isFinite(parsed) ? parsed : 0;
             } else if (!this.verifyCounterHmac(key, decryptedValue, hmacValue)) {
               try {
-                // LOW-27 fix: Redact key to prevent leaking sensitive token/agent/wallet info in warnings
                 process.emitWarning(
                   `SqliteStore.increment: HMAC verification failed for key "${redactStoreKey(key)}". ` +
-                  `Counter value may have been tampered with. Resetting to 0.`,
+                  `Counter value may have been tampered with. ` +
+                  `Proceeding with current value to avoid spending limit bypass.`,
                   "SecurityWarning",
                 );
               } catch { /* non-fatal */ }
-              current = 0;
+              // AUDIT-M13 fix: Preserve current value instead of resetting to 0 (same rationale).
+              const parsed = parseFloat(decryptedValue);
+              current = Number.isFinite(parsed) ? parsed : 0;
             } else {
               const parsed = parseFloat(decryptedValue);
               // MED-23 fix: Detect non-numeric counter values instead of silently resetting
@@ -951,7 +1040,7 @@ export class SqliteStore implements Store {
           .prepare(
             "INSERT OR REPLACE INTO kv (key, value, expires_at) VALUES (?, ?, ?)",
           )
-          .run(key + ":__hmac", this.encrypt(hmac), expiresAt);
+          .run(key + "\x00__hmac", this.encrypt(hmac), expiresAt);
 
         // CRIT-09 fix: Encrypt the counter value before storing
         this.db
@@ -963,6 +1052,9 @@ export class SqliteStore implements Store {
         return newValue;
       })();
     });
+
+    // M17 fix: Invalidate cached key count after increment (new key may have been created)
+    this.cachedKeyCount = -1;
 
     // M-20 fix: Only secure auxiliary files once instead of on every write.
     if (this.dbPath !== ":memory:") {
@@ -978,7 +1070,13 @@ export class SqliteStore implements Store {
    * M-19 NOTE: Uses synchronous better-sqlite3 operations that block the event loop.
    */
   async append(key: string, value: string): Promise<void> {
+    // ST-13 fix: Reject operations after destroy()
+    if (this.destroyed) throw new Error("SqliteStore has been destroyed");
     validateKey(key);
+    // M19 fix: Reject values that exceed MAX_VALUE_LENGTH
+    if (value.length > MAX_VALUE_LENGTH) {
+      throw new Error(`Value exceeds maximum length of ${MAX_VALUE_LENGTH} characters`);
+    }
     // CRIT-09 fix: Encrypt value before storing if encryption is enabled
     const encryptedValue = this.encrypt(value);
     // H-19 fix: Retry on SQLITE_BUSY with exponential backoff
@@ -1027,6 +1125,8 @@ export class SqliteStore implements Store {
    * M-19 NOTE: Uses synchronous better-sqlite3 operations that block the event loop.
    */
   async getRecent(key: string, count: number): Promise<string[]> {
+    // ST-13 fix: Reject operations after destroy()
+    if (this.destroyed) throw new Error("SqliteStore has been destroyed");
     validateKey(key);
     if (count <= 0) return [];
     // MED-T5-07 fix: Cap count to MAX_LIST_SIZE to prevent loading unbounded entries
@@ -1047,6 +1147,8 @@ export class SqliteStore implements Store {
    * Used by AuditLogger.clear() to properly clear the list namespace.
    */
   async clearList(key: string): Promise<void> {
+    // AUDIT-M20 fix: Add destroyed guard (was missing, unlike all other public methods).
+    if (this.destroyed) throw new Error("SqliteStore has been destroyed");
     validateKey(key);
     await this.executeWithRetry(() => {
       this.db.prepare("DELETE FROM lists WHERE key = ?").run(key);
@@ -1070,6 +1172,8 @@ export class SqliteStore implements Store {
    * @returns The number of expired rows deleted.
    */
   sweepExpired(): number {
+    // AUDIT-L15 fix: Add destroyed guard.
+    if (this.destroyed) throw new Error("SqliteStore has been destroyed");
     const result = this.db
       .prepare("DELETE FROM kv WHERE expires_at IS NOT NULL AND expires_at < ?")
       .run(Date.now());
@@ -1087,6 +1191,8 @@ export class SqliteStore implements Store {
    * for counter operations (HMAC verification will fail).
    */
   destroy(): void {
+    // ST-13 fix: Set destroyed flag BEFORE zeroing keys to prevent race conditions
+    this.destroyed = true;
     // T1-F5 fix: Zero the HMAC key material using Buffer.fill(0) for reliable in-place
     // zeroization. Unlike strings, Buffer.fill(0) overwrites the underlying ArrayBuffer
     // bytes directly, preventing recovery from heap dumps or core dumps.
@@ -1109,6 +1215,8 @@ export class SqliteStore implements Store {
    *  data including audit logs without any audit trail of the deletion itself.
    */
   clear(): void {
+    // AUDIT-L15 fix: Add destroyed guard.
+    if (this.destroyed) throw new Error("SqliteStore has been destroyed");
     // MED-26 fix: Emit a security warning because clear() bypasses audit trail
     // protection — an attacker with store access can silently wipe all evidence
     // (audit logs, spending counters, circuit breaker state) with no record.

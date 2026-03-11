@@ -2,6 +2,25 @@
  * Transaction results — structured responses from wallet operations.
  */
 
+/**
+ * LOW-10 FIX: Maximum number of warnings that can be attached to a TransactionResult.
+ * Prevents memory exhaustion from a malicious or buggy chain adapter appending
+ * unlimited warnings. Excess warnings are silently dropped.
+ */
+export const MAX_RESULT_WARNINGS = 20;
+
+/**
+ * LOW-10 FIX: Safely append a warning to a TransactionResult's warnings array,
+ * enforcing the MAX_RESULT_WARNINGS cap. Returns the (possibly new) warnings array.
+ */
+export function appendWarning(warnings: string[] | undefined, warning: string): string[] {
+  const arr = warnings ?? [];
+  if (arr.length < MAX_RESULT_WARNINGS) {
+    arr.push(warning);
+  }
+  return arr;
+}
+
 export type TransactionStatus = "confirmed" | "failed" | "pending" | "denied";
 
 /**
@@ -36,6 +55,12 @@ export type TransactionResult =
       timestamp: number;
       error?: never;
       chainData?: Record<string, unknown>;
+      /**
+       * C-03 fix: Non-fatal warnings (e.g., audit logging failure after confirmed broadcast)
+       * LOW-10 FIX: Capped at MAX_RESULT_WARNINGS (20) entries. Use appendWarning() helper
+       * to safely add warnings with automatic cap enforcement.
+       */
+      warnings?: string[];
     }
   | {
       status: "denied";
@@ -45,6 +70,7 @@ export type TransactionResult =
       error?: TransactionError;
       txId?: never;
       chainData?: Record<string, unknown>;
+      warnings?: string[];
     }
   | {
       status: "failed";
@@ -54,6 +80,7 @@ export type TransactionResult =
       error?: TransactionError;
       txId?: never;
       chainData?: Record<string, unknown>;
+      warnings?: string[];
     }
   | {
       status: "pending";
@@ -63,6 +90,7 @@ export type TransactionResult =
       error?: never;
       txId?: never;
       chainData?: Record<string, unknown>;
+      warnings?: string[];
     };
 
 export interface TransactionError {

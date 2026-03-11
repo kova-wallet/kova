@@ -1,6 +1,6 @@
 /**
  * Store interface — pluggable persistence for spending counters, rate limits, and tx logs.
- * Deliberately minimal (6 operations) to make adapters trivial to implement.
+ * Deliberately minimal (7 operations) to make adapters trivial to implement.
  *
  * HIGH-25 KEY-SCOPING REQUIREMENTS:
  * When multiple AgentWallet instances share the same Store backend, keys from
@@ -48,11 +48,6 @@ export interface Store {
   /** Get the most recent N entries from a list. */
   getRecent(key: string, count: number): Promise<string[]>;
 
-  /**
-   * MED-T5-09 fix: Clear all entries in a list.
-   * Optional — only required for audit log clearing. Custom Store implementations
-   * that do not implement this method will fall back to a no-op in AuditLogger.clear(),
-   * leaving orphaned list entries in the store.
-   */
-  clearList?(key: string): Promise<void>;
+  /** Clear all entries in a list (for audit log clearing, GC, etc.). */
+  clearList(key: string): Promise<void>;
 }

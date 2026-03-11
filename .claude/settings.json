@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx -y @solana/web3.js@1 -e ':*)",
+      "Bash(git -C /Users/haythembalti/Documents/kova-wallet ls-files)",
+      "Bash(tee /tmp/test-results.txt)",
+      "Bash(node --loader ts-node/esm -e \":*)"
+    ],
+    "additionalDirectories": [
+      "/private/tmp",
+      "/Users/haythembalti/Documents/kova-wallet",
+      "/Users/haythembalti/Documents/kova-wallet/src/chains/solana"
+    ]
+  }
+}

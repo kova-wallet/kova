@@ -9,7 +9,15 @@
  * are present, types are correct, and unknown properties are stripped.
  */
 
-import { getFilteredTools } from "./tools.js";
+import { getFilteredTools, safeHandleToolCall, sanitizeToolResponse, TOOL_CALL_TIMEOUT_MS } from "./tools.js";
+
+/**
+ * A-04: Minimal wallet interface for adapter usage.
+ * Avoids coupling to the full AgentWallet class.
+ */
+interface AgentWalletLike {
+  handleToolCall: (name: string, input: Record<string, unknown>, authToken?: string) => Promise<unknown>;
+}
 
 /** OpenAI tool shape as expected by the Chat Completions API */
 export interface OpenAITool {
@@ -28,6 +36,17 @@ export interface OpenAITool {
 /**
  * Convert canonical wallet tool definitions to OpenAI's function calling format.
  * Wraps each tool in { type: "function", function: { ... } }.
+ *
+ * @deprecated Use `createOpenAITools(wallet, options).definitions` instead.
+ * This function returns raw tool definitions without the safety wrapper.
+ *
+ * @security Using this function directly bypasses auth, rate limiting, and input
+ * sanitization enforced by `safeHandleToolCall()`. Consumers who use these raw
+ * definitions must manually call `safeHandleToolCall()` and `sanitizeToolResponse()`
+ * or risk exposing unprotected wallet operations.
+ *
+ * @warning Callers MUST use safeHandleToolCall() and sanitizeToolResponse() on results.
+ * Prefer createOpenAITools() which handles this automatically.
  *
  * API-009: This adapter performs format conversion only and does not enforce execution
  * timeouts. Execution timeouts for tool calls should be handled at the application level
@@ -53,4 +72,64 @@ export function toOpenAITools(options?: { includeDangerous?: boolean; exclude?: 
       },
     },
   }));
+}
+
+/**
+ * A-04/A-11/A-12/A-14: Create OpenAI-compatible tools with safe execution wrapper.
+ *
+ * Returns tool definitions and a handleToolCall function that:
+ * - Validates inputs via safeHandleToolCall (A-04)
+ * - Sanitizes responses via sanitizeToolResponse (A-04)
+ * - Enforces execution timeout via Promise.race (A-11)
+ * - Catches errors and returns generic error messages (A-12)
+ * - Forwards optional authToken for authentication (A-14)
+ *
+ * @param wallet - Wallet instance with handleToolCall method
+ * @param options - Optional filtering and auth options
+ */
+export function createOpenAITools(
+  wallet: AgentWalletLike,
+  options?: {
+    includeDangerous?: boolean;
+    exclude?: string[];
+    authToken?: string;
+    /**
+     * M32: Optional function that returns the current auth token on each call.
+     * When set, this is called on every handleToolCall invocation to support
+     * token rotation. Falls back to the static `authToken` if not provided.
+     */
+    authTokenProvider?: () => string | undefined;
+  },
+): {
+  definitions: ReturnType<typeof toOpenAITools>;
+  handleToolCall: (name: string, input: Record<string, unknown>) => Promise<string>;
+} {
+  const definitions = toOpenAITools(options);
+  return {
+    definitions,
+    handleToolCall: async (name: string, input: Record<string, unknown>): Promise<string> => {
+      // M32: Resolve auth token per-call to support token rotation
+      const authToken = options?.authTokenProvider?.() ?? options?.authToken;
+      try {
+        // A-11: Wrap in timeout to prevent indefinite hangs
+        let timeoutId: ReturnType<typeof setTimeout>;
+        const result = await Promise.race([
+          safeHandleToolCall(wallet, name, input, authToken),
+          new Promise<never>((_, reject) => {
+            timeoutId = setTimeout(
+              () => reject(new Error(`Tool call "${name}" timed out after ${TOOL_CALL_TIMEOUT_MS}ms`)),
+              TOOL_CALL_TIMEOUT_MS,
+            );
+          }),
+        ]).finally(() => clearTimeout(timeoutId));
+        return sanitizeToolResponse(name, result);
+      } catch {
+        // A-12: Return generic error message — do not leak internal details
+        return sanitizeToolResponse(name, {
+          success: false,
+          error: "An internal error occurred while processing the tool call.",
+        });
+      }
+    },
+  };
 }

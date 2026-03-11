@@ -22,6 +22,13 @@ export interface MpcSignResult {
 /**
  * Interface that MPC backend adapters must implement.
  *
+ * **Security: TLS Required for Production Use**
+ * All MPC provider implementations MUST communicate with their backend over TLS (HTTPS).
+ * MPC signing involves sending transaction data to a remote service; using plaintext HTTP
+ * exposes transaction contents, API credentials, and signed results to network attackers.
+ * Implementations that accept a URL or endpoint configuration should validate that the
+ * URL scheme is "https://" and reject or warn on non-HTTPS URLs.
+ *
  * Example:
  * ```typescript
  * class TurnkeyProvider implements MpcSigningProvider {
@@ -85,6 +92,15 @@ export class MpcSignerError extends Error {
     this.name = "MpcSignerError";
     this.code = code;
     this.provider = provider;
+  }
+
+  toJSON() {
+    return {
+      name: this.name,
+      code: this.code,
+      message: this.message,
+      provider: "[REDACTED]",
+    };
   }
 }
 
@@ -271,11 +287,12 @@ function decodeRlpTransaction(raw: Uint8Array): RlpTransactionFields {
 }
 
 /** HIGH-03 fix: Expected signature lengths per chain algorithm */
-const EXPECTED_SIGNATURE_LENGTHS: Record<string, number> = {
+// AUDIT-H15 fix: Freeze to prevent runtime mutation that could bypass signature length validation.
+const EXPECTED_SIGNATURE_LENGTHS: Readonly<Record<string, number>> = Object.freeze({
   solana: 64,    // Ed25519
   ethereum: 65,  // ECDSA secp256k1 (r + s + v)
   base: 65,      // ECDSA secp256k1 (r + s + v)
-};
+});
 
 export class MpcSigner implements Signer {
   private readonly provider: MpcSigningProvider;
@@ -319,12 +336,12 @@ export class MpcSigner implements Signer {
 
     // HIGH-02 fix: Validate address format from the provider.
     // The provider could return garbage, empty strings, or excessively long values.
-    if (typeof address !== "string" || address.length === 0 || address.length > 128) {
+    if (typeof address !== "string" || address.length === 0 || address.length > 64) {
       throw new MpcSignerError(
         "PROVIDER_ERROR",
         this.provider.name,
         `MPC provider returned invalid address: ` +
-        `expected non-empty string with 1-128 chars, got ${typeof address === "string" ? `"${address}" (${address.length} chars)` : typeof address}`,
+        `expected non-empty string with 1-64 chars, got ${typeof address === "string" ? `"${address}" (${address.length} chars)` : typeof address}`,
       );
     }
 
@@ -663,10 +680,15 @@ export class MpcSigner implements Signer {
 
         // Compare critical transaction fields
         const fieldsToCompare = ["nonce", "to", "value", "data"] as const;
+        // CRIT-5 fix: Import timingSafeEqual for constant-time field comparison
+        const { timingSafeEqual: tsEqualFields } = await import("crypto");
         for (const field of fieldsToCompare) {
           const origVal = originalFields[field];
           const signedVal = signedFields[field];
-          if (origVal !== signedVal) {
+          // CRIT-5 fix: Use constant-time comparison to prevent timing side-channel leakage
+          const origBuf = Buffer.from(String(origVal), "utf8");
+          const signedBuf = Buffer.from(String(signedVal), "utf8");
+          if (origBuf.length !== signedBuf.length || !tsEqualFields(origBuf, signedBuf)) {
             throw new MpcSignerError(
               "PROVIDER_ERROR",
               this.provider.name,
@@ -696,7 +718,10 @@ export class MpcSigner implements Signer {
         if (gasPriceField && signedGasPriceField && gasPriceField !== signedGasPriceField) {
           const origPrice = BigInt(gasPriceField || "0");
           const signedPrice = BigInt(signedGasPriceField || "0");
-          if (signedPrice > origPrice * 2n) {
+          // S-07 fix: Tightened from 2x to 1.5x. A 2x multiplier allows up to 1.99x inflation,
+          // which is excessive for gas price changes. 1.5x provides a reasonable buffer for
+          // network fee fluctuations while limiting fee inflation attack surface.
+          if (signedPrice > origPrice * 3n / 2n) {
             throw new MpcSignerError(
               "PROVIDER_ERROR",
               this.provider.name,
@@ -863,7 +888,9 @@ export class MpcSigner implements Signer {
         if (attempt === this.maxRetries) break;
         // CRYPTO-016 fix: Exponential backoff between retries (1s, 2s, 4s, ... capped at 10s)
         if (attempt < this.maxRetries) {
-          const delay = Math.min(1000 * Math.pow(2, attempt), 10000) * (0.5 + Math.random() * 0.5);
+          // S-09 fix: Use cryptographically secure randomness for retry jitter instead of Math.random()
+          const jitterRandom = globalThis.crypto.getRandomValues(new Uint32Array(1))[0]! / 0xFFFFFFFF;
+          const delay = Math.min(1000 * Math.pow(2, attempt), 10000) * (0.5 + jitterRandom * 0.5);
           await new Promise(resolve => setTimeout(resolve, delay));
         }
       }
@@ -873,7 +900,11 @@ export class MpcSigner implements Signer {
     const rawMessage = lastError instanceof Error ? lastError.message : String(lastError);
     const sanitized = rawMessage
       .replace(/https?:\/\/[^\s)}\]"']+/gi, "[URL_REDACTED]")
-      .replace(/\b\d{4,}\b/g, "[NUM_REDACTED]");
+      .replace(/\b\d{4,}\b/g, "[NUM_REDACTED]")
+      // S-13 fix: Additional regex patterns to sanitize UUIDs, long hex strings, and base64 blobs
+      .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, "[UUID_REDACTED]")
+      .replace(/[0-9a-f]{32,}/gi, "[HEX_REDACTED]")
+      .replace(/[A-Za-z0-9+/]{40,}={0,2}/g, "[BASE64_REDACTED]");
     throw new MpcSignerError(
       "PROVIDER_ERROR",
       this.provider.name,

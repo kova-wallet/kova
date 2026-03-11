@@ -76,7 +76,7 @@ interface Signer {
   /** Zero out key material and prevent further signing */
   // Destroys the private key from memory. After calling destroy(),
   // any subsequent sign() calls will throw an error.
-  destroy(): void;
+  destroy(): Promise<void>;
 
   /** Safe JSON serialization (never includes secret key) */
   // Returns only the public address, preventing accidental key leakage

@@ -1,8 +1,7 @@
 /**
  * SolanaAdapter — Chain adapter for Solana.
  *
- * Sprint 3: Real RPC integration via @solana/web3.js.
- * Delegates to transfers.ts, swaps.ts, and utils.ts for specific operations.
+ * Delegates to transfers.ts and utils.ts for specific operations.
  */
 
 import { createHash, timingSafeEqual } from "node:crypto";
@@ -32,9 +31,8 @@ import type { ChainAdapter, TransactionStatusResult, SimulationResult } from "..
 import type { TransactionIntent } from "../../core/intent.js";
 import type { UnsignedTransaction } from "../../signers/interface.js";
 import type { TokenBalance } from "../../core/result.js";
-import { isTransferIntent, isSwapIntent } from "../../core/intent.js";
+import { isTransferIntent } from "../../core/intent.js";
 import { buildSOLTransfer, buildSPLTransfer } from "./transfers.js";
-import { buildJupiterSwap, getTokenPriceUSD, JupiterRateLimiter } from "./swaps.js";
 import {
   isNativeSOL,
   isValidSolanaAddress,
@@ -51,10 +49,6 @@ export interface SolanaAdapterConfig {
   rpcUrl: string;
   /** Commitment level for transaction confirmation */
   commitment?: "processed" | "confirmed" | "finalized";
-  /** Jupiter API URL for swaps */
-  jupiterApiUrl?: string;
-  /** Jupiter Price API URL for USD valuation */
-  jupiterPriceApiUrl?: string;
   /**
    * MED-01 fix: Explicit network selection instead of URL sniffing.
    * Determines which token registry (mainnet vs devnet mint addresses) is used.
@@ -62,6 +56,21 @@ export interface SolanaAdapterConfig {
    * which could misidentify URLs like "https://rpc.mainnet.com/devnet-proxy".
    */
   network?: "mainnet-beta" | "devnet" | "testnet" | "auto";
+  /**
+   * SOL-09 fix: Per-instance DNS cache for multi-tenant deployments.
+   * When provided, this cache is used instead of the module-level shared cache,
+   * ensuring DNS resolution isolation between adapter instances. Each cache entry
+   * maps a hostname to its resolved IP, address family, and resolution timestamp.
+   * If not provided, the default module-level cache is used (acceptable for
+   * single-tenant deployments).
+   */
+  dnsCache?: Map<string, { resolvedIp: string; family: 4 | 6; resolvedAt: number }>;
+  /**
+   * Optional price provider function for USD valuation.
+   * Used by getValueInUSD() for spending limit enforcement.
+   * If not provided, getValueInUSD() will throw PRICE_UNAVAILABLE.
+   */
+  priceProvider?: (token: string) => Promise<number | null>;
 }
 
 /**
@@ -145,6 +154,11 @@ interface DnsCacheEntry {
  * isolation, use separate processes or worker_threads.
  */
 // AUDIT-L-9: Module-level DNS cache shared across instances. Accepted for single-tenant.
+// SOL-09 KNOWN LIMITATION: This DNS cache is module-level and shared across ALL
+// SolanaAdapter instances in the same Node.js process. In multi-tenant deployments,
+// a compromised DNS response cached by one adapter affects all wallets' SSRF protection.
+// For multi-tenant isolation, provide a per-instance dnsCache via SolanaAdapterConfig.dnsCache
+// or run each tenant in a separate process/worker_thread.
 const dnsCache = new Map<string, DnsCacheEntry>();
 const DNS_CACHE_TTL_MS = 60_000; // 60 seconds
 /**
@@ -423,14 +437,6 @@ export class SolanaAdapter implements ChainAdapter {
   private readonly config: SolanaAdapterConfig;
   private readonly isDevnet: boolean;
   /**
-   * MED-T2-03 fix: Per-instance Jupiter API rate limiter.
-   * Previously, the rate limiter was module-global in swaps.ts, causing all
-   * adapter instances to share a single rate limit counter. This could lead
-   * to unexpected throttling in multi-wallet or multi-tenant scenarios.
-   */
-  private readonly jupiterRateLimiter = new JupiterRateLimiter();
-
-  /**
    * CHAIN-001 fix: Track when DNS was last eagerly validated for configured URLs.
    * The pinned agent's lookup function handles per-request IP validation via the
    * DNS cache, but we also eagerly warm the cache before the first request and
@@ -452,20 +458,26 @@ export class SolanaAdapter implements ChainAdapter {
   constructor(config: SolanaAdapterConfig) {
     // HIGH-07/08 fix: Validate all URLs before using them
     validateRpcUrl(config.rpcUrl, "RPC");
-    if (config.jupiterApiUrl) validateRpcUrl(config.jupiterApiUrl, "Jupiter API");
-    if (config.jupiterPriceApiUrl) validateRpcUrl(config.jupiterPriceApiUrl, "Jupiter Price API");
 
     this.config = config;
+
+    // AUDIT-MED-12: Warn when commitment level is "processed" — this is the weakest
+    // commitment level and means transactions may be confirmed by a single validator
+    // but not yet voted on by the cluster. A "processed" transaction can be dropped
+    // during a fork, leading to false-positive confirmations. For financial transactions,
+    // use "confirmed" (voted on by supermajority) or "finalized" (rooted, irreversible).
+    if (config.commitment === "processed") {
+      process.emitWarning(
+        `SolanaAdapter commitment level is "processed", which provides weak consistency guarantees. ` +
+        `Transactions confirmed at "processed" level may be dropped during forks. ` +
+        `For financial transactions, use "confirmed" or "finalized" commitment.`,
+        { code: "KOVA_WEAK_COMMITMENT" },
+      );
+    }
 
     // T2-2.2 fix: Track hostnames this adapter resolves so destroy() can
     // clear only this instance's DNS cache entries, not the entire cache.
     try { this.instanceHostnames.add(new URL(config.rpcUrl).hostname.toLowerCase()); } catch { /* ignore */ }
-    if (config.jupiterApiUrl) {
-      try { this.instanceHostnames.add(new URL(config.jupiterApiUrl).hostname.toLowerCase()); } catch { /* ignore */ }
-    }
-    if (config.jupiterPriceApiUrl) {
-      try { this.instanceHostnames.add(new URL(config.jupiterPriceApiUrl).hostname.toLowerCase()); } catch { /* ignore */ }
-    }
 
     // CHAIN-001 fix: Create Connection with an IP-pinning HTTP agent.
     // The agent's custom `lookup` function returns only pre-validated, cached IPs
@@ -523,12 +535,6 @@ export class SolanaAdapter implements ChainAdapter {
       return;
     }
     await resolveAndValidateDns(this.config.rpcUrl, "RPC");
-    if (this.config.jupiterApiUrl) {
-      await resolveAndValidateDns(this.config.jupiterApiUrl, "Jupiter API");
-    }
-    if (this.config.jupiterPriceApiUrl) {
-      await resolveAndValidateDns(this.config.jupiterPriceApiUrl, "Jupiter Price API");
-    }
     this.dnsValidatedAt = now;
   }
 
@@ -553,23 +559,16 @@ export class SolanaAdapter implements ChainAdapter {
       const lamports = await this.connection.getBalance(pubkey);
       const amount = fromSmallestUnit(BigInt(lamports), 9);
 
-      // LOW-T2-04 fix: usdValue is undefined when price cannot be determined for a
-      // non-zero balance (price API failure or null price). This is distinct from
-      // usdValue: 0 which means balance is genuinely zero. Callers should treat
-      // undefined as "price unknown" and 0 as "known zero value".
       let usdValue: number | undefined;
-      try {
-        const price = await getTokenPriceUSD(
-          "SOL",
-          this.config.jupiterPriceApiUrl,
-          this.isDevnet,
-          this.jupiterRateLimiter,
-        );
-        if (price !== null) {
-          usdValue = parseFloat(amount) * price;
+      if (this.config.priceProvider) {
+        try {
+          const price = await this.config.priceProvider("SOL");
+          if (price !== null) {
+            usdValue = parseFloat(amount) * price;
+          }
+        } catch {
+          // Price fetch failure is non-fatal — usdValue remains undefined
         }
-      } catch {
-        // Price fetch failure is non-fatal — usdValue remains undefined
       }
 
       return { token, amount, decimals: 9, usdValue };
@@ -585,25 +584,36 @@ export class SolanaAdapter implements ChainAdapter {
     }
 
     const ata = getAssociatedTokenAddressSync(mint, pubkey);
-    const decimals = getTokenDecimals(token, this.isDevnet) ?? 0;
+    const rawDecimals = getTokenDecimals(token, this.isDevnet);
+    // AUDIT-LOW-5: getTokenDecimals returns null for unknown tokens, and we default to 0.
+    // A decimals value of 0 means the token is treated as having no fractional part,
+    // which will cause fromSmallestUnit() to return the raw integer amount without
+    // decimal point adjustment. For tokens that actually have decimals (e.g., 6 for USDC),
+    // this produces wildly incorrect balance display (e.g., 1000000 instead of 1.0).
+    // Callers should provide tokens with known decimals or query the mint account on-chain.
+    if (rawDecimals === null) {
+      process.emitWarning(
+        `Unknown decimals for token "${token}" — defaulting to 0. ` +
+        `Balance display may be incorrect. Query the mint account on-chain for accurate decimals.`,
+        { code: "KOVA_UNKNOWN_DECIMALS" },
+      );
+    }
+    const decimals = rawDecimals ?? 0;
 
     try {
       const account = await getAccount(this.connection, ata);
       const amount = fromSmallestUnit(account.amount, decimals);
 
       let usdValue: number | undefined;
-      try {
-        const price = await getTokenPriceUSD(
-          token,
-          this.config.jupiterPriceApiUrl,
-          this.isDevnet,
-          this.jupiterRateLimiter,
-        );
-        if (price !== null) {
-          usdValue = parseFloat(amount) * price;
+      if (this.config.priceProvider) {
+        try {
+          const price = await this.config.priceProvider(token);
+          if (price !== null) {
+            usdValue = parseFloat(amount) * price;
+          }
+        } catch {
+          /* non-fatal */
         }
-      } catch {
-        /* non-fatal */
       }
 
       return { token, amount, decimals, usdValue };
@@ -618,35 +628,25 @@ export class SolanaAdapter implements ChainAdapter {
   }
 
   /**
-   * Get the USD value of a token amount via Jupiter Price API.
-   * Falls back to $1 for stablecoins. Throws for unknown tokens (fail-closed).
-   *
-   * MED-14 limitation: parseFloat() is used to convert the amount string to a number
-   * for multiplication with the price. IEEE 754 double-precision floats have ~15-17
-   * significant decimal digits of precision. For very large amounts (> 2^53) or amounts
-   * requiring high precision (e.g., "999999999999999.123456789"), the result may have
-   * rounding errors. For spending limit enforcement, this is acceptable because the
-   * error is negligible relative to typical limit thresholds, but a BigDecimal library
-   * (e.g., decimal.js) would be more precise for high-value transactions.
+   * Get the USD value of a token amount via a pluggable price provider.
+   * Throws PRICE_UNAVAILABLE if no price provider is configured or price is null (fail-closed).
+   * Configure a priceProvider in SolanaAdapterConfig to enable USD valuation.
    */
   async getValueInUSD(token: string, amount: string): Promise<number> {
-    const price = await getTokenPriceUSD(
-      token,
-      this.config.jupiterPriceApiUrl,
-      this.isDevnet,
-      this.jupiterRateLimiter,
-    );
-
-    if (price === null) {
-      // CRIT-CROSS-02 fix: Fail-closed when price is unavailable for ALL tokens,
-      // including stablecoins. Previously, USDC/USDT fell back to a hardcoded $1
-      // price, which allowed transactions to bypass USD-denominated spending limits
-      // during depeg events (e.g., UST 2022, USDC 2023) or when the price API was
-      // unreachable. Now all tokens fail-closed when the oracle is unavailable,
-      // ensuring spending limits and approval gates cannot be bypassed.
+    if (!this.config.priceProvider) {
       throw new SolanaAdapterError(
         "PRICE_UNAVAILABLE",
-        `Cannot determine USD price for ${token}. Price oracle unavailable. ` +
+        `Cannot determine USD price for ${token}. No price provider configured. ` +
+        `Set priceProvider in SolanaAdapterConfig to enable USD-denominated limits.`,
+      );
+    }
+
+    const price = await this.config.priceProvider(token);
+
+    if (price === null) {
+      throw new SolanaAdapterError(
+        "PRICE_UNAVAILABLE",
+        `Cannot determine USD price for ${token}. Price provider returned null. ` +
         `All USD-denominated limits require a live price feed.`,
       );
     }
@@ -685,7 +685,7 @@ export class SolanaAdapter implements ChainAdapter {
    * CHAIN-004 WARNING — Blockhash Staleness Risk:
    * The transaction's recentBlockhash is set during this method call. Solana blockhashes
    * expire after ~60-90 seconds (~150 slots). If there is a delay between building the
-   * transaction and broadcasting it (e.g., waiting for human approval via Telegram or
+   * transaction and broadcasting it (e.g., waiting for human approval via human approval or
    * policy evaluation), the blockhash may become stale, causing "blockhash not found"
    * errors at broadcast time. The blockhash is baked into the signed transaction and
    * cannot be updated without rebuilding and re-signing.
@@ -714,27 +714,16 @@ export class SolanaAdapter implements ChainAdapter {
       );
     }
 
-    if (isSwapIntent(intent)) {
-      return buildJupiterSwap(
-        this.connection,
-        intent.params,
-        signerAddress,
-        this.config.jupiterApiUrl,
-        this.isDevnet,
-        undefined, // options
-        this.jupiterRateLimiter,
-      );
-    }
-
     throw new SolanaAdapterError(
       "UNSUPPORTED_INTENT",
-      `Intent type "${intent.type}" is not yet supported on Solana. Supported: transfer, swap.`,
+      `Intent type "${intent.type}" is not supported by the built-in Solana adapter. Supported: transfer. ` +
+      `For swaps, provide a pre-built transaction via the custom intent type.`,
     );
   }
 
   /**
    * CHAIN-004 fix: Refresh the blockhash on an unsigned transaction to prevent staleness.
-   * Call this after approval delays (e.g., Telegram approval) and before signing/broadcast.
+   * Call this after approval delays (e.g., human approval) and before signing/broadcast.
    * Returns a new UnsignedTransaction with an updated recentBlockhash and lastValidBlockHeight.
    *
    * Note: This returns a NEW unsigned transaction that must be re-signed. The old signed
@@ -930,15 +919,30 @@ export class SolanaAdapter implements ChainAdapter {
         const messageV0 = legacyTx.compileMessage();
         tx = new VersionedTransaction(messageV0);
       }
-      // H-20 fix: sigVerify is intentionally set to false because simulation occurs
-      // BEFORE the transaction is signed. At this point in the pipeline, the transaction
-      // has only been built (buildTransaction) but not yet passed to the signer. Setting
+      // AUDIT-HIGH-5: SIMULATION RUNS UNSIGNED (sigVerify: false)
+      // sigVerify is intentionally set to false because simulation occurs BEFORE the
+      // transaction is signed. At this point in the pipeline, the transaction has only
+      // been built (buildTransaction) but not yet passed to the signer. Setting
       // sigVerify: true would cause simulation to fail with "signature verification failed"
-      // for every transaction, since no valid signatures exist yet. The signing step happens
-      // after simulation passes, in the wallet execution pipeline:
+      // for every transaction, since no valid signatures exist yet.
+      //
+      // SECURITY IMPLICATION: Because sigVerify is false, the simulation does NOT verify
+      // that the transaction's signatures are valid. This means a malicious transaction
+      // could pass simulation even if it would fail signature verification at broadcast.
+      // The signing step happens after simulation in the wallet execution pipeline:
       //   buildTransaction -> simulateTransaction -> sign -> verifyIntegrity -> broadcast
       // The MED-10 check below (numRequiredSignatures > 1) mitigates the risk of
       // multi-signer transactions slipping through without proper authorization.
+      //
+      // AUDIT-HIGH-8: STALE BLOCKHASH NOT DETECTED BEFORE SIMULATION
+      // The transaction's recentBlockhash was set during buildTransaction(), which may
+      // have been called seconds or minutes earlier (e.g., during approval delays).
+      // simulateTransaction does NOT check whether the blockhash is still valid before
+      // running the simulation. A stale blockhash will cause the simulation to succeed
+      // but the subsequent broadcast to fail with "blockhash not found". The simulation
+      // result may also be inaccurate if the ledger state has changed significantly since
+      // the blockhash was fetched. Callers should use refreshBlockhash() before simulation
+      // if there has been any delay since buildTransaction().
       const simulation = await this.connection.simulateTransaction(tx, {
         sigVerify: false,
         commitment: this.config.commitment ?? "confirmed",
@@ -971,6 +975,18 @@ export class SolanaAdapter implements ChainAdapter {
       // Solana base fee = 5000 lamports per signature (not per compute unit).
       // Priority fee = computeUnits * microLamportsPerCU (not available from simulation).
       // We estimate: base fee (1 signature) + approximate priority from compute usage.
+      //
+      // AUDIT-MED-10: PRIORITY FEE NOT INCLUDED IN BALANCE CHECK
+      // This fee estimation does NOT include the actual priority fee set by addPriorityFee()
+      // in transfers.ts. The priority fee (ComputeBudgetProgram.setComputeUnitPrice) is
+      // embedded in the transaction instructions but not extracted here. The estimated fee
+      // below uses a conservative approximation (0.000000001 SOL per CU), which may
+      // significantly underestimate the actual fee when priority fees are high (e.g., during
+      // network congestion). The getBalance() pre-flight check in transfers.ts only accounts
+      // for the base fee (5000 lamports), not the priority fee. As a result, a transaction
+      // may pass the balance check but fail at broadcast due to insufficient lamports for
+      // the combined base + priority fee. The simulation step partially mitigates this
+      // because the simulated transaction includes the priority fee instructions.
       const baseFee = numSignatures * 5000; // 5000 lamports per signature
       const estimatedFee = (baseFee / 1e9) + (simulation.value.unitsConsumed
         ? simulation.value.unitsConsumed * 0.000000001 // conservative priority fee estimate
@@ -1002,7 +1018,7 @@ export class SolanaAdapter implements ChainAdapter {
    *
    * CHAIN-004 IMPORTANT -- Blockhash Staleness During Approval Delays:
    * The transaction's recentBlockhash is set during buildTransaction(), but broadcast
-   * may occur minutes later (e.g., after human approval via Telegram). Solana blockhashes
+   * may occur minutes later (e.g., after human human approval via webhook). Solana blockhashes
    * expire after ~60-90 seconds (~150 slots). If the approval takes longer, the
    * transaction WILL fail with "blockhash not found".
    *
@@ -1018,7 +1034,7 @@ export class SolanaAdapter implements ChainAdapter {
       //
       // CRIT-09 limitation: Blockhash staleness risk.
       // The transaction's recentBlockhash was set during buildTransaction(), which may have
-      // occurred minutes earlier (e.g., while waiting for human approval via Telegram).
+      // occurred minutes earlier (e.g., while waiting for human human approval via webhook).
       // Solana blockhashes expire after ~60-90 seconds (~150 slots). If the approval takes
       // longer, the transaction will fail with "blockhash not found" at broadcast time.
       // This is a known limitation of the Solana transaction model — blockhashes are baked
@@ -1155,158 +1171,6 @@ export class SolanaAdapter implements ChainAdapter {
         `Failed to check transaction status: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
-  }
-
-  /**
-   * CRIT-T2-02 fix: Capture a pre-swap balance snapshot for post-swap verification.
-   * Call this BEFORE broadcasting a swap transaction to record the output token balance.
-   * The returned snapshot is passed to verifySwapOutput() after broadcast confirmation.
-   *
-   * @param ownerAddress - The wallet's public key address
-   * @param outputToken  - The token being received (e.g., "USDC", "SOL")
-   * @returns A snapshot containing the pre-swap balance and metadata
-   */
-  async getPreSwapSnapshot(
-    ownerAddress: string,
-    outputToken: string,
-  ): Promise<{ outputToken: string; preBalance: bigint; snapshotTimestamp: number }> {
-    await this.ensureDnsValidated();
-    const pubkey = new PublicKey(ownerAddress);
-
-    let preBalance: bigint;
-    if (isNativeSOL(outputToken)) {
-      const lamports = await this.connection.getBalance(pubkey);
-      preBalance = BigInt(lamports);
-    } else {
-      const mint = resolveTokenMint(outputToken, this.isDevnet);
-      if (!mint) {
-        throw new SolanaAdapterError("INVALID_TOKEN", `Unknown output token for swap verification: ${outputToken}`);
-      }
-      const ata = getAssociatedTokenAddressSync(mint, pubkey);
-      try {
-        const account = await getAccount(this.connection, ata);
-        preBalance = account.amount;
-      } catch {
-        // ATA doesn't exist yet — pre-balance is zero
-        preBalance = 0n;
-      }
-    }
-
-    return {
-      outputToken,
-      preBalance,
-      snapshotTimestamp: Date.now(),
-    };
-  }
-
-  /**
-   * CRIT-T2-02 fix: Verify that a swap produced the expected minimum output amount.
-   *
-   * After broadcasting and confirming a swap transaction, call this method to verify
-   * that the output token balance increased by at least the expected minimum amount.
-   * This detects:
-   * - Sandwich attacks that consume full slippage tolerance
-   * - Partial fills where output is less than otherAmountThreshold
-   * - Zero-output swaps from edge-case AMM pool states
-   * - Discrepancies between quoted and actual output for audit/reconciliation
-   *
-   * @param ownerAddress       - The wallet's public key address
-   * @param preSwapSnapshot    - Snapshot from getPreSwapSnapshot() captured before broadcast
-   * @param minimumExpectedOut - Minimum expected output in smallest units (from Jupiter quote's otherAmountThreshold)
-   * @param quotedOutAmount    - The quoted output amount (from Jupiter quote's outAmount) for logging
-   * @returns Verification result with actual received amount and pass/fail status
-   */
-  async verifySwapOutput(
-    ownerAddress: string,
-    preSwapSnapshot: { outputToken: string; preBalance: bigint; snapshotTimestamp: number },
-    minimumExpectedOut: bigint,
-    quotedOutAmount?: bigint,
-  ): Promise<{
-    passed: boolean;
-    actualReceived: bigint;
-    minimumExpected: bigint;
-    quotedAmount?: bigint;
-    deficit?: bigint;
-    warning?: string;
-  }> {
-    await this.ensureDnsValidated();
-    const pubkey = new PublicKey(ownerAddress);
-    const { outputToken, preBalance, snapshotTimestamp } = preSwapSnapshot;
-
-    // Guard against stale snapshots (> 5 minutes old)
-    const SNAPSHOT_MAX_AGE_MS = 300_000;
-    if (Date.now() - snapshotTimestamp > SNAPSHOT_MAX_AGE_MS) {
-      throw new SolanaAdapterError(
-        "SWAP_VERIFICATION_FAILED",
-        `Pre-swap snapshot is too old (${Math.round((Date.now() - snapshotTimestamp) / 1000)}s). ` +
-        `Maximum age is ${SNAPSHOT_MAX_AGE_MS / 1000}s. Take a new snapshot before the swap.`,
-      );
-    }
-
-    let postBalance: bigint;
-    // CHAIN-021 fix: When the output token is native SOL, the wallet's SOL balance
-    // is reduced by the transaction fee (typically 5000 lamports + priority fee).
-    // This means actualReceived = postBalance - preBalance will be LESS than the
-    // actual swap output because the tx fee is subtracted from the same SOL balance.
-    // We estimate the fee and add it back to get the true swap output amount.
-    let estimatedTxFee = 0n;
-    if (isNativeSOL(outputToken)) {
-      const lamports = await this.connection.getBalance(pubkey);
-      postBalance = BigInt(lamports);
-      // Solana base fee is 5000 lamports per signature. Most swap transactions
-      // have 1 signature, but we use a conservative estimate of 10000 lamports
-      // (2 signatures) to avoid false-positive verification failures.
-      estimatedTxFee = 10_000n;
-    } else {
-      const mint = resolveTokenMint(outputToken, this.isDevnet);
-      if (!mint) {
-        throw new SolanaAdapterError("INVALID_TOKEN", `Unknown output token for swap verification: ${outputToken}`);
-      }
-      const ata = getAssociatedTokenAddressSync(mint, pubkey);
-      try {
-        const account = await getAccount(this.connection, ata);
-        postBalance = account.amount;
-      } catch {
-        postBalance = 0n;
-      }
-    }
-
-    // CHAIN-021 fix: Add estimated tx fee back for SOL output to get true swap output
-    const actualReceived = postBalance - preBalance + estimatedTxFee;
-
-    const result: {
-      passed: boolean;
-      actualReceived: bigint;
-      minimumExpected: bigint;
-      quotedAmount?: bigint;
-      deficit?: bigint;
-      warning?: string;
-    } = {
-      passed: actualReceived >= minimumExpectedOut,
-      actualReceived,
-      minimumExpected: minimumExpectedOut,
-    };
-
-    if (quotedOutAmount !== undefined) {
-      result.quotedAmount = quotedOutAmount;
-    }
-
-    if (!result.passed) {
-      result.deficit = minimumExpectedOut - actualReceived;
-      result.warning =
-        `CRIT-T2-02: Swap output verification FAILED. ` +
-        `Received ${actualReceived} but expected at least ${minimumExpectedOut}` +
-        (quotedOutAmount !== undefined ? ` (quoted: ${quotedOutAmount})` : "") +
-        `. Deficit: ${result.deficit}. This may indicate a sandwich attack, partial fill, or malformed swap.`;
-    } else if (quotedOutAmount !== undefined && actualReceived < quotedOutAmount) {
-      // Passed minimum threshold but received less than quoted — warn about slippage consumption
-      const slippageConsumed = quotedOutAmount - actualReceived;
-      result.warning =
-        `Swap output below quoted amount. Received ${actualReceived}, quoted ${quotedOutAmount}. ` +
-        `Slippage consumed: ${slippageConsumed}. This may indicate MEV extraction.`;
-    }
-
-    return result;
   }
 
   /**

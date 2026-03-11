@@ -8,7 +8,7 @@
 :::
 
 ::: warning Separate Project
-The Kova Dashboard is a separate project and is **not included** in the kova SDK npm package. It lives in the `dashboard/` directory of the kova-wallet repository and must be set up independently.
+The Kova Dashboard is a separate project and is **not included** in the kova SDK npm package. It lives in the `dashboard/` directory of the @kova/wallet repository and must be set up independently.
 :::
 
 The Kova Dashboard is a **Next.js admin UI** for testing and exploring the SDK on Solana devnet. Think of it as a visual control panel for your agent wallet -- you can create wallets, configure policies, execute transactions, and approve requests, all from a browser instead of writing code.
@@ -34,7 +34,7 @@ The dashboard is for **development and testing only**. It uses `MemoryStore` (st
 ## Setup
 
 ```bash
-# From the kova-wallet project root, navigate to the dashboard directory.
+# From the @kova/wallet project root, navigate to the dashboard directory.
 cd dashboard
 
 # Install the dashboard's dependencies (Next.js, React, Tailwind CSS, etc.).
@@ -150,7 +150,7 @@ Clicking a button sends the decision back to the SDK, which then either proceeds
 A connection status indicator (green/red dot) shows whether the SSE stream is active.
 
 ::: tip
-The dashboard uses its own `DashboardApprovalChannel` implementation instead of `TelegramApprovalBot`. This channels approval requests through the browser instead of Telegram, making it easy to test the approval flow without configuring an external bot.
+The dashboard uses its own `DashboardApprovalChannel` implementation (a custom `ApprovalChannel`). This channels approval requests through the browser, making it easy to test the approval flow without configuring an external service.
 :::
 
 ## Wallet Persistence

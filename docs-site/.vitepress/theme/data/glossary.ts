@@ -188,7 +188,7 @@ export const glossary: Record<string, GlossaryEntry> = {
   "human-in-the-loop": {
     term: "human-in-the-loop",
     definition:
-      "A pattern where certain agent actions require explicit human approval before proceeding. In kova, implemented via the ApprovalGateRule and TelegramApprovalBot.",
+      "A pattern where certain agent actions require explicit human approval before proceeding. In kova, implemented via the ApprovalGateRule and pluggable ApprovalChannel implementations (CallbackApprovalChannel, WebhookApprovalChannel).",
     category: "sdk",
   },
   allowlist: {

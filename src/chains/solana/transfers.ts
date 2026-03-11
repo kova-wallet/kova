@@ -39,6 +39,7 @@ import {
   resolveTokenMint,
   toSmallestUnit,
   getTokenDecimals,
+  getTokenDecimalsOnChain,
   SolanaAdapterError,
   stripControlChars,
 } from "./utils.js";
@@ -118,6 +119,22 @@ export async function buildSOLTransfer(
   // HIGH-08 fix: Validate recipient before building transaction
   validateRecipientAddress(params.to);
 
+  // AUDIT-MED-15 fix: Warn when the SOL transfer recipient is off-curve (likely a PDA).
+  // SOL CAN be sent to PDAs (they can hold lamports), but this is unusual for typical
+  // user-to-user transfers and may indicate a mistake or an attempt to send SOL to a
+  // program-derived address. This is a warning, not a rejection, to avoid breaking
+  // legitimate use cases (e.g., funding PDA vaults).
+  try {
+    if (!PublicKey.isOnCurve(recipient.toBytes())) {
+      process.emitWarning(
+        `SOL transfer recipient ${params.to} is not on the Ed25519 curve (may be a PDA). Ensure this is intentional.`,
+        { code: "KOVA_RECIPIENT_PDA_WARNING" },
+      );
+    }
+  } catch {
+    // Non-fatal: isOnCurve check failure should not block the transfer
+  }
+
   const lamports = toSmallestUnit(params.amount, 9);
 
   // CHAIN-003: Pre-flight balance verification.
@@ -143,9 +160,8 @@ export async function buildSOLTransfer(
   if (BigInt(senderBalance) < totalRequired) {
     throw new SolanaAdapterError(
       "INSUFFICIENT_BALANCE",
-      `Insufficient SOL balance: sender has ${senderBalance} lamports but transfer requires ${lamports} lamports ` +
-      `(${params.amount} SOL) plus estimated fees of ${ESTIMATED_FEE_LAMPORTS} lamports ` +
-      `(total: ${totalRequired} lamports).`,
+      `Insufficient SOL balance for the requested transfer amount. ` +
+      `Ensure the sender has enough SOL to cover the transfer plus estimated fees.`,
     );
   }
 
@@ -174,6 +190,19 @@ export async function buildSOLTransfer(
     requireAllSignatures: false,
     verifySignatures: false,
   });
+
+  // AUDIT-HIGH-7 fix: Enforce Solana transaction size limit.
+  // Solana transactions must fit within a single IPv6 MTU (1280 bytes) minus headers.
+  // Oversized transactions will be rejected by validators at broadcast time, but catching
+  // this early provides a clear error instead of a confusing broadcast failure.
+  const MAX_TX_SIZE = 1232; // 1 IPv6 MTU (1280) - IPv6 header (40) - UDP header (8) = 1232
+  if (serialized.length > MAX_TX_SIZE) {
+    throw new SolanaAdapterError(
+      "TRANSACTION_TOO_LARGE",
+      `Serialized transaction size (${serialized.length} bytes) exceeds Solana's maximum ` +
+      `of ${MAX_TX_SIZE} bytes. Reduce the number of instructions or accounts.`,
+    );
+  }
 
   return {
     chain: "solana",
@@ -242,12 +271,26 @@ export async function buildSPLTransfer(
     );
   }
 
-  const decimals = getTokenDecimals(params.token, isDevnet);
+  // M29 fix: Fall back to on-chain decimal lookup for unknown tokens.
+  // The hardcoded registry only covers SOL, USDC, USDT. For arbitrary mint
+  // addresses, query the mint account's decimals field on-chain.
+  let decimals = getTokenDecimals(params.token, isDevnet);
   if (decimals === null) {
-    throw new SolanaAdapterError(
-      "UNKNOWN_DECIMALS",
-      `Cannot determine decimals for token: ${params.token}. Use a known symbol or provide mint address.`,
-    );
+    if (!mint) {
+      throw new SolanaAdapterError(
+        "UNKNOWN_DECIMALS",
+        `Cannot determine decimals for token: ${params.token}. Use a known symbol or provide mint address.`,
+      );
+    }
+    try {
+      decimals = await getTokenDecimalsOnChain(connection, mint);
+    } catch (err) {
+      throw new SolanaAdapterError(
+        "UNKNOWN_DECIMALS",
+        `Cannot determine decimals for token ${params.token}: on-chain lookup failed. ` +
+        `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 
   const amount = toSmallestUnit(params.amount, decimals);
@@ -259,7 +302,17 @@ export async function buildSPLTransfer(
   const TOKEN_2022_PROGRAM_ID = new PublicKey("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
   try {
     const mintAccountInfo = await connection.getAccountInfo(mint);
-    if (mintAccountInfo && mintAccountInfo.owner.equals(TOKEN_2022_PROGRAM_ID)) {
+    // SOL-04 fix: Reject null mint accounts instead of silently passing them through.
+    // Previously, a null mintAccountInfo (non-existent account) would skip the Token-2022
+    // check entirely, allowing transfers to non-existent mint addresses to proceed until
+    // they fail at a later stage with a confusing error.
+    if (!mintAccountInfo) {
+      throw new SolanaAdapterError(
+        "INVALID_TOKEN",
+        "Mint account does not exist on-chain: " + mint.toBase58(),
+      );
+    }
+    if (mintAccountInfo.owner.equals(TOKEN_2022_PROGRAM_ID)) {
       throw new SolanaAdapterError(
         "TOKEN_2022_NOT_SUPPORTED",
         `Token mint ${mint.toBase58()} is a Token-2022 (Token Extensions) token. ` +
@@ -304,8 +357,7 @@ export async function buildSPLTransfer(
     if (senderAccount.amount < amount) {
       throw new SolanaAdapterError(
         "INSUFFICIENT_BALANCE",
-        `Insufficient ${params.token} balance: sender has ${senderAccount.amount} smallest units ` +
-        `but transfer requires ${amount} smallest units (${params.amount} ${params.token}).`,
+        `Insufficient ${params.token} balance for the requested transfer amount.`,
       );
     }
   } catch (err) {
@@ -318,8 +370,7 @@ export async function buildSPLTransfer(
     if (isNotFound) {
       throw new SolanaAdapterError(
         "INSUFFICIENT_BALANCE",
-        `Insufficient ${params.token} balance: sender has no token account for ${params.token}. ` +
-        `Transfer requires ${params.amount} ${params.token}.`,
+        `Insufficient ${params.token} balance: sender has no token account for this token.`,
       );
     }
     throw new SolanaAdapterError(
@@ -388,9 +439,8 @@ export async function buildSPLTransfer(
       if (BigInt(senderSOLBalance) < requiredSOL) {
         throw new SolanaAdapterError(
           "INSUFFICIENT_BALANCE",
-          `Insufficient SOL for ATA creation: sender has ${senderSOLBalance} lamports but ATA rent ` +
-          `requires ~${ATA_RENT_EXEMPTION_LAMPORTS} lamports plus ~${ESTIMATED_FEE_LAMPORTS_SPL} lamports ` +
-          `in fees (total: ${requiredSOL} lamports). Fund the sender with at least ~0.003 SOL.`,
+          `Insufficient SOL for ATA creation and fees. ` +
+          `Fund the sender with at least ~0.003 SOL to cover ATA rent and transaction fees.`,
         );
       }
     } catch (err) {
@@ -430,6 +480,16 @@ export async function buildSPLTransfer(
     requireAllSignatures: false,
     verifySignatures: false,
   });
+
+  // AUDIT-HIGH-7 fix: Enforce Solana transaction size limit (same as SOL transfers).
+  const MAX_TX_SIZE = 1232;
+  if (serialized.length > MAX_TX_SIZE) {
+    throw new SolanaAdapterError(
+      "TRANSACTION_TOO_LARGE",
+      `Serialized transaction size (${serialized.length} bytes) exceeds Solana's maximum ` +
+      `of ${MAX_TX_SIZE} bytes. Reduce the number of instructions or accounts.`,
+    );
+  }
 
   return {
     chain: "solana",
@@ -565,8 +625,10 @@ export async function addPriorityFee(
     const maxTotalFeeLamports = config?.maxPriorityFeeLamports ?? DEFAULT_MAX_PRIORITY_FEE_LAMPORTS;
     // INT-LOW-01 fix: Use BigInt for priority fee calculation to avoid floating-point
     // precision loss when cappedFee * computeUnits exceeds Number.MAX_SAFE_INTEGER.
-    const totalFeeLamports = Number(BigInt(cappedFee) * BigInt(computeUnits) / 1_000_000n);
-    if (totalFeeLamports > maxTotalFeeLamports) {
+    const totalFeeLamportsBig = BigInt(cappedFee) * BigInt(computeUnits) / 1_000_000n;
+    if (totalFeeLamportsBig > BigInt(Number.MAX_SAFE_INTEGER)) {
+      cappedFee = Number(BigInt(maxTotalFeeLamports) * 1_000_000n / BigInt(computeUnits));
+    } else if (Number(totalFeeLamportsBig) > maxTotalFeeLamports) {
       cappedFee = Number(BigInt(maxTotalFeeLamports) * 1_000_000n / BigInt(computeUnits));
     }
 
@@ -579,20 +641,34 @@ export async function addPriorityFee(
       }),
     );
   } catch (err) {
-    // CHAIN-006 fix: Improved error classification for priority fee estimation failures.
-    // Previously used fragile string matching ("fetch"/"network") which could miss
-    // legitimate network errors with different messages or catch false positives.
-    // Now uses a structured approach: check error codes and types first, then fall
-    // back to string matching with an expanded keyword set.
-    const isNetworkError =
-      (err instanceof TypeError && (err as Error).message.includes("fetch")) || // Node.js fetch TypeError
-      (err instanceof Error && "code" in err && typeof (err as Record<string, unknown>).code === "string" &&
-        ["ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "ENOTFOUND", "EAI_AGAIN", "EPIPE", "EHOSTUNREACH"].includes(
-          (err as Record<string, unknown>).code as string)) ||
-      (err instanceof Error && err.message.toLowerCase().match(/\b(fetch|network|timeout|econnrefused|dns|socket|abort)\b/) !== null);
-    if (!isNetworkError) {
+    // M63 fix: Only swallow RPC/network-related errors. Re-throw unexpected errors
+    // (programming bugs, assertion failures, etc.) that should not be silently ignored.
+    // SOL-05 fix: Check for both programming errors and non-RPC errors.
+    const errMessage = err instanceof Error ? err.message.toLowerCase() : "";
+    const isRpcRelatedError =
+      err instanceof Error &&
+      /\b(rpc|fetch|network|timeout|econnrefused|econnreset|dns|socket|abort|unavailable|service|rate|refused|getaddrinfo|ehostunreach|epipe|enotfound)\b/i.test(errMessage);
+    const isProgrammingError =
+      (err instanceof TypeError && !isRpcRelatedError) ||
+      err instanceof RangeError ||
+      err instanceof SyntaxError ||
+      err instanceof ReferenceError;
+    if (isProgrammingError) {
       throw err;
     }
+    // If it's not an RPC-related error and not a known programming error,
+    // re-throw it rather than swallowing silently. Only swallow RPC errors.
+    if (!isRpcRelatedError && err instanceof Error) {
+      throw err;
+    }
+
+    // AUDIT-HIGH-6 fix: Emit a warning so callers know fee estimation failed.
+    // Silent degradation to minimum fee can cause transactions to be delayed or
+    // dropped during network congestion without any indication to the caller.
+    process.emitWarning(
+      "Priority fee estimation failed — using minimum fee. Transactions may be delayed during congestion.",
+      { code: "KOVA_PRIORITY_FEE_WARNING" },
+    );
 
     // HIGH-10 fix: Apply minimum priority fee floor when estimation fails,
     // instead of submitting with zero priority (vulnerable to front-running).
@@ -604,8 +680,8 @@ export async function addPriorityFee(
     // AUDIT-M-13 fix: Apply the same maxTotalFeeLamports cap as the main path
     // to prevent the fallback from exceeding the absolute fee ceiling.
     const maxTotalFeeLamports = config?.maxPriorityFeeLamports ?? DEFAULT_MAX_PRIORITY_FEE_LAMPORTS;
-    const fallbackTotalFeeLamports = Number(BigInt(minFee) * BigInt(computeUnits) / 1_000_000n);
-    if (fallbackTotalFeeLamports > maxTotalFeeLamports) {
+    const fallbackTotalFeeLamportsBig = BigInt(minFee) * BigInt(computeUnits) / 1_000_000n;
+    if (fallbackTotalFeeLamportsBig > BigInt(maxTotalFeeLamports)) {
       minFee = Number(BigInt(maxTotalFeeLamports) * 1_000_000n / BigInt(computeUnits));
     }
 

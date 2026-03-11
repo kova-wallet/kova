@@ -126,9 +126,8 @@ describe("TurnkeyProvider", () => {
       // Destroy should clear it
       await provider.destroy();
 
-      // After destroy, getAddress still works (re-caches from config)
-      const result = await provider.getAddress();
-      expect(result).toBe(address);
+      // S-01 fix: After destroy(), signWith is nulled out, so getAddress() rejects
+      await expect(provider.getAddress()).rejects.toThrow("TurnkeyProvider has been destroyed");
     });
   });
 

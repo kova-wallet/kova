@@ -48,18 +48,33 @@ function computeIntentHash(intent: TransactionIntent): string {
  * of generic "N/A" placeholders.
  */
 function extractAmountAndToken(intent: TransactionIntent): { amount: string; token: string; target: string } {
-  const params = intent.params as unknown as Record<string, unknown>;
-  const amount = typeof params.amount === "string" ? params.amount : "N/A";
-  const token = typeof params.token === "string"
-    ? params.token
-    : typeof params.fromToken === "string"
-      ? params.fromToken
-      : "N/A";
-  const target = typeof params.to === "string"
-    ? params.to
-    : typeof params.programId === "string"
-      ? params.programId
-      : "N/A";
+  // H10 fix: Use discriminated union narrowing instead of unsafe double-cast.
+  let amount = "N/A";
+  let token = "N/A";
+  let target = "N/A";
+
+  switch (intent.type) {
+    case "transfer":
+      amount = typeof intent.params.amount === "string" ? intent.params.amount : "N/A";
+      token = typeof intent.params.token === "string" ? intent.params.token : "N/A";
+      target = typeof intent.params.to === "string" ? intent.params.to : "N/A";
+      break;
+    case "swap":
+      amount = typeof intent.params.amount === "string" ? intent.params.amount : "N/A";
+      token = typeof intent.params.fromToken === "string" ? intent.params.fromToken : "N/A";
+      break;
+    case "stake":
+      amount = typeof intent.params.amount === "string" ? intent.params.amount : "N/A";
+      token = typeof intent.params.token === "string" ? intent.params.token : "N/A";
+      break;
+    case "mint":
+      target = typeof intent.params.collection === "string" ? intent.params.collection : "N/A";
+      break;
+    case "custom":
+      target = typeof intent.params.programId === "string" ? intent.params.programId : "N/A";
+      break;
+  }
+
   return { amount, token, target };
 }
 
@@ -67,6 +82,19 @@ function extractAmountAndToken(intent: TransactionIntent): { amount: string; tok
 export class TimeWindowRule implements PolicyRule {
   readonly name = "time-window";
   private readonly config: ActiveHoursConfig;
+  /**
+   * L65 fix: Cached Intl.DateTimeFormat instance, reused across evaluations instead of
+   * being created fresh each time in isWithinActiveHours(). The formatter is immutable
+   * and thread-safe, so a single instance is sufficient for the lifetime of the rule.
+   */
+  private readonly dateFormatter: Intl.DateTimeFormat;
+  /**
+   * M45 fix: Track the maximum `now` value seen so far to enforce monotonic time.
+   * If the system clock goes backward (e.g., NTP correction), a time window that was
+   * previously closed could re-open. By using the maximum seen time instead of a
+   * regressed time, we prevent this vulnerability.
+   */
+  private lastSeenNow: number = 0;
 
   constructor(config: ActiveHoursConfig) {
     // HIGH-T4-03 fix: Validate timezone at construction time using Intl.DateTimeFormat.
@@ -74,7 +102,13 @@ export class TimeWindowRule implements PolicyRule {
     // catches errors and returns false), but failing at construction is preferable because
     // it surfaces misconfiguration immediately rather than silently denying all transactions.
     try {
-      new Intl.DateTimeFormat("en-US", { timeZone: config.timezone });
+      this.dateFormatter = new Intl.DateTimeFormat("en-US", {
+        timeZone: config.timezone,
+        weekday: "short",
+        hour: "numeric",
+        minute: "numeric",
+        hour12: false,
+      });
     } catch {
       throw new Error(
         `TimeWindowRule: invalid timezone "${config.timezone}". ` +
@@ -112,7 +146,24 @@ export class TimeWindowRule implements PolicyRule {
   }
 
   async evaluate(_intent: TransactionIntent, context: PolicyContext): Promise<PolicyDecision> {
-    const now = new Date(context.now);
+    // M45 fix: Enforce monotonic time to prevent clock regression from re-opening
+    // time windows that were previously closed.
+    let effectiveNow = context.now;
+    if (effectiveNow < this.lastSeenNow) {
+      try {
+        process.emitWarning(
+          `TimeWindowRule: clock regression detected (current=${effectiveNow}, last=${this.lastSeenNow}, ` +
+          `delta=${this.lastSeenNow - effectiveNow}ms). Using last seen time to prevent ` +
+          `closed time windows from re-opening.`,
+          "SecurityWarning",
+        );
+      } catch { /* non-fatal */ }
+      effectiveNow = this.lastSeenNow;
+    } else {
+      this.lastSeenNow = effectiveNow;
+    }
+
+    const now = new Date(effectiveNow);
     const isActive = this.isWithinActiveHours(now);
 
     if (isActive) {
@@ -125,6 +176,17 @@ export class TimeWindowRule implements PolicyRule {
     // this option behaved identically to "deny", which was misleading. Now it properly
     // integrates with the ApprovalChannel to gate transactions outside active hours.
     if (this.config.outsideHoursPolicy === "require_approval") {
+      // P-08 fix: During dry-run (Phase 1), skip the actual approval request to prevent
+      // duplicate approval messages. Phase 2 will send the real request.
+      if (context.dryRun) {
+        // LOW-14 fix: During dry-run, verify that an approval channel is configured.
+        // Without this check, dry-run would optimistically ALLOW, but Phase 2 would
+        // DENY due to missing approval channel, causing inconsistent evaluation.
+        if (!context.approval) {
+          return { decision: "DENY", rule: this.name, reason: "Outside active hours and no approval channel configured" };
+        }
+        return { decision: "ALLOW", metadata: { pendingApproval: true } };
+      }
       if (context.approval) {
         // HIGH-09 fix: Compute intent hash BEFORE sending the approval request
         // to cryptographically bind the approval to the exact transaction parameters.
@@ -224,20 +286,13 @@ export class TimeWindowRule implements PolicyRule {
     let currentMinutes: number;
 
     try {
-      // POLICY-016: DateTimeFormat options are consistent — this is the only place
-      // DateTimeFormat is used. The "en-US" locale with explicit hour12:false ensures
-      // 24-hour format. Note: hour:"numeric" with hour12:false may return "24" for
-      // midnight in some ICU implementations (instead of "0"). The modulo below
-      // normalizes this to 0 for correctness.
-      const formatter = new Intl.DateTimeFormat("en-US", {
-        timeZone: this.config.timezone,
-        weekday: "short",
-        hour: "numeric",
-        minute: "numeric",
-        hour12: false,
-      });
-
-      const parts = formatter.formatToParts(now);
+      // L65 fix: Use the cached DateTimeFormat instance instead of creating a new one
+      // per evaluation. The formatter options (en-US, hour12:false, weekday/hour/minute)
+      // are configured once in the constructor.
+      // POLICY-016: The "en-US" locale with explicit hour12:false ensures 24-hour format.
+      // Note: hour:"numeric" with hour12:false may return "24" for midnight in some ICU
+      // implementations (instead of "0"). The modulo below normalizes this to 0.
+      const parts = this.dateFormatter.formatToParts(now);
       const weekday = parts.find(p => p.type === "weekday")?.value?.toLowerCase() ?? "";
       // POLICY-016: Modulo 24 normalizes "24" (returned by some ICU implementations for
       // midnight with hour12:false) to 0, ensuring correct minute-of-day calculation.
@@ -258,6 +313,7 @@ export class TimeWindowRule implements PolicyRule {
 
       if (startMinutes <= endMinutes) {
         // Normal range: e.g., 09:00 to 17:00
+        // Note: end time is exclusive (half-open interval). "17:00" means up to but not including 17:00.
         // The current day must be in the window's days list.
         if (!window.days.includes(currentDay as typeof window.days[number])) {
           continue;

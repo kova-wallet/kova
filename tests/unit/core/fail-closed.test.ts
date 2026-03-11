@@ -93,6 +93,7 @@ function createWallet(overrides?: Partial<AgentWalletConfig>) {
     policy: new PolicyEngine([allowAllRule], store),
     store,
     circuitBreaker: false, // disable circuit breaker by default so it does not interfere with fail-closed tests
+    dangerouslyDisableAuth: true,
   };
   return new AgentWallet({ ...defaults, ...overrides });
 }
@@ -117,14 +118,15 @@ describe("Fail-Closed Behavior Verification", () => {
         },
       };
 
-      // Make store.get throw only for non-idempotency keys (the idempotency check
-      // happens before policy evaluation and is NOT in a try/catch).
+      // Make store.get throw only for policy-related keys.
+      // Allow idempotency keys (checked before policy) and advisory lock keys
+      // (CRIT-13 fix: checked at wallet construction/execute entry).
       const originalGet = store.get.bind(store);
       vi.spyOn(store, "get").mockImplementation(async (key: string) => {
-        if (!key.startsWith("idempotency:")) {
-          throw new Error("Redis connection refused");
+        if (key.startsWith("idempotency:") || key.startsWith("lock:")) {
+          return originalGet(key);
         }
-        return originalGet(key);
+        throw new Error("Redis connection refused");
       });
 
       const policy = new PolicyEngine([ruleUsingStore], store);
@@ -187,7 +189,14 @@ describe("Fail-Closed Behavior Verification", () => {
     it("store.set throws during cache write -> transaction still succeeds (cache failure non-fatal)", async () => {
       const store = new MemoryStore();
       // store.set is called in cacheResult() which IS wrapped in try/catch
-      vi.spyOn(store, "set").mockRejectedValue(new Error("Store write failed"));
+      // Allow advisory lock sets through, only fail cache writes
+      const originalSet = store.set.bind(store);
+      vi.spyOn(store, "set").mockImplementation(async (key: string, ...args: unknown[]) => {
+        if (key.startsWith("lock:")) {
+          return originalSet(key, ...args);
+        }
+        throw new Error("Store write failed");
+      });
 
       const policy = new PolicyEngine([allowAllRule], store);
       const wallet = createWallet({ policy, store });
@@ -726,11 +735,10 @@ describe("Fail-Closed Behavior Verification", () => {
     it("store failure during policy + audit failure -> DENY (not crash)", async () => {
       const store = new MemoryStore();
 
-      // Make the store broken for everything except the idempotency check
-      // (which is not in a try/catch and would propagate to the caller).
+      // Make the store broken for everything except idempotency and advisory lock keys
       const originalGet = store.get.bind(store);
       vi.spyOn(store, "get").mockImplementation(async (key: string) => {
-        if (key.startsWith("idempotency:")) {
+        if (key.startsWith("idempotency:") || key.startsWith("lock:")) {
           return originalGet(key);
         }
         throw new Error("Store totally down");
@@ -787,7 +795,7 @@ describe("Fail-Closed Behavior Verification", () => {
         ...createMockChain(),
         broadcast: async () => { throw new Error("Temporary network outage"); },
       };
-      const wallet = createWallet({ policy, store, chain: brokenChain });
+      const wallet = createWallet({ policy, store, chain: brokenChain, strictAdvisoryLock: false });
 
       const r1 = await wallet.execute(createTransferIntent({ id: "seq-fail-1" }));
       expect(r1.status).toBe("failed");
@@ -797,13 +805,13 @@ describe("Fail-Closed Behavior Verification", () => {
         ...createMockSigner(),
         sign: async () => { throw new Error("Key rotation in progress"); },
       };
-      const wallet2 = createWallet({ policy, store, signer: brokenSigner });
+      const wallet2 = createWallet({ policy, store, signer: brokenSigner, strictAdvisoryLock: false });
 
       const r2 = await wallet2.execute(createTransferIntent({ id: "seq-fail-2" }));
       expect(r2.status).toBe("failed");
 
       // Third: everything works again -- wallet should recover
-      const healthyWallet = createWallet({ policy, store });
+      const healthyWallet = createWallet({ policy, store, strictAdvisoryLock: false });
       const r3 = await healthyWallet.execute(createTransferIntent({ id: "seq-recover-3" }));
 
       expect(r3.status).toBe("confirmed");

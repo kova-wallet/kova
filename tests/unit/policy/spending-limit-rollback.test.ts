@@ -16,6 +16,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { MemoryStore } from "../../../src/stores/memory.js";
 import { SpendingLimitRule } from "../../../src/policy/rules/spending-limit.js";
 import { PolicyEngine } from "../../../src/policy/engine.js";
+import { normalizeTokenId } from "../../../src/policy/utils.js";
 import type { PolicyRule, PolicyContext, PolicyDecision } from "../../../src/policy/types.js";
 import type { TransactionIntent } from "../../../src/core/intent.js";
 import type { Store } from "../../../src/stores/interface.js";
@@ -37,47 +38,15 @@ function makeContext(store: Store, now = Date.now()): PolicyContext {
 }
 
 /**
- * Read the raw numeric value of a counter key from the store.
- * Returns 0 when the key is absent (no counter has been written yet).
- */
-async function readCounter(store: Store, key: string): Promise<number> {
-  const raw = await store.get(key);
-  if (raw === null) return 0;
-  const parsed = parseFloat(raw);
-  return isNaN(parsed) ? 0 : parsed;
-}
-
-/**
  * Return all sliding-window log entries for a given key.
  */
-async function readLog(store: Store, logKey: string): Promise<string[]> {
-  return store.getRecent(logKey, 100_000);
-}
-
-/**
- * Mirrors the production normalizeTokenId logic used by SpendingLimitRule
- * when building store key names.
- *
- * Short alphanumeric tokens (1-20 chars) → uppercase.
- * EVM addresses (0x + 40 hex) → lowercase.
- * Others → as-is.
- *
- * e.g. normalizeToken("SOL") === "SOL", normalizeToken("usdc") === "USDC"
- */
-function normalizeToken(token: string): string {
-  if (token.startsWith("0x") && token.length === 42) return token.toLowerCase();
-  if (/^[A-Za-z0-9_-]{1,20}$/.test(token)) return token.toUpperCase();
-  return token;
-}
-
-/** Build the counter key the SpendingLimitRule writes for a token+window combo. */
-function counterKey(window: "daily" | "weekly" | "monthly", token: string, prefix = "spending:"): string {
-  return `${prefix}${window}:${normalizeToken(token)}`;
+async function readLog(store: Store, key: string): Promise<string[]> {
+  return store.getRecent(key, 100_000);
 }
 
 /** Build the sliding window log key the SpendingLimitRule writes for a token+window combo. */
 function logKey(window: "daily" | "weekly" | "monthly", token: string, prefix = "spending:"): string {
-  return `${prefix}log:${window}:${normalizeToken(token)}`;
+  return `${prefix}log:${window}:${normalizeTokenId(token)}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -106,8 +75,7 @@ describe("SpendingLimitRule — rollback on DENY", () => {
     const result = await rule.evaluate(makeTransfer("10"), ctx); // exceeds perTransaction
 
     expect(result.decision).toBe("DENY");
-    // The daily counter must be zero — no increment should have occurred.
-    expect(await readCounter(store, counterKey("daily", "SOL"))).toBe(0);
+    // M22 fix: No separate counter key — only the log matters. Log must be empty.
     expect(await readLog(store, logKey("daily", "SOL"))).toHaveLength(0);
   });
 
@@ -126,20 +94,12 @@ describe("SpendingLimitRule — rollback on DENY", () => {
     expect(allow1.decision).toBe("ALLOW");
 
     // Now try 2 SOL — daily total would become 6, exceeding 5 SOL limit.
-    // Daily check fires and rolls back before the weekly counter is touched.
+    // Daily check fires before the weekly log is appended.
     const deny = await rule.evaluate(makeTransfer("2"), makeContext(store, now));
     expect(deny.decision).toBe("DENY");
 
-    // Daily counter reflects the first ALLOW (4 SOL), not the rolled-back attempt.
-    const dailyCounter = await readCounter(store, counterKey("daily", "SOL"));
-    expect(dailyCounter).toBeCloseTo(4, 5);
-
-    // Weekly counter: the first transaction went through both daily + weekly checks,
-    // so the weekly counter should also be 4 SOL.
-    const weeklyCounter = await readCounter(store, counterKey("weekly", "SOL"));
-    expect(weeklyCounter).toBeCloseTo(4, 5);
-
-    // The denied 2 SOL attempt must NOT appear in either log.
+    // M22 fix: The sliding window log is now the sole source of truth (no separate
+    // counter key). The denied 2 SOL attempt must NOT appear in either log.
     const dailyLog = await readLog(store, logKey("daily", "SOL"));
     const weeklyLog = await readLog(store, logKey("weekly", "SOL"));
 
@@ -148,8 +108,8 @@ describe("SpendingLimitRule — rollback on DENY", () => {
     expect(weeklyLog).toHaveLength(1);
   });
 
-  it("rolling back daily+weekly leaves monthly counter uninflated", async () => {
-    // Tight daily limit forces early denial; verify monthly counter is untouched.
+  it("rolling back daily+weekly leaves monthly log uninflated", async () => {
+    // Tight daily limit forces early denial; verify monthly log is untouched.
     const rule = new SpendingLimitRule({
       daily: { amount: "3", token: "SOL" },
       weekly: { amount: "20", token: "SOL" },
@@ -162,15 +122,12 @@ describe("SpendingLimitRule — rollback on DENY", () => {
     const allow = await rule.evaluate(makeTransfer("2"), makeContext(store, now));
     expect(allow.decision).toBe("ALLOW");
 
-    // Attempt 2 more SOL — daily total becomes 4 > 3, DENY. Daily and weekly
-    // counters are rolled back; monthly counter must remain at 2 (from first tx).
+    // Attempt 2 more SOL — daily total becomes 4 > 3, DENY.
+    // M22 fix: No separate counter to roll back — only the log matters.
     const deny = await rule.evaluate(makeTransfer("2"), makeContext(store, now));
     expect(deny.decision).toBe("DENY");
 
-    // Monthly counter must equal 2 (from the first allowed tx only).
-    const monthlyCounter = await readCounter(store, counterKey("monthly", "SOL"));
-    expect(monthlyCounter).toBeCloseTo(2, 5);
-
+    // Monthly log must have exactly one entry (from the first allowed tx only).
     const monthlyLog = await readLog(store, logKey("monthly", "SOL"));
     expect(monthlyLog).toHaveLength(1);
   });
@@ -198,24 +155,26 @@ describe("SpendingLimitRule — rollback on DENY", () => {
     expect(entryAmount).toBeCloseTo(9, 5);
   });
 
-  it("counter is decremented back to exact previous value on rollback", async () => {
+  it("log is unchanged after a denied transaction (no phantom entries)", async () => {
+    // M22 fix: Since the sliding window log is now the sole source of truth
+    // (no separate counter key), verify only log entries exist after allow/deny.
     const rule = new SpendingLimitRule({
       daily: { amount: "10", token: "SOL" },
     });
 
     const now = Date.now();
 
-    // Allow 6 SOL — daily counter becomes 6.
+    // Allow 6 SOL — log has one entry.
     await rule.evaluate(makeTransfer("6"), makeContext(store, now));
-    const counterAfterAllow = await readCounter(store, counterKey("daily", "SOL"));
-    expect(counterAfterAllow).toBeCloseTo(6, 5);
+    const logAfterAllow = await readLog(store, logKey("daily", "SOL"));
+    expect(logAfterAllow).toHaveLength(1);
 
-    // Deny 5 SOL — would take daily to 11 >= 10. Counter must roll back to 6.
+    // Deny 5 SOL — would take daily to 11 >= 10. Log must still have only one entry.
     const deny = await rule.evaluate(makeTransfer("5"), makeContext(store, now));
     expect(deny.decision).toBe("DENY");
 
-    const counterAfterDeny = await readCounter(store, counterKey("daily", "SOL"));
-    expect(counterAfterDeny).toBeCloseTo(6, 5);
+    const logAfterDeny = await readLog(store, logKey("daily", "SOL"));
+    expect(logAfterDeny).toHaveLength(1);
   });
 });
 
@@ -224,17 +183,17 @@ describe("SpendingLimitRule — rollback on DENY", () => {
 // ---------------------------------------------------------------------------
 
 describe("SpendingLimitRule — rollback on store error", () => {
-  it("decrements already-incremented daily counter when weekly read throws", async () => {
-    // Sequence inside slidingWindowCheckLimit for the daily window (POLICY-005 order):
+  it("daily log has phantom entry when weekly read throws (safe direction)", async () => {
+    // M22 fix: Sequence inside slidingWindowCheckLimit for the daily window:
     //   1. getRecent(dailyLogKey)       — reads daily window entries
-    //   2. increment(dailyCounterKey)   — optimistically records daily spend
-    //   3. append(dailyLogKey)          — records daily tx in sliding window log
+    //   2. append(dailyLogKey)          — records daily tx in sliding window log
     // Then slidingWindowCheckLimit for the weekly window:
-    //   4. getRecent(weeklyLogKey)      — THROWS HERE
+    //   3. getRecent(weeklyLogKey)      — THROWS HERE
     //
-    // The catch block rolls back incremented counters only (not list appends).
-    // So: daily counter → 0, but daily log → still has the entry from step 3.
-    // This is the documented behaviour: rollback is counter-level, not log-level.
+    // The daily log entry (step 2) was appended before the weekly error.
+    // The rollback path cannot remove list entries. This is the documented
+    // "safe direction": the phantom entry causes slight over-counting of
+    // spending (conservative), as noted in spending-limit.ts.
     const base = new MemoryStore();
 
     // Proxy store: let everything work normally except getRecent on the weekly log key.
@@ -251,7 +210,7 @@ describe("SpendingLimitRule — rollback on store error", () => {
         }
         return base.getRecent(k, count);
       },
-      clearList: (k) => base.clearList!(k),
+      clearList: (k) => base.clearList(k),
     };
 
     const rule = new SpendingLimitRule({
@@ -264,23 +223,9 @@ describe("SpendingLimitRule — rollback on store error", () => {
       "simulated store failure on weekly read",
     );
 
-    // PRIMARY GUARANTEE: The daily counter is rolled back to 0.
-    // The rollbackIncrements path decrements each key that was incremented during
-    // this evaluation. The daily counter was incremented and must be decremented back.
-    const dailyCounter = await readCounter(base, counterKey("daily", "SOL"));
-    expect(dailyCounter).toBe(0);
-
-    // SECONDARY NOTE: The daily log entry (step 3 above) was appended before the
-    // weekly error. The rollback path (rollbackIncrements) does NOT remove list entries
-    // — it only decrements counters. This is the documented "safe direction":
-    // slight under-counting rather than over-counting.
-    //
-    // The log entry exists but the counter is 0, so on the next evaluation the
-    // sliding window sum will include this phantom entry until its TTL expires.
-    // This is the documented trade-off: rollback failure "results in slight
-    // under-counting (safe direction)" as noted in spending-limit.ts lines 17-19.
+    // M22 fix: The daily log has the phantom entry from the aborted transaction.
+    // This is safe direction (over-counting spending, not under-counting).
     const dailyLog = await readLog(base, logKey("daily", "SOL"));
-    // Log has the phantom entry (cannot be rolled back), but counter is 0.
     expect(dailyLog).toHaveLength(1); // phantom entry from aborted tx
     // Verify the phantom entry encodes the correct amount (10 SOL).
     const phantomAmount = parseFloat(dailyLog[0]!.split(":")[1]!);
@@ -304,7 +249,7 @@ describe("SpendingLimitRule — rollback on store error", () => {
         }
         return base.getRecent(k, count);
       },
-      clearList: (k) => base.clearList!(k),
+      clearList: (k) => base.clearList(k),
     };
 
     const rule = new SpendingLimitRule({
@@ -315,12 +260,8 @@ describe("SpendingLimitRule — rollback on store error", () => {
     const ctx = makeContext(faultyStore);
     await expect(rule.evaluate(makeTransfer("10"), ctx)).rejects.toThrow();
 
-    // The weekly counter was never incremented — error happened during getRecent
+    // M22 fix: The weekly log was never appended — error happened during getRecent
     // which is the very first operation of the weekly window check.
-    const weeklyCounter = await readCounter(base, counterKey("weekly", "SOL"));
-    expect(weeklyCounter).toBe(0);
-
-    // The weekly log was never appended either.
     const weeklyLog = await readLog(base, logKey("weekly", "SOL"));
     expect(weeklyLog).toHaveLength(0);
   });
@@ -363,15 +304,12 @@ describe("PolicyEngine two-phase evaluation — no counter inflation on Phase 2 
 
     expect(result.decision.decision).toBe("DENY");
 
-    // The spending counter must be zero — Phase 2 never ran.
-    const counter = await readCounter(store, counterKey("daily", "SOL"));
-    expect(counter).toBe(0);
-
+    // M22 fix: The log must be empty — Phase 2 never ran.
     const logEntries = await readLog(store, logKey("daily", "SOL"));
     expect(logEntries).toHaveLength(0);
   });
 
-  it("spending counter IS incremented when both rules ALLOW", async () => {
+  it("spending log IS appended when both rules ALLOW", async () => {
     const spendingRule = new SpendingLimitRule({
       daily: { amount: "100", token: "SOL" },
     });
@@ -386,12 +324,12 @@ describe("PolicyEngine two-phase evaluation — no counter inflation on Phase 2 
 
     expect(result.decision.decision).toBe("ALLOW");
 
-    // Phase 2 committed — counter should reflect the 10 SOL.
-    const counter = await readCounter(store, counterKey("daily", "SOL"));
-    expect(counter).toBeCloseTo(10, 5);
-
+    // M22 fix: Phase 2 committed — the sliding window log (sole source of truth)
+    // should reflect the 10 SOL transaction.
     const logEntries = await readLog(store, logKey("daily", "SOL"));
     expect(logEntries).toHaveLength(1);
+    const entryAmount = parseFloat(logEntries[0]!.split(":")[1]!);
+    expect(entryAmount).toBeCloseTo(10, 5);
   });
 
   it("spending rule before blocking rule: counter stays zero across multiple denied attempts", async () => {
@@ -416,8 +354,9 @@ describe("PolicyEngine two-phase evaluation — no counter inflation on Phase 2 
       expect(result.decision.decision).toBe("DENY");
     }
 
-    const counter = await readCounter(store, counterKey("daily", "SOL"));
-    expect(counter).toBe(0);
+    // M22 fix: Log must be empty — no transactions were committed.
+    const logEntries = await readLog(store, logKey("daily", "SOL"));
+    expect(logEntries).toHaveLength(0);
   });
 });
 
@@ -436,10 +375,10 @@ describe("PolicyEngine mutex — only one of two concurrent evaluations commits"
     store.stopGc();
   });
 
-  it("serialises concurrent evaluations so the spending counter is exact", async () => {
+  it("serialises concurrent evaluations so the spending log is exact", async () => {
     // Budget: 15 SOL daily. Two evaluations of 10 SOL race each other.
     // The mutex ensures they run sequentially: the first succeeds (10 SOL committed),
-    // the second is denied (10 + 10 = 20 >= 15 limit) and rolls back.
+    // the second is denied (10 + 10 = 20 >= 15 limit).
     const spendingRule = new SpendingLimitRule({
       daily: { amount: "15", token: "SOL" },
     });
@@ -457,11 +396,7 @@ describe("PolicyEngine mutex — only one of two concurrent evaluations commits"
     expect(decisions.filter((d) => d === "ALLOW")).toHaveLength(1);
     expect(decisions.filter((d) => d === "DENY")).toHaveLength(1);
 
-    // Counter must be exactly 10 SOL — only one committed.
-    const counter = await readCounter(store, counterKey("daily", "SOL"));
-    expect(counter).toBeCloseTo(10, 5);
-
-    // Log must have exactly one entry.
+    // M22 fix: Log (sole source of truth) must have exactly one entry.
     const logEntries = await readLog(store, logKey("daily", "SOL"));
     expect(logEntries).toHaveLength(1);
   });
@@ -485,10 +420,7 @@ describe("PolicyEngine mutex — only one of two concurrent evaluations commits"
     const allows = results.filter((r) => r.decision.decision === "ALLOW");
     expect(allows).toHaveLength(1);
 
-    // Counter should reflect only the one committed transaction.
-    const counter = await readCounter(store, counterKey("daily", "SOL"));
-    expect(counter).toBeCloseTo(5, 5);
-
+    // M22 fix: Log (sole source of truth) must have exactly one entry.
     const logEntries = await readLog(store, logKey("daily", "SOL"));
     expect(logEntries).toHaveLength(1);
   });

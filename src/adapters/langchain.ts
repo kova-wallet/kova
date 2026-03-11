@@ -10,12 +10,15 @@
  * are present, types are correct, and unknown properties are stripped.
  */
 
-import { getFilteredTools, safeHandleToolCall, sanitizeToolResponse } from "./tools.js";
+import { getFilteredTools, safeHandleToolCall, sanitizeToolResponse, TOOL_CALL_TIMEOUT_MS } from "./tools.js";
 import type { ToolDefinition } from "./types.js";
 import type { AgentWallet } from "../core/wallet.js";
 
-/** MED-28: Timeout for tool call execution in milliseconds (120 seconds). */
-const TOOL_CALL_TIMEOUT_MS = 120_000;
+/**
+ * A-16: Maximum number of concurrent tool calls per createLangChainTools instance.
+ * Prevents a runaway agent from overwhelming the wallet with parallel requests.
+ */
+const MAX_CONCURRENT_CALLS = 10;
 
 /** Shape compatible with LangChain's tool interface */
 export interface LangChainToolDefinition {
@@ -47,8 +50,14 @@ export interface LangChainToolDefinition {
  */
 export function createLangChainTools(
   wallet: AgentWallet,
-  options?: { includeDangerous?: boolean; exclude?: string[] },
+  options?: { includeDangerous?: boolean; exclude?: string[]; authToken?: string },
 ): LangChainToolDefinition[] {
+  // A-16 / M31: Atomic concurrency limiter — shared across all tools from this invocation.
+  // The counter is incremented BEFORE the check to prevent the TOCTOU race condition
+  // where two concurrent calls both see the count below the limit and both proceed.
+  let pending = 0;
+  const maxConcurrent = MAX_CONCURRENT_CALLS;
+
   return getFilteredTools(options).map((tool) => ({
     name: tool.name,
     description: tool.description,
@@ -60,6 +69,16 @@ export function createLangChainTools(
       required: [...tool.parameters.required],
     },
     call: async (input: Record<string, unknown>): Promise<string> => {
+      // M31: Atomic concurrency check — increment first, then check.
+      // This prevents the TOCTOU race where two calls both read the old value.
+      const current = ++pending;
+      if (current > maxConcurrent) {
+        pending--;
+        return sanitizeToolResponse(tool.name, {
+          success: false,
+          error: `Concurrency limit exceeded (${maxConcurrent} concurrent calls). Try again later.`,
+        });
+      }
       // S5-10 fix: defensive try/catch to prevent unhandled errors (e.g. BigInt serialization)
       try {
         // MED-28: Wrap handleToolCall in a timeout to prevent indefinite hangs.
@@ -68,7 +87,7 @@ export function createLangChainTools(
         // and unresolvable Promise references when the tool call resolves before the timeout.
         let timeoutId: ReturnType<typeof setTimeout>;
         const result = await Promise.race([
-          safeHandleToolCall(wallet, tool.name, input),
+          safeHandleToolCall(wallet, tool.name, input, options?.authToken),
           new Promise<never>((_, reject) => {
             timeoutId = setTimeout(
               () => reject(new Error(`Tool call "${tool.name}" timed out after ${TOOL_CALL_TIMEOUT_MS}ms`)),
@@ -90,6 +109,9 @@ export function createLangChainTools(
           );
         }
         return sanitizeToolResponse(tool.name, { success: false, error: message });
+      } finally {
+        // A-16: Always decrement concurrency counter
+        pending--;
       }
     },
   }));

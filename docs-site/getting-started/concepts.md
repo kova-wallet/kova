@@ -354,9 +354,9 @@ interface ChainAdapter {
 
 An abstraction over human approval delivery mechanisms. When the `ApprovalGateRule` triggers (transaction above a threshold), it sends a request through the `ApprovalChannel` and blocks until a human responds.
 
-**Real-world analogy:** Think of this like a pull request review. The agent wants to make a large transaction, but instead of proceeding automatically, it sends a notification to a human reviewer via Telegram. The transaction is "paused" until the reviewer approves or rejects it.
+**Real-world analogy:** Think of this like a pull request review. The agent wants to make a large transaction, but instead of proceeding automatically, it sends a notification to a human reviewer. The transaction is "paused" until the reviewer approves or rejects it.
 
-The SDK ships with `TelegramApprovalBot`, which sends inline-button messages to a Telegram chat.
+The SDK ships with `CallbackApprovalChannel` (for any notification mechanism) and `WebhookApprovalChannel` (for HTTP-based approval flows).
 
 ---
 

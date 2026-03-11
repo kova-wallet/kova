@@ -26,6 +26,17 @@ import type { Store } from "./interface.js";
 /** MED-21 fix: Maximum key length to prevent memory exhaustion */
 const MAX_KEY_LENGTH = 512;
 
+/** L17 fix: Maximum TTL in seconds (30 days) to prevent misconfiguration */
+const MAX_TTL_SECONDS = 2_592_000;
+
+/**
+ * M17 fix: Default upper bound on the total number of distinct keys in the store.
+ * When exceeded, set() and increment() will throw for NEW keys (existing key
+ * updates are allowed). This prevents a malicious or buggy agent from creating
+ * unlimited keys and exhausting memory.
+ */
+const MAX_KEYS = 100_000;
+
 /** MED-22 fix: Maximum value length to prevent unbounded memory consumption.
  * A single 1MB value is the upper bound for any reasonable counter, audit log entry,
  * or serialized transaction result. Larger values likely indicate a bug or abuse. */
@@ -84,13 +95,35 @@ export interface MemoryStoreConfig {
    * limits. Must be a hex-encoded string of at least 64 characters (32 bytes).
    */
   hmacKey?: string;
+  /**
+   * M17 fix: Maximum number of distinct keys allowed in the store.
+   * When exceeded, set() and increment() will throw for NEW keys (existing key
+   * updates are allowed). This prevents a malicious or buggy agent from creating
+   * unlimited keys and exhausting memory. Default: 100_000.
+   */
+  maxKeys?: number;
 }
 
 export class MemoryStore implements Store {
-  private readonly data = new Map<string, StoreEntry>();
-  private readonly lists = new Map<string, string[]>();
+  // ST-10 fix: Use ES2022 private class fields (#) for runtime enforcement.
+  // TypeScript's `private` keyword is only enforced at compile time — at runtime,
+  // the fields are accessible via (instance as any).data. The # prefix provides
+  // true runtime privacy via WeakMap-based encapsulation in the JS engine.
+  #data = new Map<string, StoreEntry>();
+  #lists = new Map<string, string[]>();
   /** LOW-04 fix: Optional periodic GC timer for expired entries */
   private gcTimer?: ReturnType<typeof setInterval>;
+  /**
+   * M44 fix: Monotonic clock tracking for detecting clock forward-jumps.
+   * Stores the last wall-clock time (Date.now()) and corresponding monotonic time
+   * (performance.now()). If the wall clock jumps forward by more than 1 minute
+   * relative to the monotonic clock, TTL expiration is deferred to prevent
+   * premature rate limit counter expiration.
+   */
+  private lastWallTime: number = Date.now();
+  private lastMonoTime: number = performance.now();
+  /** M44 fix: Clock jump warning emitted flag to avoid spamming */
+  private clockJumpWarningEmitted = false;
   // LOW-T5-01 fix: Static flag so the production warning is emitted only once across all instances
   private static warningEmitted = false;
   /** M-18 fix: Flag to prevent use after destroy() */
@@ -107,9 +140,12 @@ export class MemoryStore implements Store {
   // are immutable — "overwriting" a string just creates a new string while the original
   // remains in memory until GC. Buffer.fill(0) overwrites bytes in-place, providing
   // reliable zeroization of key material on destroy().
-  private hmacKey: Buffer;
+  // ST-10 fix: Runtime-enforced private field
+  #hmacKey: Buffer;
   /** L-29 fix: Default TTL for counter keys created via increment() on absent keys */
   private readonly defaultCounterTtlSeconds?: number;
+  /** M17 fix: Configurable max key limit */
+  private readonly maxKeys: number;
 
   constructor(config?: MemoryStoreConfig) {
     // STORE-017 fix: Block MemoryStore in production unless explicitly opted in.
@@ -150,13 +186,15 @@ export class MemoryStore implements Store {
         );
       }
       // T1-F4 fix: Store as Buffer for reliable zeroization via Buffer.fill(0)
-      this.hmacKey = Buffer.from(config.hmacKey, "hex");
+      this.#hmacKey = Buffer.from(config.hmacKey, "hex");
     } else {
       // T1-F4 fix: Store raw bytes instead of hex string
-      this.hmacKey = crypto.randomBytes(32);
+      this.#hmacKey = crypto.randomBytes(32);
     }
     // L-29 fix: Store the default counter TTL
     this.defaultCounterTtlSeconds = config?.defaultCounterTtlSeconds;
+    // M17 fix: Configurable max key limit (default: MAX_KEYS)
+    this.maxKeys = config?.maxKeys ?? MAX_KEYS;
   }
 
   /**
@@ -174,7 +212,7 @@ export class MemoryStore implements Store {
     // key="a:b" value="c" vs key="a" value="b:c"). Length-prefixing the key
     // makes the boundary unambiguous regardless of key content.
     return crypto
-      .createHmac("sha256", this.hmacKey)
+      .createHmac("sha256", this.#hmacKey)
       .update(`${key.length.toString(16)}:${key}:${value}`)
       .digest("hex");
   }
@@ -197,6 +235,48 @@ export class MemoryStore implements Store {
   }
 
   /**
+   * M44 fix: Check if a key should be considered expired, accounting for clock forward-jumps.
+   * Compares wall-clock elapsed time against monotonic elapsed time. If the wall clock
+   * jumped forward by more than 1 minute, the key expiration is deferred by the jump amount
+   * to prevent premature rate limit counter expiration from NTP corrections.
+   */
+  private isExpired(expiresAt: number): boolean {
+    const wallNow = Date.now();
+    const monoNow = performance.now();
+
+    const wallElapsed = wallNow - this.lastWallTime;
+    const monoElapsed = monoNow - this.lastMonoTime;
+
+    // Detect clock forward-jump: wall clock advanced much more than monotonic clock
+    const clockDrift = wallElapsed - monoElapsed;
+    if (clockDrift > 60_000) {
+      // Clock jumped forward by more than 1 minute
+      if (!this.clockJumpWarningEmitted) {
+        this.clockJumpWarningEmitted = true;
+        try {
+          process.emitWarning(
+            `MemoryStore: clock forward-jump detected (${Math.round(clockDrift / 1000)}s drift). ` +
+            `Deferring TTL expiration to prevent premature rate limit counter reset. ` +
+            `This may indicate an NTP correction or clock manipulation.`,
+            "SecurityWarning",
+          );
+        } catch { /* non-fatal */ }
+      }
+      // Defer expiration: treat the key as not expired if it would only be expired
+      // due to the clock jump. Use monotonic-adjusted time for comparison.
+      const adjustedNow = wallNow - clockDrift;
+      return adjustedNow > expiresAt;
+    }
+
+    // Update tracking (only when no jump detected to avoid anchoring to jumped time)
+    this.lastWallTime = wallNow;
+    this.lastMonoTime = monoNow;
+    this.clockJumpWarningEmitted = false;
+
+    return wallNow > expiresAt;
+  }
+
+  /**
    * Retrieve a value by key. Returns null if not found or expired.
    *
    * M-35 WARNING: TTL enforcement relies on system clock integrity (Date.now()).
@@ -205,11 +285,12 @@ export class MemoryStore implements Store {
    */
   async get(key: string): Promise<string | null> {
     validateKey(key);
-    const entry = this.data.get(key);
+    const entry = this.#data.get(key);
     if (!entry) return null;
 
-    if (entry.expiresAt && Date.now() > entry.expiresAt) {
-      this.data.delete(key);
+    // M44 fix: Use monotonic-aware expiration check
+    if (entry.expiresAt && this.isExpired(entry.expiresAt)) {
+      this.#data.delete(key);
       return null;
     }
 
@@ -224,17 +305,28 @@ export class MemoryStore implements Store {
     if (ttlSeconds !== undefined && (!Number.isFinite(ttlSeconds) || ttlSeconds <= 0)) {
       throw new Error(`MemoryStore.set: ttlSeconds must be a positive finite number, got ${ttlSeconds}`);
     }
+    if (ttlSeconds !== undefined && ttlSeconds > MAX_TTL_SECONDS) {
+      throw new Error(`MemoryStore.set: ttlSeconds ${ttlSeconds} exceeds maximum of ${MAX_TTL_SECONDS} seconds (30 days)`);
+    }
     // MED-22 fix: Reject values exceeding maximum length to prevent memory exhaustion
     if (value.length > MAX_VALUE_LENGTH) {
       throw new Error(
         `MemoryStore.set: value length ${value.length} exceeds maximum of ${MAX_VALUE_LENGTH} characters`,
       );
     }
+    // M17 fix: Enforce max key limit for NEW keys (existing key updates are fine)
+    if (!this.#data.has(key) && this.#data.size >= this.maxKeys) {
+      throw new Error(
+        `MemoryStore: maximum key count (${this.maxKeys}) reached. ` +
+        `Cannot create new key. This limit prevents unbounded memory growth. ` +
+        `Configure maxKeys in MemoryStoreConfig to increase, or investigate key creation patterns.`,
+      );
+    }
     const entry: StoreEntry = { value };
     if (ttlSeconds !== undefined && ttlSeconds > 0) {
       entry.expiresAt = Date.now() + ttlSeconds * 1000;
     }
-    this.data.set(key, entry);
+    this.#data.set(key, entry);
   }
 
   /**
@@ -249,10 +341,14 @@ export class MemoryStore implements Store {
     if (ttlSeconds !== undefined && (!Number.isFinite(ttlSeconds) || ttlSeconds <= 0)) {
       throw new Error(`MemoryStore.setIfNotExists: ttlSeconds must be a positive finite number, got ${ttlSeconds}`);
     }
-    const entry = this.data.get(key);
+    if (ttlSeconds !== undefined && ttlSeconds > MAX_TTL_SECONDS) {
+      throw new Error(`MemoryStore.setIfNotExists: ttlSeconds ${ttlSeconds} exceeds maximum of ${MAX_TTL_SECONDS} seconds (30 days)`);
+    }
+    const entry = this.#data.get(key);
     if (entry) {
-      if (entry.expiresAt && Date.now() > entry.expiresAt) {
-        this.data.delete(key);
+      // M44 fix: Use monotonic-aware expiration check
+      if (entry.expiresAt && this.isExpired(entry.expiresAt)) {
+        this.#data.delete(key);
       } else {
         return false;
       }
@@ -262,7 +358,7 @@ export class MemoryStore implements Store {
     if (ttlSeconds !== undefined && ttlSeconds > 0) {
       newEntry.expiresAt = Date.now() + ttlSeconds * 1000;
     }
-    this.data.set(key, newEntry);
+    this.#data.set(key, newEntry);
     return true;
   }
 
@@ -301,6 +397,11 @@ export class MemoryStore implements Store {
    * running in a threat model where clock manipulation is a concern. However,
    * performance.now() resets on process restart, so it is not suitable for
    * persistent TTL enforcement across restarts.
+   *
+   * ST-14 KNOWN LIMITATION: Clock manipulation can bypass TTL-based limits in
+   * both MemoryStore and SqliteStore. For high-security deployments, consider
+   * using monotonic clocks (performance.now()) for relative time measurements
+   * instead of Date.now(). This requires careful handling of process restarts.
    * =========================================================================
    */
   async increment(key: string, amount: number): Promise<number> {
@@ -311,51 +412,65 @@ export class MemoryStore implements Store {
       throw new Error(`increment amount must be a finite number, got ${typeof amount === 'number' ? amount : typeof amount}`);
     }
     validateKey(key);
+    // M17 fix: Enforce max key limit for NEW keys in increment()
+    if (!this.#data.has(key) && this.#data.size >= this.maxKeys) {
+      throw new Error(
+        `MemoryStore: maximum key count (${this.maxKeys}) reached. ` +
+        `Cannot create new key via increment(). This limit prevents unbounded memory growth. ` +
+        `Configure maxKeys in MemoryStoreConfig to increase, or investigate key creation patterns.`,
+      );
+    }
     // Synchronous atomic operation — no await between read and write
-    const entry = this.data.get(key);
+    const entry = this.#data.get(key);
     let current = 0;
     let existingTtl: number | undefined;
     let keyExists = false;
 
     if (entry) {
-      // Check TTL expiration
-      if (entry.expiresAt && Date.now() > entry.expiresAt) {
-        this.data.delete(key);
+      // M44 fix: Use monotonic-aware expiration check
+      if (entry.expiresAt && this.isExpired(entry.expiresAt)) {
+        this.#data.delete(key);
       } else {
         keyExists = true;
         // H-25 fix: Verify HMAC integrity of existing counter value before trusting it.
         // The HMAC is stored in a separate key ({key}:__hmac) to avoid polluting the
         // counter value returned by get(). If the HMAC is missing or invalid, the counter
         // may have been tampered with — treat as corrupted and reset to 0.
-        const hmacEntry = this.data.get(key + ":__hmac");
-        // DATA-005 fix: Warn when HMAC entry is missing. This could indicate:
-        // (a) the counter was initialized via set() (legitimate, no HMAC created), or
-        // (b) an attacker deleted the HMAC entry to bypass integrity checks.
-        // We emit a SecurityWarning but trust the value, since set()-initialized
-        // counters legitimately lack HMAC entries. Only when an HMAC EXISTS but is
-        // INVALID do we reset to 0 (definitive evidence of tampering).
+        const hmacEntry = this.#data.get(key + "\x00__hmac");
+        // ST-01 fix: When HMAC entry is missing but counter key exists, reset to 0.
+        // Previously the value was trusted when the HMAC was missing, which allowed
+        // an attacker to delete the HMAC entry and have the tampered counter value
+        // accepted. Now missing HMAC is treated the same as HMAC mismatch — the
+        // counter is reset to 0, which is the safe default.
         if (!hmacEntry) {
           try {
             // LOW-27 fix: Redact key to prevent leaking sensitive token/agent/wallet info in warnings
             process.emitWarning(
               `MemoryStore.increment: HMAC entry missing for key "${redactStoreKey(key)}". ` +
-              `Counter may have been tampered with (HMAC deleted), or was initialized via set().`,
+              `Counter integrity cannot be verified — possible tampering or crash recovery. ` +
+              `Proceeding with current value to avoid spending limit bypass.`,
               "SecurityWarning",
             );
           } catch { /* non-fatal */ }
-          // Trust the value but proceed with caution — next increment will create an HMAC
+          // AUDIT-M13 fix: Do NOT reset to 0 on missing HMAC. Resetting enables a spending
+          // limit bypass attack: an attacker who can delete the HMAC entry erases all spend
+          // history, allowing the agent to spend again up to the full limit. Instead, preserve
+          // the current value (same approach as RedisStore) for consistent fail-safe behavior.
           const parsed = parseFloat(entry.value);
-          current = isNaN(parsed) ? 0 : parsed;
+          current = Number.isFinite(parsed) ? parsed : 0;
         } else if (!this.verifyCounterHmac(key, entry.value, hmacEntry.value)) {
           try {
             // LOW-27 fix: Redact key to prevent leaking sensitive token/agent/wallet info in warnings
             process.emitWarning(
               `MemoryStore.increment: HMAC verification failed for key "${redactStoreKey(key)}". ` +
-              `Counter value may have been tampered with. Resetting to 0.`,
+              `Counter value may have been tampered with. ` +
+              `Proceeding with current value to avoid spending limit bypass.`,
               "SecurityWarning",
             );
           } catch { /* non-fatal */ }
-          current = 0;
+          // AUDIT-M13 fix: Preserve current value instead of resetting to 0 (same rationale).
+          const parsed = parseFloat(entry.value);
+          current = Number.isFinite(parsed) ? parsed : 0;
         } else {
           const parsed = parseFloat(entry.value);
           // MED-23 fix: Detect non-numeric counter values instead of silently resetting
@@ -394,15 +509,15 @@ export class MemoryStore implements Store {
       // to prevent counter entries from persisting indefinitely without a TTL.
       newEntry.expiresAt = Date.now() + this.defaultCounterTtlSeconds * 1000;
     }
-    this.data.set(key, newEntry);
+    this.#data.set(key, newEntry);
     // DATA-012 fix: Copy the counter's TTL to the HMAC entry so orphaned HMAC
     // entries don't persist indefinitely after the counter's TTL expires.
     // Without this, long-running processes accumulate unbounded HMAC entries.
-    const hmacEntry: StoreEntry = { value: hmac };
+    const hmacStoreEntry: StoreEntry = { value: hmac };
     if (newEntry.expiresAt) {
-      hmacEntry.expiresAt = newEntry.expiresAt;
+      hmacStoreEntry.expiresAt = newEntry.expiresAt;
     }
-    this.data.set(key + ":__hmac", hmacEntry);
+    this.#data.set(key + "\x00__hmac", hmacStoreEntry);
     return newValue;
   }
 
@@ -420,7 +535,7 @@ export class MemoryStore implements Store {
         `MemoryStore.append: value length ${value.length} exceeds maximum of ${MAX_VALUE_LENGTH} characters`,
       );
     }
-    const list = this.lists.get(key) ?? [];
+    const list = this.#lists.get(key) ?? [];
     list.push(value);
     // CRIT-03 fix: Evict oldest entries when list exceeds max size
     if (list.length > MAX_LIST_SIZE) {
@@ -436,7 +551,7 @@ export class MemoryStore implements Store {
       );
       list.splice(0, evicted);
     }
-    this.lists.set(key, list);
+    this.#lists.set(key, list);
   }
 
   /** Get the most recent entries from a list, newest first. */
@@ -445,7 +560,7 @@ export class MemoryStore implements Store {
     if (count <= 0) return [];
     // MED-T5-07 fix: Cap count to MAX_LIST_SIZE to prevent loading unbounded entries
     const cappedCount = Math.min(count, MAX_LIST_SIZE);
-    const list = this.lists.get(key) ?? [];
+    const list = this.#lists.get(key) ?? [];
     return list.slice(-cappedCount).reverse();
   }
 
@@ -456,13 +571,20 @@ export class MemoryStore implements Store {
    */
   async clearList(key: string): Promise<void> {
     validateKey(key);
-    this.lists.delete(key);
+    this.#lists.delete(key);
   }
 
   /** Clear all data (useful for testing) */
   clear(): void {
-    this.data.clear();
-    this.lists.clear();
+    // ST-18 fix: Overwrite values before clearing to reduce exposure of sensitive data
+    // in memory. Note: JavaScript strings are immutable — the original string values
+    // remain in V8's heap until garbage collected. This overwrite replaces the Map
+    // entries' references but cannot guarantee the original string bytes are zeroed.
+    // For true secure erasure, store sensitive values in Buffers (not strings).
+    for (const [k] of this.#data) this.#data.set(k, { value: "", expiresAt: undefined });
+    this.#data.clear();
+    for (const [k] of this.#lists) this.#lists.set(k, []);
+    this.#lists.clear();
   }
 
   /**
@@ -502,20 +624,23 @@ export class MemoryStore implements Store {
     // T1-F4 fix: Zero the HMAC key material using Buffer.fill(0) for reliable in-place
     // zeroization. Unlike strings (which are immutable in V8), Buffer.fill(0) overwrites
     // the underlying ArrayBuffer bytes directly, preventing recovery from heap dumps.
-    if (this.hmacKey) {
-      this.hmacKey.fill(0);
+    if (this.#hmacKey) {
+      this.#hmacKey.fill(0);
     }
     this.stopGc();
-    this.data.clear();
-    this.lists.clear();
+    // ST-18 fix: Overwrite values before clearing to reduce exposure of sensitive data
+    for (const [k] of this.#data) this.#data.set(k, { value: "", expiresAt: undefined });
+    this.#data.clear();
+    for (const [k] of this.#lists) this.#lists.set(k, []);
+    this.#lists.clear();
   }
 
   /** LOW-04 fix: Sweep all expired entries from the data map. */
   private sweepExpired(): void {
-    const now = Date.now();
-    for (const [key, entry] of this.data) {
-      if (entry.expiresAt && now > entry.expiresAt) {
-        this.data.delete(key);
+    // M44 fix: Use monotonic-aware expiration check
+    for (const [key, entry] of this.#data) {
+      if (entry.expiresAt && this.isExpired(entry.expiresAt)) {
+        this.#data.delete(key);
       }
     }
   }

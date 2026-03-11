@@ -137,7 +137,7 @@ const wallet = new AgentWallet({
 // SqliteStore: a persistent store backed by SQLite (survives process restarts).
 // RateLimitRule: limits how many transactions can execute per minute/hour.
 // ApprovalGateRule: requires human approval for transactions above a dollar threshold.
-// TelegramApprovalBot: sends approval requests to a Telegram chat and waits for human response.
+// CallbackApprovalChannel: sends approval requests via callbacks and waits for human response.
 // AuditLogger: records every transaction attempt (allowed or denied) in a tamper-evident hash chain.
 import {
   AgentWallet,
@@ -148,7 +148,7 @@ import {
   SpendingLimitRule,
   RateLimitRule,
   ApprovalGateRule,
-  TelegramApprovalBot,
+  CallbackApprovalChannel,
   AuditLogger,
 } from "kova";
 import { Keypair } from "@solana/web3.js";
@@ -170,15 +170,17 @@ const chain = new SolanaAdapter({
   commitment: "finalized",
 });
 
-// Set up a Telegram approval bot as the human-in-the-loop approval channel.
-// - token: the Telegram Bot API token (keep this secret; loaded from an environment variable).
-// - chatId: the Telegram chat where approval requests are sent.
-// - allowedUserIds: only these Telegram user IDs can approve/reject transactions.
-//   This prevents unauthorized users in the chat from approving transactions.
-const approval = new TelegramApprovalBot({
-  token: process.env.TELEGRAM_BOT_TOKEN!,
-  chatId: process.env.TELEGRAM_CHAT_ID!,
-  allowedUserIds: [123456789],
+// Set up a callback-based approval channel for human-in-the-loop approval.
+// You provide two callbacks: one to notify a human, one to wait for their decision.
+// This works with any notification mechanism (Telegram, Slack, email, SMS, etc.).
+const approval = new CallbackApprovalChannel({
+  name: "my-approval",
+  onApprovalRequest: async (request) => {
+    await notifyApprover(request); // Send notification via your preferred channel
+  },
+  waitForDecision: async (request) => {
+    return pollForResponse(request.id); // Wait for human's response
+  },
 });
 
 // Build the PolicyEngine with multiple rules, ordered from cheapest to most expensive.

@@ -14,23 +14,26 @@
  * should not be used for this determination.
  */
 
-import { PublicKey } from "@solana/web3.js";
-import { getAssociatedTokenAddressSync } from "@solana/spl-token";
+import { PublicKey, type Connection } from "@solana/web3.js";
+import { getAssociatedTokenAddressSync, getMint } from "@solana/spl-token";
 
 // ── Token Registry ──────────────────────────────────────────────────
 
 /** Well-known SPL token mint addresses and decimals (mainnet) */
-export const TOKEN_MINTS: Record<string, { mint: string; decimals: number }> = {
-  SOL: { mint: "So11111111111111111111111111111111111111112", decimals: 9 },
-  USDC: { mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", decimals: 6 },
-  USDT: { mint: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", decimals: 6 },
-};
+// AUDIT-H9 fix: Freeze token registries to prevent runtime mutation.
+// Without Object.freeze, any consumer could do TOKEN_MINTS["SOL"] = { mint: "attacker-address", decimals: 9 }
+// which would corrupt token resolution SDK-wide.
+export const TOKEN_MINTS: Readonly<Record<string, Readonly<{ mint: string; decimals: number }>>> = Object.freeze({
+  SOL: Object.freeze({ mint: "So11111111111111111111111111111111111111112", decimals: 9 }),
+  USDC: Object.freeze({ mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", decimals: 6 }),
+  USDT: Object.freeze({ mint: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", decimals: 6 }),
+});
 
 /** Devnet overrides (some tokens have different mint addresses on devnet) */
-export const DEVNET_TOKEN_MINTS: Record<string, { mint: string; decimals: number }> = {
-  SOL: { mint: "So11111111111111111111111111111111111111112", decimals: 9 },
-  USDC: { mint: "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU", decimals: 6 },
-};
+export const DEVNET_TOKEN_MINTS: Readonly<Record<string, Readonly<{ mint: string; decimals: number }>>> = Object.freeze({
+  SOL: Object.freeze({ mint: "So11111111111111111111111111111111111111112", decimals: 9 }),
+  USDC: Object.freeze({ mint: "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU", decimals: 6 }),
+});
 
 /**
  * MED-T1-05 fix: Verify that known token mint addresses have not been tampered with.
@@ -90,6 +93,16 @@ export function isNativeSOL(token: string): boolean {
  * that it is a valid PublicKey format. It does NOT verify on-chain that the address
  * is actually a valid SPL Token mint account. Callers interacting with arbitrary
  * mint addresses should verify the account owner is the Token Program on-chain.
+ *
+ * SOL-14: For production use with arbitrary (user-provided) mint addresses, callers
+ * SHOULD perform on-chain verification via `connection.getAccountInfo(mintPubkey)` to
+ * confirm that:
+ * 1. The account exists on-chain (non-null result)
+ * 2. The account owner is the SPL Token Program or Token-2022 Program
+ * 3. The account data parses as a valid Mint struct
+ * Without this verification, an arbitrary base58 string could reference a non-existent
+ * account, a non-mint account, or even a program-owned account that is not a token.
+ * See also: `validateMintAddress()` for format-level validation with registry awareness.
  */
 /**
  * Base58 alphabet used by Solana (Bitcoin-style base58check without the checksum).
@@ -150,6 +163,55 @@ export function getTokenDecimals(token: string, isDevnet?: boolean): number | nu
   const registry = isDevnet ? DEVNET_TOKEN_MINTS : TOKEN_MINTS;
   const entry = registry[normalizeTokenSymbol(token)];
   return entry?.decimals ?? null;
+}
+
+// ── Dynamic Token Decimal Lookup ──────────────────────────────────────
+
+/**
+ * M29 fix: In-memory cache for on-chain token decimal lookups.
+ * Prevents repeated RPC calls for the same mint address.
+ * TTL: 5 minutes. Max size: 1000 entries (FIFO eviction).
+ */
+const decimalsCache = new Map<string, { decimals: number; fetchedAt: number }>();
+const DECIMALS_CACHE_TTL_MS = 300_000; // 5 minutes
+const DECIMALS_CACHE_MAX_SIZE = 1000;
+
+/**
+ * M29 fix: Fetch token decimals from on-chain mint account data.
+ * Falls back to on-chain RPC lookup when the token is not in the hardcoded registry.
+ * Results are cached in-memory with a 5-minute TTL to avoid repeated RPC calls.
+ *
+ * @param connection - Solana RPC connection
+ * @param mintAddress - The token mint address (PublicKey or base58 string)
+ * @returns The number of decimals for the token
+ * @throws SolanaAdapterError if the on-chain lookup fails
+ */
+export async function getTokenDecimalsOnChain(
+  connection: Connection,
+  mintAddress: string | PublicKey,
+): Promise<number> {
+  const mint = typeof mintAddress === "string" ? new PublicKey(mintAddress) : mintAddress;
+  const key = mint.toBase58();
+
+  // Check cache
+  const cached = decimalsCache.get(key);
+  if (cached && Date.now() - cached.fetchedAt < DECIMALS_CACHE_TTL_MS) {
+    return cached.decimals;
+  }
+
+  // On-chain lookup
+  const mintInfo = await getMint(connection, mint);
+
+  // Cache with FIFO eviction
+  if (decimalsCache.size >= DECIMALS_CACHE_MAX_SIZE) {
+    const oldestKey = decimalsCache.keys().next().value;
+    if (oldestKey !== undefined) {
+      decimalsCache.delete(oldestKey);
+    }
+  }
+  decimalsCache.set(key, { decimals: mintInfo.decimals, fetchedAt: Date.now() });
+
+  return mintInfo.decimals;
 }
 
 // ── Mint Address Validation ──────────────────────────────────────────
@@ -295,7 +357,15 @@ export function toSmallestUnit(amount: string, decimals: number): bigint {
   // smallest-unit result is 0, this means the amount has more decimal places
   // than the token supports and was silently truncated. This is dangerous because
   // the user intended to send a non-zero amount but the transaction would send nothing.
-  // AUDIT-L-8: parseFloat used for zero detection. Safe for practical amounts.
+  // AUDIT-LOW-6: parseFloat() is used here for zero detection — checking whether the
+  // original string represents a non-zero value that truncated to 0n. This is a known
+  // heuristic limitation: parseFloat has ~15-17 significant digits of precision (IEEE 754),
+  // so extremely small values with many leading zeros (e.g., "0." followed by 300+ zeros
+  // and then "1") would parseFloat to 0, causing a false negative (the check would not
+  // detect that the original amount was non-zero). In practice, no real token has more
+  // than ~18 decimal places, so this is safe for all Solana tokens. A fully correct
+  // implementation would use string-based comparison (check if the amount string contains
+  // any non-zero digit after the decimal point within the token's decimal precision range).
   if (result === 0n && parseFloat(amount) > 0) {
     // LOW-T1-05 fix: Redact exact input value from error message to prevent information leakage
     throw new SolanaAdapterError(
@@ -452,12 +522,34 @@ export function sanitizeTokenName(value: string): string {
   return value.replace(/[^\x20-\x7E]/g, "?");
 }
 
+// ── Error Sanitization ──────────────────────────────────────────
+
+/**
+ * M64 fix: Sanitize RPC error messages to strip infrastructure details.
+ * RPC error messages may contain server URLs, internal IPs, or file paths
+ * that leak infrastructure details. This function replaces:
+ * - HTTP(S)/WSS URLs with [redacted-url]
+ * - IPv4 addresses (e.g., 192.168.1.1) with [redacted-ip]
+ * - IPv6 addresses with [redacted-ip]
+ * - File paths (e.g., /usr/local/bin/...) with [redacted-path]
+ */
+export function sanitizeRpcError(message: string): string {
+  let sanitized = message;
+  // Strip URLs (http, https, ws, wss)
+  sanitized = sanitized.replace(/(?:https?|wss?):\/\/[^\s,)}\]"']+/gi, "[redacted-url]");
+  // Strip IPv4 addresses (but not version-like patterns e.g., "v1.2.3")
+  sanitized = sanitized.replace(/\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(:\d+)?\b/g, "[redacted-ip]");
+  // Strip file paths (Unix-style: /path/to/something with at least 3 segments)
+  sanitized = sanitized.replace(/\/[\w.-]+\/[\w.-]+\/[\w./-]+/g, "[redacted-path]");
+  return sanitized;
+}
+
 // ── Error Types ──────────────────────────────────────────────────
 
 export class SolanaAdapterError extends Error {
   readonly code: string;
   constructor(code: string, message: string) {
-    super(message);
+    super(sanitizeRpcError(message));
     this.name = "SolanaAdapterError";
     this.code = code;
   }
@@ -528,6 +620,16 @@ export function isPrivateIPv6(ip: string): boolean {
   if (lower.startsWith("100:")) return true;
   if (lower.startsWith("2001:db8:") || lower.startsWith("2001:0db8:")) return true;
   if (lower.startsWith("2002:")) return true;
-  if (lower.startsWith("2001:0000:") || lower.startsWith("2001:0:") || lower.startsWith("2001::")) return true;
+  // AUDIT-LOW-7 fix: Teredo tunnel detection (2001:0000::/32).
+  // Previously included `lower.startsWith("2001::")` which false-positives on any address
+  // in the 2001::/16 range (e.g., 2001::1, 2001:db8::1 which is documentation prefix).
+  // Teredo is specifically 2001:0000::/32, meaning the second group must be 0.
+  // Canonical forms: "2001:0000:" (full) or "2001:0:" (compressed zero group).
+  // "2001::" only matches Teredo if nothing follows the "::" except content in groups 3+,
+  // but "::" can compress multiple zero groups making it ambiguous. We restrict to the
+  // precise prefix matches to avoid false-positives on legitimate 2001::/16 addresses.
+  if (lower.startsWith("2001:0000:") || lower.startsWith("2001:0:")) return true;
+  // Handle the edge case where the address is exactly "2001::" (all zeros after first group)
+  if (lower === "2001::" || lower.startsWith("2001::0:") || lower.startsWith("2001::0.")) return true;
   return false;
 }

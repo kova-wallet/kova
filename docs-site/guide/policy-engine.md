@@ -21,7 +21,7 @@ The `PolicyEngine` is the core enforcement layer of `kova`. It holds an ordered 
 - **You want to limit how much your agent can spend.** Set per-transaction, daily, weekly, or monthly spending caps.
 - **You want to control how fast your agent can transact.** Rate-limit transactions to prevent runaway loops.
 - **You want to restrict where funds can go.** Allowlist specific recipient addresses and block everything else.
-- **You want human oversight for large transactions.** Require Telegram or Slack approval above a certain amount.
+- **You want human oversight for large transactions.** Require human approval above a certain amount via any channel (Slack, email, webhook, etc.).
 - **You want transactions restricted to business hours.** Only allow operations during specific days and times.
 
 ## Constructor
@@ -42,7 +42,7 @@ const engine = new PolicyEngine(rules, store, approval?, getValueInUSD?, mutexTi
 |-----------|------|----------|-------------|
 | `rules` | `PolicyRule[]` | Yes | Ordered list of rules to evaluate. Must contain at least one rule. |
 | `store` | `Store` | Yes | Store instance for spending counters, rate limits, etc. (the database that tracks how much has been spent) |
-| `approval` | `ApprovalChannel` | No | Approval channel for rules that require human-in-the-loop (e.g., a Telegram bot) |
+| `approval` | `ApprovalChannel` | No | Approval channel for rules that require human-in-the-loop (e.g., `CallbackApprovalChannel`) |
 | `getValueInUSD` | `(token: string, amount: string) => Promise<number>` | No | Function to convert token amounts to USD for spending limit evaluation |
 | `mutexTimeoutMs` | `number` | No | Timeout in milliseconds for acquiring the evaluation mutex |
 
@@ -169,16 +169,16 @@ const engine = new PolicyEngine(
     new SpendingLimitRule(config.spendingLimit!),
 
     // Position 5: ApprovalGateRule — most expensive (blocks execution waiting for human response).
-    // Only reached if ALL cheaper rules have passed. Sends a Telegram/Slack message and waits.
+    // Only reached if ALL cheaper rules have passed. Sends an approval request and waits.
     new ApprovalGateRule(config.approvalGate!),
   ],
   store,
-  approval, // The approval channel (e.g., TelegramApprovalBot) used by ApprovalGateRule
+  approval, // The approval channel (e.g., CallbackApprovalChannel) used by ApprovalGateRule
 );
 ```
 
 ::: tip
-If you place `ApprovalGateRule` first, every high-value transaction would trigger a Telegram message even if it would be denied by a rate limit. By placing cheap rules first, the agent gets an instant denial without bothering the human approver.
+If you place `ApprovalGateRule` first, every high-value transaction would trigger an approval request even if it would be denied by a rate limit. By placing cheap rules first, the agent gets an instant denial without bothering the human approver.
 :::
 
 ::: warning You do not need all five rules
@@ -344,7 +344,7 @@ import {
   AllowlistRule,       // Restricts allowed addresses and programs
   TimeWindowRule,      // Restricts when transactions can occur
   ApprovalGateRule,    // Requires human approval above a threshold
-  TelegramApprovalBot, // Sends approval requests via Telegram
+  CallbackApprovalChannel, // Sends approval requests via callbacks
 } from "kova";
 
 // Step 1: Build the policy config using the fluent builder API.
@@ -396,15 +396,19 @@ const config = policy.toJSON();
 // Each rule is constructed from the relevant section of the policy config.
 const store = new MemoryStore();
 
-// Set up the Telegram approval bot for human-in-the-loop approval.
-// The bot token and chat ID are loaded from environment variables for security.
-const approval = new TelegramApprovalBot({
-  token: process.env.TELEGRAM_BOT_TOKEN!,
-  chatId: process.env.TELEGRAM_CHAT_ID!,
+// Set up the approval channel for human-in-the-loop approval.
+const approval = new CallbackApprovalChannel({
+  name: "my-approval",
+  onApprovalRequest: async (request) => {
+    await notifyApprover(request);
+  },
+  waitForDecision: async (request) => {
+    return pollForResponse(request.id);
+  },
 });
 
 // Create the rule array in the recommended order: cheapest rules first.
-// This ensures that expensive operations (like waiting for Telegram approval)
+// This ensures that expensive operations (like waiting for human approval)
 // only run when all cheap checks have already passed.
 const rules = [
   new RateLimitRule(config.rateLimit!),                          // Cheapest: counter lookup
@@ -543,7 +547,7 @@ This makes it straightforward to store policy configurations in databases, confi
 ## Common Mistakes
 
 **1. Putting `ApprovalGateRule` before cheaper rules.**
-If `ApprovalGateRule` is first, every high-value transaction will trigger a Telegram message to a human -- even ones that would be instantly denied by a rate limit or spending cap. Always put cheap rules first and expensive rules last.
+If `ApprovalGateRule` is first, every high-value transaction will trigger an approval request to a human -- even ones that would be instantly denied by a rate limit or spending cap. Always put cheap rules first and expensive rules last.
 
 **2. Passing an empty rules array.**
 The `PolicyEngine` constructor throws an error if you pass `[]`. This is intentional -- a policy with no rules would allow everything, which defeats the purpose. You must always have at least one rule.

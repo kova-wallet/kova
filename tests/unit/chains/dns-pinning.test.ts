@@ -339,14 +339,16 @@ describe("SolanaAdapter constructor — rejects private IP URLs", () => {
       expect((thrownError as SolanaAdapterError).code).toBe("SSRF_BLOCKED");
     });
 
-    it("should include the blocked IP in the error message", () => {
+    it("should redact the blocked IP in the error message (M64 fix)", () => {
       let errorMessage = "";
       try {
         new SolanaAdapter({ rpcUrl: "https://192.168.1.1:8899" });
       } catch (err) {
         errorMessage = (err as Error).message;
       }
-      expect(errorMessage).toContain("192.168.1.1");
+      // M64 fix: sanitizeRpcError redacts IPs from error messages
+      expect(errorMessage).toContain("[redacted-ip]");
+      expect(errorMessage).not.toContain("192.168.1.1");
     });
   });
 

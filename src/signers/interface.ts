@@ -3,6 +3,8 @@
  * The consuming code only knows that it can request an address and a signature.
  */
 
+export const nodeInspectSymbol: unique symbol = Symbol.for("nodejs.util.inspect.custom") as unknown as typeof nodeInspectSymbol;
+
 export interface UnsignedTransaction {
   /** Chain identifier */
   chain: string;
@@ -54,4 +56,6 @@ export interface Signer {
    * never exposing private key material.
    */
   toJSON(): Record<string, unknown>;
+
+  [nodeInspectSymbol]?: () => string;
 }

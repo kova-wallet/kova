@@ -29,8 +29,8 @@ describe("sanitizeToolResponse — prompt injection defenses", () => {
     const lines = sanitized.split("\n");
     // The first line should be the real start delimiter
     expect(lines[0]).toContain("TOOL RESPONSE DATA START");
-    // The last line should be the real end delimiter
-    expect(lines[lines.length - 1]).toBe("<<< TOOL RESPONSE DATA END >>>");
+    // The last line should be the real end delimiter (with nonce)
+    expect(lines[lines.length - 1]).toMatch(/^<<< TOOL RESPONSE DATA END \[[0-9a-f]+\] >>>$/);
     // The response is wrapped in clear delimiters so the LLM can distinguish
     // the real boundary from spoofed data. The spoofed delimiter in the data
     // is inside a JSON string, structurally distinguishable from the real one.
@@ -62,7 +62,7 @@ describe("sanitizeToolResponse — prompt injection defenses", () => {
 
 describe("validateToolInput — adversarial input handling", () => {
   it("rejects __proto__ keys by stripping them as unknown properties", () => {
-    const input = {
+    const _input = {
       token: "SOL",
       __proto__: { polluted: true },
     } as unknown as Record<string, unknown>;

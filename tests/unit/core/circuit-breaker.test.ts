@@ -76,15 +76,30 @@ function createTransferIntent(overrides?: Partial<TransactionIntent>): Transacti
 
 function createWallet(overrides?: Partial<AgentWalletConfig>) {
   const store = overrides?.store ?? new MemoryStore();
+  // Merge failOnMultiInstance: false into any provided circuitBreaker config
+  const cbConfig = overrides?.circuitBreaker === false
+    ? false as const
+    : { failOnMultiInstance: false, ...(typeof overrides?.circuitBreaker === "object" ? overrides.circuitBreaker : {}) };
   const defaults: AgentWalletConfig = {
     signer: createMockSigner(),
     chain: createMockChain(),
     policy: new PolicyEngine([allowAllRule], store as MemoryStore),
     store,
+    circuitBreaker: cbConfig,
+    dangerouslyDisableAuth: true,
   };
-  return new AgentWallet({ ...defaults, ...overrides });
+  return new AgentWallet({ ...defaults, ...overrides, circuitBreaker: cbConfig });
 }
 
+/** Helper: create and initialize a CircuitBreaker (required after CRIT-02 enforcement) */
+async function _createCB(
+  cbStore: MemoryStore,
+  config?: Partial<{ threshold: number; cooldownMs: number; failOnMultiInstance: boolean; intentTypes: string[] }>,
+): Promise<CircuitBreaker> {
+  const cb = new CircuitBreaker(cbStore, { failOnMultiInstance: false, ...config });
+  await cb.initialize();
+  return cb;
+}
 // ── Unit tests for CircuitBreaker class ───────────────────────────────
 
 describe("CircuitBreaker", () => {
@@ -132,12 +147,14 @@ describe("CircuitBreaker", () => {
   describe("check()", () => {
     it("should return null initially (no denials recorded)", async () => {
       const cb = new CircuitBreaker(store);
+      await cb.initialize();
       const result = await cb.check();
       expect(result).toBeNull();
     });
 
     it("should return null when denial count is below threshold", async () => {
       const cb = new CircuitBreaker(store, { threshold: 5 });
+      await cb.initialize();
 
       // Record 4 denials (below threshold of 5)
       await cb.recordOutcome("DENY");
@@ -152,6 +169,7 @@ describe("CircuitBreaker", () => {
     it("should return a reason string during cooldown period", async () => {
       const now = Date.now();
       const cb = new CircuitBreaker(store, { threshold: 2, cooldownMs: 60_000 });
+      await cb.initialize();
 
       // Trigger cooldown by recording 2 consecutive denials
       await cb.recordOutcome("DENY", now);
@@ -169,6 +187,7 @@ describe("CircuitBreaker", () => {
       const now = Date.now();
       const cooldownMs = 60_000;
       const cb = new CircuitBreaker(store, { threshold: 2, cooldownMs });
+      await cb.initialize();
 
       // Trigger cooldown
       await cb.recordOutcome("DENY", now);
@@ -183,6 +202,7 @@ describe("CircuitBreaker", () => {
       const now = Date.now();
       const cooldownMs = 60_000;
       const cb = new CircuitBreaker(store, { threshold: 2, cooldownMs });
+      await cb.initialize();
 
       // Trigger cooldown
       await cb.recordOutcome("DENY", now);
@@ -206,6 +226,7 @@ describe("CircuitBreaker", () => {
   describe("recordOutcome()", () => {
     it("should reset counter to 0 on ALLOW", async () => {
       const cb = new CircuitBreaker(store, { threshold: 5 });
+      await cb.initialize();
 
       // Record 3 denials
       await cb.recordOutcome("DENY");
@@ -228,6 +249,7 @@ describe("CircuitBreaker", () => {
     it("should increment counter on DENY", async () => {
       const now = Date.now();
       const cb = new CircuitBreaker(store, { threshold: 3, cooldownMs: 60_000 });
+      await cb.initialize();
 
       await cb.recordOutcome("DENY", now);
       expect(await cb.check(now)).toBeNull();
@@ -243,6 +265,7 @@ describe("CircuitBreaker", () => {
     it("should treat PENDING as a no-op (counter does not change)", async () => {
       const now = Date.now();
       const cb = new CircuitBreaker(store, { threshold: 3, cooldownMs: 60_000 });
+      await cb.initialize();
 
       // Record 2 denials (one below threshold)
       await cb.recordOutcome("DENY", now);
@@ -264,6 +287,7 @@ describe("CircuitBreaker", () => {
     it("should trigger cooldown when N denials reach the threshold", async () => {
       const now = Date.now();
       const cb = new CircuitBreaker(store, { threshold: 3, cooldownMs: 120_000 });
+      await cb.initialize();
 
       await cb.recordOutcome("DENY", now);
       await cb.recordOutcome("DENY", now);
@@ -279,6 +303,7 @@ describe("CircuitBreaker", () => {
     it("should reset counter when ALLOW comes after N-1 denials", async () => {
       const now = Date.now();
       const cb = new CircuitBreaker(store, { threshold: 5, cooldownMs: 60_000 });
+      await cb.initialize();
 
       // 4 denials (one below threshold)
       await cb.recordOutcome("DENY", now);
@@ -300,6 +325,7 @@ describe("CircuitBreaker", () => {
     it("should reset counter when ALLOW follows multiple consecutive DENYs", async () => {
       const now = Date.now();
       const cb = new CircuitBreaker(store, { threshold: 10, cooldownMs: 60_000 });
+      await cb.initialize();
 
       // 8 consecutive denials
       for (let i = 0; i < 8; i++) {
@@ -329,6 +355,7 @@ describe("CircuitBreaker", () => {
       const now = Date.now();
       const cooldownMs = 60_000;
       const cb = new CircuitBreaker(store, { threshold: 2, cooldownMs });
+      await cb.initialize();
 
       // Trigger cooldown
       await cb.recordOutcome("DENY", now);
@@ -345,6 +372,7 @@ describe("CircuitBreaker", () => {
       const now = Date.now();
       const cooldownMs = 10_000;
       const cb = new CircuitBreaker(store, { threshold: 1, cooldownMs });
+      await cb.initialize();
 
       // Single denial triggers cooldown (threshold=1)
       await cb.recordOutcome("DENY", now);
@@ -433,6 +461,7 @@ describe("CircuitBreaker — Wallet integration", () => {
       policy,
       store,
       circuitBreaker: { threshold: 5, cooldownMs: 300_000 },
+      strictAdvisoryLock: false,
     });
 
     // 2 denials (below threshold of 5)
@@ -450,6 +479,7 @@ describe("CircuitBreaker — Wallet integration", () => {
       policy: denyPolicy,
       store,
       circuitBreaker: { threshold: 5, cooldownMs: 300_000 },
+      strictAdvisoryLock: false,
     });
 
     for (let i = 0; i < 5; i++) {
@@ -491,6 +521,9 @@ describe("CircuitBreaker — Wallet integration", () => {
       store,
       circuitBreaker: { threshold: 7, cooldownMs: 120_000 },
     });
+
+    // Trigger lazy initialization of the circuit breaker via an execute call
+    await wallet.execute(createTransferIntent({ id: "init-trigger" }));
 
     const policySummary = await wallet.getPolicy();
     expect(policySummary.circuitBreaker).toBeDefined();
@@ -542,5 +575,65 @@ describe("CircuitBreaker — Wallet integration", () => {
     expect(blocked.error!.message).toContain("Circuit breaker open");
     expect(blocked.error!.message).toContain("cooldown remaining");
     expect(blocked.error!.message).toContain("1 consecutive denials");
+  });
+});
+
+// ── Initialization enforcement tests ─────────────────────────────────
+
+describe("CircuitBreaker initialization enforcement", () => {
+  let store: MemoryStore;
+
+  beforeEach(() => {
+    store = new MemoryStore();
+  });
+
+  it("check() throws before initialize()", async () => {
+    const cb = new CircuitBreaker(store);
+    await expect(cb.check()).rejects.toThrow(
+      "CircuitBreaker.initialize() must be called before use.",
+    );
+  });
+
+  it("checkAndRecord() throws before initialize()", async () => {
+    const cb = new CircuitBreaker(store);
+    await expect(cb.checkAndRecord("DENY")).rejects.toThrow(
+      "CircuitBreaker.initialize() must be called before use.",
+    );
+  });
+
+  it("recordOutcome() throws before initialize()", async () => {
+    const cb = new CircuitBreaker(store);
+    await expect(cb.recordOutcome("DENY")).rejects.toThrow(
+      "CircuitBreaker.initialize() must be called before use.",
+    );
+  });
+
+  it("isOpen() returns false before initialize() (safe read-only fallback)", async () => {
+    const cb = new CircuitBreaker(store);
+    // isOpen() is a read-only query; returns false when not initialized
+    const result = await cb.isOpen();
+    expect(result).toBe(false);
+  });
+
+  it("all methods work normally after initialize() is called", async () => {
+    const cb = new CircuitBreaker(store, { threshold: 3, cooldownMs: 60_000 });
+    await cb.initialize();
+
+    // check() should return null (no denials yet)
+    const checkResult = await cb.check();
+    expect(checkResult).toBeNull();
+
+    // recordOutcome() should not throw
+    await cb.recordOutcome("DENY");
+
+    // checkAndRecord() should not throw and return null (below threshold)
+    const carResult = await cb.checkAndRecord("DENY");
+    expect(carResult).toBeNull();
+
+    // isOpen() should return false (below threshold)
+    const open = await cb.isOpen();
+    expect(open).toBe(false);
+
+    cb.destroy();
   });
 });

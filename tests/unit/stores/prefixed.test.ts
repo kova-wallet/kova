@@ -228,12 +228,10 @@ describe("PrefixedStore", () => {
       const prefixed = new PrefixedStore(innerStore, "wallet1");
       await prefixed.increment("counter", 10);
 
-      // The HMAC key should also be prefixed in the inner store
-      // The inner store's increment stores HMAC at `{key}:__hmac`
-      // where {key} = "wallet1|counter"
-      const hmac = await innerStore.get("wallet1|counter:__hmac");
-      expect(hmac).not.toBeNull();
-      expect(/^[0-9a-f]{64}$/.test(hmac!)).toBe(true);
+      // The inner store's increment stores HMAC at `{key}\x00__hmac`
+      // where {key} = "wallet1|counter". Verify indirectly via clean increment.
+      const result = await prefixed.increment("counter", 5);
+      expect(result).toBe(15);
     });
   });
 
