@@ -1,14 +1,18 @@
 # Human-in-the-Loop with Telegram
 
 ::: info What you'll learn
+- How to implement a custom `ApprovalChannel` using Telegram as the delivery mechanism
 - How to create a Telegram bot with BotFather and connect it to your agent wallet
 - How the `ApprovalGateRule` pauses transaction execution and waits for a human decision
-- How to build inline Approve/Reject buttons that resolve pending approvals
 - How to wire the full flow: agent submits transaction → Telegram notification → human decides → agent resumes
 - How to test the complete human-in-the-loop approval cycle end to end
 :::
 
-This tutorial walks you through setting up a Telegram-based <Term id="human-in-the-loop" /> approval system for your agent wallet. High-value transactions will trigger a message to your Telegram chat with Approve and Reject buttons. The agent pauses and waits for your decision before proceeding.
+This tutorial walks you through setting up a Telegram-based <Term id="human-in-the-loop" /> approval system for your agent wallet using kova's `CallbackApprovalChannel`. High-value transactions will trigger a message to your Telegram chat with Approve and Reject buttons. The agent pauses and waits for your decision before proceeding.
+
+::: tip Why Telegram?
+kova ships two generic approval channels — `CallbackApprovalChannel` and `WebhookApprovalChannel` — instead of bundling a Telegram-specific implementation. This gives you full control over how approvals are delivered (Slack, Discord, email, SMS, in-app UI, etc.). This tutorial demonstrates the pattern using Telegram as one example.
+:::
 
 ::: tip New to "human-in-the-loop"?
 "Human-in-the-loop" (HITL) is a pattern where an automated system pauses at critical decision points and asks a human for approval before continuing. In this case, your AI agent will handle small transactions automatically but ask *you* for permission before executing large ones -- similar to how a bank might call you to confirm a large wire transfer.
@@ -93,6 +97,10 @@ export TELEGRAM_BOT_TOKEN="7123456789:AAF1xxxxxxxxxxxxxxxxxxxxxxxxxxx"
 # For private chats, this is a positive integer. For group chats, it is negative.
 export TELEGRAM_CHAT_ID="123456789"
 
+# Set your Telegram user ID for self-approval prevention.
+# In private chats, this is usually the same as the chat ID.
+export TELEGRAM_USER_ID="123456789"
+
 # Set the Solana wallet secret key as a JSON array of 64 bytes.
 # This is the keypair that the agent will use to sign transactions.
 # NEVER commit this value to source control.
@@ -117,56 +125,195 @@ function requireEnv(name: string): string {
 // Load and validate all required environment variables at startup.
 const TELEGRAM_BOT_TOKEN = requireEnv("TELEGRAM_BOT_TOKEN");   // Bot token from @BotFather
 const TELEGRAM_CHAT_ID = requireEnv("TELEGRAM_CHAT_ID");       // Chat ID for approval messages
+const TELEGRAM_USER_ID = requireEnv("TELEGRAM_USER_ID");       // User ID for self-approval prevention
 const SOLANA_SECRET_KEY = requireEnv("SOLANA_SECRET_KEY");      // Wallet keypair (JSON byte array)
 ```
 
 ::: details What just happened?
-You set three environment variables that the application needs to run:
+You set four environment variables that the application needs to run:
 
 - **`TELEGRAM_BOT_TOKEN`** authenticates your app with the Telegram Bot API -- it proves you own this bot.
 - **`TELEGRAM_CHAT_ID`** tells the bot *where* to send approval request messages.
+- **`TELEGRAM_USER_ID`** identifies you for self-approval prevention -- ensures the person who requested a transaction cannot also approve it.
 - **`SOLANA_SECRET_KEY`** is the wallet's private key -- the agent uses it to sign transactions after approval.
 
 These are kept as environment variables (not hardcoded) so you never accidentally commit secrets to version control.
 :::
 
-## Step 4: Create the TelegramApprovalBot Instance
+## Step 4: Build a Telegram Approval Channel
+
+kova's `CallbackApprovalChannel` lets you plug in any notification and decision-collection mechanism. Here, we'll use the Telegram Bot API.
+
+The key idea: you provide two callbacks:
+- **`onApprovalRequest`** — sends a Telegram message with Approve/Reject buttons
+- **`waitForDecision`** — polls Telegram for the human's button click
 
 ```typescript
-import { TelegramApprovalBot } from "kova";
+import { CallbackApprovalChannel } from "kova";
+import type { ApprovalRequest, ApprovalResult } from "kova";
 
-// Create the TelegramApprovalBot instance. This implements the ApprovalChannel
-// interface and sends rich messages with inline Approve/Reject buttons.
-// When a high-value transaction is detected, it sends a message to the specified
-// chat and polls for the human's button-click response.
-const approvalBot = new TelegramApprovalBot({
-  token: TELEGRAM_BOT_TOKEN,               // Authenticates with the Telegram Bot API
-  chatId: TELEGRAM_CHAT_ID,                 // Chat where approval messages are delivered
-  defaultTimeout: 300000,                    // 5 minutes to respond before auto-deny (fail-closed)
-  allowedUserIds: [Number(TELEGRAM_CHAT_ID)], // Only these Telegram user IDs can approve/reject.
-                                             // Number() converts the env var string to the number
-                                             // that Telegram uses for user IDs.
-  pollInterval: 2000,                        // Poll Telegram for callback responses every 2 seconds.
-                                             // Lower = more responsive, higher = fewer API calls.
+// Telegram Bot API base URL. All API calls go through this endpoint.
+const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
+
+// Track pending approvals: maps request ID → resolver function.
+// When a human clicks Approve or Reject, we resolve the corresponding promise.
+const pendingApprovals = new Map<string, (result: ApprovalResult) => void>();
+
+// Create the approval channel using CallbackApprovalChannel.
+// This implements the ApprovalChannel interface that the policy engine expects.
+const approvalChannel = new CallbackApprovalChannel({
+  name: "telegram",
+
+  // Called when a transaction needs human approval.
+  // Sends a Telegram message with inline Approve/Reject buttons.
+  onApprovalRequest: async (request: ApprovalRequest) => {
+    const text =
+      `🔔 *Wallet Approval Request*\n\n` +
+      `*Action:* ${request.summary}\n` +
+      `*Amount:* ${request.amount} ${request.token}\n` +
+      `*Recipient:* \`${request.target}\`\n` +
+      `*Request ID:* \`${request.id}\`\n` +
+      (request.reason ? `*Reason:* ${request.reason}\n` : "");
+
+    // Telegram inline keyboard with Approve and Reject buttons.
+    // The callback_data encodes the action and request ID so we can
+    // match button clicks to pending requests.
+    const keyboard = {
+      inline_keyboard: [[
+        { text: "✅ Approve", callback_data: `approve:${request.id}` },
+        { text: "❌ Reject", callback_data: `reject:${request.id}` },
+      ]],
+    };
+
+    const response = await fetch(`${TELEGRAM_API}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: TELEGRAM_CHAT_ID,
+        text,
+        parse_mode: "Markdown",
+        reply_markup: keyboard,
+      }),
+    });
+
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(`Telegram sendMessage failed: ${response.status} ${body}`);
+    }
+  },
+
+  // Called to wait for the human's decision.
+  // Polls Telegram's getUpdates endpoint for callback queries (button clicks).
+  waitForDecision: (request: ApprovalRequest) => {
+    return new Promise<ApprovalResult>((resolve) => {
+      pendingApprovals.set(request.id, resolve);
+    });
+  },
+
+  // Auto-deny if no response within 5 minutes (fail-closed).
+  defaultTimeout: 300_000,
 });
 ```
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `token` | `string` | Bot token from @BotFather |
-| `chatId` | `string` | Chat ID where approval messages are sent |
-| `defaultTimeout` | `number` | Milliseconds to wait for a response (default: 300000) |
-| `allowedUserIds` | `number[]` | Only these user IDs can approve or reject |
-| `pollInterval` | `number` | How often to poll for callback responses in ms |
+## Step 5: Start Polling for Button Clicks
 
-## Step 5: Build a Policy with Approval Gate
+The Telegram Bot API uses a polling model — we periodically call `getUpdates` to check for new button clicks:
+
+```typescript
+let lastUpdateId = 0;
+let polling = true;
+
+// Poll Telegram for callback queries (button clicks) in a background loop.
+// Each callback_data contains "approve:<requestId>" or "reject:<requestId>".
+async function pollTelegram(): Promise<void> {
+  while (polling) {
+    try {
+      const response = await fetch(
+        `${TELEGRAM_API}/getUpdates?offset=${lastUpdateId + 1}&timeout=10&allowed_updates=["callback_query"]`,
+      );
+      const data = await response.json() as {
+        ok: boolean;
+        result: Array<{
+          update_id: number;
+          callback_query?: {
+            id: string;
+            from: { id: number; first_name?: string };
+            data?: string;
+          };
+        }>;
+      };
+
+      if (!data.ok || !data.result?.length) continue;
+
+      for (const update of data.result) {
+        lastUpdateId = update.update_id;
+        const query = update.callback_query;
+        if (!query?.data) continue;
+
+        // Parse the callback data: "approve:<requestId>" or "reject:<requestId>"
+        const [action, requestId] = query.data.split(":");
+        if (!requestId) continue;
+
+        // Self-approval prevention: check if the clicker is the requester
+        if (String(query.from.id) === TELEGRAM_USER_ID) {
+          await fetch(`${TELEGRAM_API}/answerCallbackQuery`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              callback_query_id: query.id,
+              text: "Self-approval is not permitted.",
+              show_alert: true,
+            }),
+          });
+          continue;
+        }
+
+        // Look up the pending request and resolve it
+        const resolver = pendingApprovals.get(requestId!);
+        if (!resolver) continue;
+
+        pendingApprovals.delete(requestId!);
+
+        const decision = action === "approve" ? "approved" : "rejected";
+        const decidedBy = query.from.first_name || String(query.from.id);
+
+        resolver({
+          requestId: requestId!,
+          decision,
+          decidedBy,
+          decidedAt: Date.now(),
+        });
+
+        // Acknowledge the button click in Telegram (removes the loading spinner)
+        await fetch(`${TELEGRAM_API}/answerCallbackQuery`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            callback_query_id: query.id,
+            text: decision === "approved" ? "Transaction approved!" : "Transaction rejected.",
+          }),
+        });
+      }
+    } catch (err) {
+      console.error("Telegram polling error:", err);
+      // Brief pause before retrying to avoid tight error loops
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+  }
+}
+
+// Start polling in the background (fire-and-forget).
+pollTelegram();
+```
+
+## Step 6: Build a Policy with Approval Gate
 
 Use `requireApproval()` in the policy builder to set the approval threshold.
 
 ```typescript
 import { Policy } from "kova";
 
-// Build a policy that combines spending limits with a Telegram approval gate.
+// Build a policy that combines spending limits with an approval gate.
 // The key concept: transactions below the threshold proceed automatically,
 // while those at or above the threshold require explicit human approval.
 const policy = Policy.create("telegram-approval-policy")
@@ -179,7 +326,6 @@ const policy = Policy.create("telegram-approval-policy")
   })
   .requireApproval({
     above: { amount: "5.0", token: "SOL" },  // Trigger approval for transactions >= 5 SOL
-    channel: "telegram",                       // Send the approval request via Telegram
     timeout: 300_000,                          // Auto-deny if no response within 5 minutes
                                                // (300,000 ms). This is the fail-closed behavior.
   })
@@ -191,75 +337,58 @@ This means:
 - Transactions of 5 SOL or more require Telegram approval
 - If no response within 5 minutes, the transaction is denied (<Term id="fail-closed" />) with `APPROVAL_TIMEOUT`
 
-## Step 6: Create the PolicyEngine with Approval Channel
+## Step 7: Create the PolicyEngine and AgentWallet
 
-Pass the `approvalBot` as the third argument to `PolicyEngine` so the `ApprovalGateRule` can send approval requests.
-
-```typescript
-import {
-  SpendingLimitRule,   // Enforces per-transaction and daily spending caps
-  RateLimitRule,       // Enforces max transactions per time window
-  ApprovalGateRule,    // Triggers human approval for high-value transactions
-  PolicyEngine,        // Evaluates all rules sequentially
-  MemoryStore,         // In-memory state store for dev/testing
-} from "kova";
-
-// Create the store for spending counters, rate limit windows, and audit log.
-const store = new MemoryStore(); // Dev-only; throws in production unless KOVA_ALLOW_MEMORY_STORE=1
-// Extract the policy configuration to create individual rule instances.
-const config = policy.toJSON();
-
-// Create rules in evaluation order: cheapest checks first.
-// If spending or rate limits deny the intent, the approval gate is never reached.
-const rules = [
-  new SpendingLimitRule(config.spendingLimit!),  // Check spending caps first
-  new RateLimitRule(config.rateLimit!),            // Check rate limits next
-  new ApprovalGateRule(config.approvalGate!),   // Approval gate runs last (most expensive)
-];
-
-// Pass the approvalBot as the third argument to PolicyEngine.
-// This connects the ApprovalGateRule to the Telegram delivery mechanism.
-// When the gate rule detects a transaction above the threshold, it calls
-// approvalBot.requestApproval() to send the Telegram message.
-const engine = new PolicyEngine(rules, store, approvalBot);
-```
-
-## Step 7: Create the AgentWallet
-
-Assemble the wallet with both the engine and the approval channel.
+Pass the `approvalChannel` so the `ApprovalGateRule` can send approval requests.
 
 ```typescript
 import { Keypair } from "@solana/web3.js";
 import {
-  AgentWallet,     // Top-level wallet object the agent interacts with
-  LocalSigner,     // Signs transactions using an in-memory Solana Keypair
-  SolanaAdapter,   // Chain adapter for Solana (build tx, broadcast, query balance)
-  AuditLogger,     // Tamper-evident SHA-256 hash chain audit log
+  AgentWallet,
+  LocalSigner,
+  MemoryStore,
+  SolanaAdapter,
+  SpendingLimitRule,
+  RateLimitRule,
+  ApprovalGateRule,
+  PolicyEngine,
+  AuditLogger,
 } from "kova";
 
-// Reconstruct the Solana Keypair from the secret key environment variable.
-// The secret key is a JSON-encoded array of 64 bytes.
+// Create the store for spending counters, rate limit windows, and audit log.
+const store = new MemoryStore(); // Dev-only; throws in production unless KOVA_ALLOW_MEMORY_STORE=1
+const config = policy.toJSON();
+
+// Create rules in evaluation order: cheapest checks first.
+const rules = [
+  new SpendingLimitRule(config.spendingLimit!),
+  new RateLimitRule(config.rateLimit!),
+  new ApprovalGateRule(config.approvalGate!),
+];
+
+// Pass the approvalChannel so the ApprovalGateRule can send messages.
+const engine = new PolicyEngine(rules, store, approvalChannel);
+
+// Reconstruct the Solana Keypair from the environment variable.
 const keypair = Keypair.fromSecretKey(
   Uint8Array.from(JSON.parse(SOLANA_SECRET_KEY))
 );
 
-// Create the signer, chain adapter, and audit logger.
-const signer = new LocalSigner(keypair);       // Dev-only; throws in production unless KOVA_ALLOW_LOCAL_SIGNER=1
+const signer = new LocalSigner(keypair);
 const chain = new SolanaAdapter({
-  rpcUrl: "https://api.devnet.solana.com",     // Solana devnet for testing
-  commitment: "confirmed",                      // Wait for supermajority confirmation
+  rpcUrl: "https://api.devnet.solana.com",
+  commitment: "confirmed",
 });
-const logger = new AuditLogger(store);          // Records all transaction attempts
+const logger = new AuditLogger(store);
 
-// Assemble the AgentWallet with all components, including the approval bot.
-// The `approval` field is optional -- only needed when using ApprovalGateRule.
+// Assemble the wallet with all components, including the approval channel.
 const wallet = new AgentWallet({
-  signer,                   // Signs transactions before broadcast
-  chain,                    // Builds and broadcasts Solana transactions
-  policy: engine,           // Evaluates policy rules (including the approval gate)
-  store,                    // Shared state for counters, audit log, and caches
-  approval: approvalBot,    // Telegram bot for human-in-the-loop approval
-  logger,                   // Records every transaction attempt in the hash chain
+  signer,
+  chain,
+  policy: engine,
+  store,
+  approval: approvalChannel,
+  logger,
 });
 ```
 
@@ -274,14 +403,12 @@ async function main() {
 
   // Small transfer: 1 SOL is below the 5 SOL approval threshold,
   // so it proceeds automatically without triggering a Telegram message.
-  // The policy engine checks spending limits and rate limits, but the
-  // ApprovalGateRule sees the amount is below the threshold and returns ALLOW.
   console.log("\n--- Small transfer (1 SOL) ---");
   const smallResult = await wallet.execute({
-    type: "transfer",    // Simple SOL transfer
+    type: "transfer",
     chain: "solana",
     params: {
-      to: "9aE476sH92Vz7DMPyq5WLPkrKWivxeuTKEFKd2sZZcde",  // Recipient address
+      to: "9aE476sH92Vz7DMPyq5WLPkrKWivxeuTKEFKd2sZZcde",
       amount: "1.0",     // Below the 5 SOL approval threshold
       token: "SOL",
     },
@@ -289,9 +416,6 @@ async function main() {
 
   console.log("Status:", smallResult.status);    // "confirmed" -- no approval needed
   console.log("Summary:", smallResult.summary);
-  // Output:
-  //   Status: confirmed
-  //   Summary: Transferred 1.0 SOL to 9aE476...
 ```
 
 **Expected output:**
@@ -313,7 +437,7 @@ Transactions at or above the threshold trigger a Telegram message and the `walle
   // This triggers the following flow:
   //   1. PolicyEngine evaluates spending limit and rate limit (both ALLOW)
   //   2. ApprovalGateRule detects amount >= 5 SOL threshold
-  //   3. TelegramApprovalBot sends a message with Approve/Reject buttons
+  //   3. CallbackApprovalChannel calls onApprovalRequest → sends Telegram message
   //   4. wallet.execute() BLOCKS here, waiting for the human response
   //   5. Human clicks a button (or timeout expires after 5 minutes)
   console.log("\n--- Large transfer (15 SOL) ---");
@@ -329,29 +453,14 @@ Transactions at or above the threshold trigger a Telegram message and the `walle
     },
   });
 
-  // Check the result -- three possible outcomes after approval request:
   console.log("Status:", largeResult.status);
   console.log("Summary:", largeResult.summary);
   if (largeResult.txId) {
-    // txId is present only if the transaction was approved and confirmed on-chain.
     console.log("Transaction ID:", largeResult.txId);
   }
   if (largeResult.error) {
-    // Error is present for denied (rejected/timeout) or failed transactions.
     console.log("Error:", largeResult.error);
   }
-  // If approved:
-  //   Status: confirmed
-  //   Summary: Transferred 15.0 SOL to 9aE476...
-  //   Transaction ID: 4xR8n...
-  //
-  // If rejected (human clicked Reject):
-  //   Status: denied
-  //   Error: APPROVAL_REJECTED
-  //
-  // If timeout (no response within 5 minutes):
-  //   Status: denied
-  //   Error: APPROVAL_TIMEOUT
 ```
 
 **Expected output (if you click Approve in Telegram):**
@@ -381,12 +490,12 @@ Here is the full sequence that occurred when you executed the 15 SOL transfer:
    - `SpendingLimitRule`: 15 SOL is under the 50 SOL per-transaction cap -- ALLOW.
    - `RateLimitRule`: This is only the second transaction -- ALLOW.
    - `ApprovalGateRule`: 15 SOL is at or above the 5 SOL threshold -- PAUSE.
-3. The `ApprovalGateRule` called `approvalBot.requestApproval()`, which sent a message to your Telegram chat with inline Approve/Reject buttons.
-4. The `wallet.execute()` call blocked (waited), polling Telegram every 2 seconds for your response.
-5. When you clicked Approve, the bot detected the callback, and the wallet proceeded to build, sign, and broadcast the transaction.
+3. The `ApprovalGateRule` called `approvalChannel.requestApproval()`, which invoked your `onApprovalRequest` callback, sending a Telegram message with inline Approve/Reject buttons.
+4. The `wallet.execute()` call blocked (waited), while `pollTelegram()` checked for button clicks.
+5. When you clicked Approve, the polling loop detected the callback, resolved the pending promise, and the wallet proceeded to build, sign, and broadcast the transaction.
 6. After on-chain confirmation, `wallet.execute()` returned with `status: "confirmed"`.
 
-If you had not clicked anything within 5 minutes, the system would have automatically denied the transaction (fail-closed behavior).
+If you had not clicked anything within 5 minutes, the `CallbackApprovalChannel` timeout would have automatically resolved as "timeout", and the policy engine would have denied the transaction (fail-closed behavior).
 :::
 
 ## Step 10: What the Telegram Message Looks Like
@@ -396,11 +505,10 @@ When the large transfer is triggered, your Telegram chat receives a message like
 ```
 🔔 Wallet Approval Request
 
-Action: transfer
+Action: transfer 15.0 SOL
 Amount: 15.0 SOL
 Recipient: 9aE476sH92Vz7DMPyq5WLPkrKWivxeuTKEFKd2sZZcde
-Chain: solana
-Intent ID: intent_a1b2c3d4
+Request ID: a1b2c3d4-...
 
 [✅ Approve]  [❌ Reject]
 ```
@@ -410,192 +518,51 @@ The two inline buttons are:
 - **Reject** -- The transaction is denied and the agent receives `APPROVAL_REJECTED`
 
 ::: tip
-The message includes the intent ID for traceability and <Term id="idempotency" />. You can cross-reference this with the audit log to see the full transaction lifecycle.
+The message includes the request ID for traceability and <Term id="idempotency" />. You can cross-reference this with the audit log to see the full transaction lifecycle.
 :::
 
 ## Step 11: Check Transaction History After Approval
 
 ```typescript
   // Retrieve the last 10 entries from the audit log.
-  // Both the small (auto-approved) and large (Telegram-approved) transfers
-  // are recorded, along with any denied or failed attempts.
   const history = await wallet.getTransactionHistory(10);
   console.log(`\n=== Transaction History (${history.length} entries) ===`);
   for (const tx of history) {
     console.log(`[${tx.status}] ${tx.summary}`);
     console.log(`  Intent: ${tx.intentId} | Time: ${tx.timestamp}`);
-    if (tx.txId) console.log(`  Tx ID: ${tx.txId}`);       // Only for submitted transactions
-    if (tx.error) console.log(`  Error: ${tx.error}`);     // Only for denied/failed transactions
+    if (tx.txId) console.log(`  Tx ID: ${tx.txId}`);
+    if (tx.error) console.log(`  Error: ${tx.error}`);
     console.log();
   }
-  // Output:
-  //   === Transaction History (2 entries) ===
-  //   [confirmed] Transferred 1.0 SOL to 9aE476...
-  //     Intent: intent_... | Time: 2025-01-15T10:30:00.000Z
-  //     Tx ID: 5Uj7...
-  //
-  //   [confirmed] Transferred 15.0 SOL to 9aE476...
-  //     Intent: intent_... | Time: 2025-01-15T10:31:00.000Z
-  //     Tx ID: 4xR8n...
 
   // Verify the SHA-256 hash chain integrity of the audit log.
-  // Each entry's hash includes the previous entry's hash, forming a
-  // tamper-evident chain. If any entry is modified, this check fails.
   const integrity = await logger.verifyIntegrity(10);
   console.log("Audit integrity:", integrity.valid ? "VALID" : "BROKEN");
-}
 
-// Run the async main function; log any unhandled errors.
-main().catch(console.error);
-```
-
-## Full Working Code
-
-```typescript
-import { Keypair } from "@solana/web3.js";
-import {
-  AgentWallet,
-  LocalSigner,
-  MemoryStore,
-  SolanaAdapter,
-  Policy,
-  SpendingLimitRule,
-  RateLimitRule,
-  ApprovalGateRule,
-  PolicyEngine,
-  AuditLogger,
-  TelegramApprovalBot,
-} from "kova";
-
-// --- Environment Validation ---
-// Fail fast if any required environment variable is missing.
-function requireEnv(name: string): string {
-  const value = process.env[name];
-  if (!value) {
-    throw new Error(`Missing required environment variable: ${name}`);
-  }
-  return value;
-}
-
-const TELEGRAM_BOT_TOKEN = requireEnv("TELEGRAM_BOT_TOKEN");   // Bot token from @BotFather
-const TELEGRAM_CHAT_ID = requireEnv("TELEGRAM_CHAT_ID");       // Chat ID for approval messages
-const SOLANA_SECRET_KEY = requireEnv("SOLANA_SECRET_KEY");      // Wallet keypair (JSON byte array)
-
-// --- Approval Bot ---
-// TelegramApprovalBot sends approval requests to Telegram and polls for responses.
-const approvalBot = new TelegramApprovalBot({
-  token: TELEGRAM_BOT_TOKEN,
-  chatId: TELEGRAM_CHAT_ID,
-  defaultTimeout: 300000,                // 5 minutes to respond before auto-deny
-  allowedUserIds: [Number(TELEGRAM_CHAT_ID)],  // Only this user can approve/reject
-  pollInterval: 2000,                    // Check for responses every 2 seconds
-});
-
-// --- Policy ---
-// Transactions < 5 SOL proceed automatically; >= 5 SOL require Telegram approval.
-const policy = Policy.create("telegram-approval-policy")
-  .spendingLimit({
-    perTransaction: { amount: "50.0", token: "SOL" },  // Hard cap per transaction
-    daily: { amount: "200.0", token: "SOL" },           // Hard cap per day
-  })
-  .rateLimit({
-    maxTransactionsPerMinute: 10,  // Max 10 transactions per rolling minute
-  })
-  .requireApproval({
-    above: { amount: "5.0", token: "SOL" },  // Approval threshold
-    channel: "telegram",                       // Delivery mechanism
-    timeout: 300_000,                          // 5 minutes before auto-deny
-  })
-  .build();
-
-// --- Engine ---
-// Create the store, rules, and policy engine.
-const store = new MemoryStore(); // Dev-only; throws in production unless KOVA_ALLOW_MEMORY_STORE=1
-const config = policy.toJSON();
-const rules = [
-  new SpendingLimitRule(config.spendingLimit!),  // Check spending caps first
-  new RateLimitRule(config.rateLimit!),            // Check rate limits next
-  new ApprovalGateRule(config.approvalGate!),   // Approval gate runs last
-];
-// Pass approvalBot so the ApprovalGateRule can send Telegram messages.
-const engine = new PolicyEngine(rules, store, approvalBot);
-
-// --- Wallet ---
-// Reconstruct the Solana Keypair from the environment variable.
-const keypair = Keypair.fromSecretKey(
-  Uint8Array.from(JSON.parse(SOLANA_SECRET_KEY))
-);
-const signer = new LocalSigner(keypair);           // Dev-only; throws in production unless KOVA_ALLOW_LOCAL_SIGNER=1
-const chain = new SolanaAdapter({
-  rpcUrl: "https://api.devnet.solana.com",         // Devnet for testing
-  commitment: "confirmed",                          // Wait for supermajority
-});
-const logger = new AuditLogger(store);              // Tamper-evident audit log
-
-// Assemble the wallet with all components including the approval bot.
-const wallet = new AgentWallet({
-  signer,
-  chain,
-  policy: engine,
-  store,
-  approval: approvalBot,   // Enables human-in-the-loop approval flow
-  logger,
-});
-
-// --- Main ---
-async function main() {
-  console.log("Wallet address:", await wallet.getAddress());
-
-  // Small transfer: auto-approved (1 SOL < 5 SOL threshold)
-  console.log("\n--- Small transfer (1 SOL) ---");
-  const smallResult = await wallet.execute({
-    type: "transfer",
-    chain: "solana",
-    params: {
-      to: "9aE476sH92Vz7DMPyq5WLPkrKWivxeuTKEFKd2sZZcde",
-      amount: "1.0",     // Below threshold -- no Telegram message sent
-      token: "SOL",
-    },
-  });
-  console.log("Status:", smallResult.status);
-  console.log("Summary:", smallResult.summary);
-
-  // Large transfer: triggers Telegram approval (15 SOL >= 5 SOL threshold)
-  // This call BLOCKS until the human approves, rejects, or the timeout expires.
-  console.log("\n--- Large transfer (15 SOL) ---");
-  console.log("Waiting for Telegram approval...");
-  const largeResult = await wallet.execute({
-    type: "transfer",
-    chain: "solana",
-    params: {
-      to: "9aE476sH92Vz7DMPyq5WLPkrKWivxeuTKEFKd2sZZcde",
-      amount: "15.0",    // Above threshold -- triggers Telegram approval
-      token: "SOL",
-    },
-  });
-  console.log("Status:", largeResult.status);
-  console.log("Summary:", largeResult.summary);
-  if (largeResult.txId) console.log("Tx ID:", largeResult.txId);
-  if (largeResult.error) console.log("Error:", largeResult.error);
-
-  // View the audit trail after both transactions.
-  const history = await wallet.getTransactionHistory(10);
-  console.log(`\n=== Transaction History (${history.length} entries) ===`);
-  for (const tx of history) {
-    console.log(`[${tx.status}] ${tx.summary} (${tx.timestamp})`);
-  }
-
-  // Verify the SHA-256 hash chain integrity.
-  const integrity = await logger.verifyIntegrity(10);
-  console.log("\nAudit integrity:", integrity.valid ? "VALID" : "BROKEN");
+  // Stop the Telegram polling loop before exiting.
+  polling = false;
 }
 
 main().catch(console.error);
 ```
+
+## Adapting This Pattern for Other Channels
+
+The `CallbackApprovalChannel` pattern used here is not Telegram-specific. You can swap the Telegram Bot API calls for any notification mechanism:
+
+| Channel | `onApprovalRequest` | `waitForDecision` |
+|---------|---------------------|-------------------|
+| **Slack** | Post a message with Block Kit buttons | Listen for Slack interaction webhook |
+| **Discord** | Send an embed with reaction buttons | Listen for Discord interaction events |
+| **Email** | Send an email with approve/reject links | Poll a webhook endpoint or inbox |
+| **In-app UI** | Push a WebSocket event to the frontend | Wait for a WebSocket response |
+| **SMS** | Send an SMS via Twilio | Wait for an inbound SMS reply |
+
+For HTTP-based flows, consider using the built-in `WebhookApprovalChannel` which handles HMAC signing, callback server setup, and SSRF protection out of the box.
 
 ## Common Mistakes
 
-1. **Confusing chat ID with user ID.** In private chats, the chat ID and user ID are the same number. In group chats, they are different. The `chatId` parameter tells the bot *where* to send messages, while `allowedUserIds` controls *who* can click the buttons. If you are in a group chat, make sure `allowedUserIds` contains your personal user ID, not the group chat ID.
+1. **Confusing chat ID with user ID.** In private chats, the chat ID and user ID are the same number. In group chats, they are different. The `chatId` tells the bot *where* to send messages, while `TELEGRAM_USER_ID` is used for self-approval prevention.
 
 2. **Not starting a conversation with the bot first.** Telegram bots cannot send messages to users who have not interacted with them. You must open a chat with your bot and send `/start` before the bot can send you approval requests.
 
@@ -610,17 +577,10 @@ main().catch(console.error);
 - Check that the chat ID is correct
 - If you recently created the bot, wait a minute and try again -- Telegram sometimes takes a moment to propagate new bots
 
-### Telegram bot not responding
-
-- **Check the bot token:** Copy your `TELEGRAM_BOT_TOKEN` and visit `https://api.telegram.org/botYOUR_TOKEN/getMe` in your browser. If you see `{"ok":false}`, the token is invalid. Go back to @BotFather and verify.
-- **Check the chat ID:** Visit `https://api.telegram.org/botYOUR_TOKEN/getUpdates` after sending a message to the bot. If the response is empty (`{"ok":true,"result":[]}`), the bot has not received any messages yet -- send `/start` to the bot first.
-- **Firewall or proxy issues:** If you are behind a corporate firewall, Telegram API requests may be blocked. Try from a different network or use a VPN.
-
 ### Approval always times out
 
 - Increase `defaultTimeout` if you need more time to respond
-- Verify `allowedUserIds` includes your Telegram user ID (not the chat ID if they differ)
-- Check that `pollInterval` is not too long (2000ms is a good default)
+- Verify the polling loop is running (check for errors in the console)
 - Make sure your internet connection is stable -- the bot polls Telegram's servers and needs consistent connectivity
 
 ### Bot works but buttons do not appear
@@ -637,10 +597,11 @@ main().catch(console.error);
 
 - **Lower the threshold to 1 SOL** and send three transactions (0.5 SOL, 1.5 SOL, 3 SOL) to observe which ones trigger approval and which proceed automatically.
 - **Add a second approver** by creating a Telegram group, adding your bot, and setting `chatId` to the group chat ID. Now multiple people can approve transactions.
-- **Combine with a time window policy.** Add `.activeHours()` to the policy so the agent can only transact during business hours, and transactions above the threshold also require approval. See the [Policy Cookbook](/tutorials/policy-cookbook) for the business hours pattern.
+- **Try `WebhookApprovalChannel`** instead of `CallbackApprovalChannel` for a more production-ready setup where an external service handles the Telegram integration and posts decisions back via HTTP webhook.
+- **Build a Slack or Discord approval channel** by following the same `CallbackApprovalChannel` pattern with a different API.
 
 ## Next Steps
 
 - [Policy Cookbook](/tutorials/policy-cookbook) -- Explore different approval threshold configurations
 - [Production Deployment](/tutorials/production) -- Use SqliteStore for persistent audit logs
-- [API Reference](/api/reference) -- Full TelegramApprovalBot configuration reference
+- [API Reference](/api/reference) -- Full `CallbackApprovalChannel` and `WebhookApprovalChannel` configuration reference

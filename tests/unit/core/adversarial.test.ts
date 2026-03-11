@@ -84,6 +84,7 @@ function createWallet(overrides?: Partial<AgentWalletConfig>) {
     policy: new PolicyEngine([allowAllRule], store),
     store,
     circuitBreaker: false,
+    dangerouslyDisableAuth: true,
   };
   return new AgentWallet({ ...defaults, ...overrides });
 }
@@ -529,6 +530,7 @@ describe("Adversarial Tests", () => {
         policy,
         store,
         circuitBreaker: { threshold: 3, cooldownMs: 60_000 },
+        dangerouslyDisableAuth: true,
       });
 
       // Send 6 concurrent requests that will all be denied
@@ -777,9 +779,9 @@ describe("Adversarial Tests", () => {
     it("should handle very large counter values with correct arithmetic", async () => {
       const store = new MemoryStore();
       // H-01 fix: SpendingLimitRule now uses sliding window logs instead of simple counters.
-      // Populate the sliding window log key with a recent entry to simulate 9.99 SOL spent.
+      // M3 fix: normalizeTokenId maps "SOL" to its canonical mint address for store keys.
       const recentTimestamp = Date.now() - 1000; // 1 second ago, well within the daily window
-      await store.append("spending:log:daily:SOL", `${recentTimestamp}:9.99`);
+      await store.append("spending:log:daily:So11111111111111111111111111111111111111112", `${recentTimestamp}:9.99`);
 
       const spendingRule = new SpendingLimitRule({
         daily: { amount: "10", token: "SOL" },

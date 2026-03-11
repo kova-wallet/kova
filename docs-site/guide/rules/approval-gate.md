@@ -3,7 +3,7 @@
 ::: info What you'll learn
 - How to require human approval for transactions above a configurable threshold
 - The full approval flow: request, wait, approve/reject/timeout
-- How to integrate with TelegramApprovalBot for real-time notifications
+- How to integrate with CallbackApprovalChannel or WebhookApprovalChannel for real-time notifications
 - Fail-closed behavior: what happens when approval channels are unavailable
 - Why the approval gate should always be the last rule in the chain
 :::
@@ -150,7 +150,7 @@ When a transaction exceeds the threshold:
 ```
 
 ::: tip WHAT IS AN APPROVAL CHANNEL?
-An `ApprovalChannel` is the communication mechanism used to reach a human approver. It is an abstraction -- the SDK provides `TelegramApprovalBot` out of the box (sends a message to a Telegram chat), but you can implement any channel (Slack, email, SMS, a web dashboard). The channel is responsible for delivering the approval request and returning the human's decision.
+An `ApprovalChannel` is the communication mechanism used to reach a human approver. It is an abstraction -- the SDK provides `CallbackApprovalChannel` and `WebhookApprovalChannel` out of the box, but you can implement any channel (Slack, email, SMS, a web dashboard). The channel is responsible for delivering the approval request and returning the human's decision.
 :::
 
 ### Intent Hash Binding
@@ -186,35 +186,37 @@ The `ApprovalGateRule` is fail-closed in multiple ways:
 If you configure an `ApprovalGateRule` but do NOT provide an `ApprovalChannel` to the `PolicyEngine`, all transactions above the threshold will be automatically denied. Always pass the approval channel to the `PolicyEngine` constructor.
 :::
 
-## Integration with TelegramApprovalBot
+## Integration with CallbackApprovalChannel
 
-The most common setup pairs `ApprovalGateRule` with `TelegramApprovalBot`:
+The most common setup pairs `ApprovalGateRule` with `CallbackApprovalChannel`:
 
 ```typescript
-// Import all the classes needed for a policy engine with Telegram-based human approval.
+// Import all the classes needed for a policy engine with callback-based human approval.
 import {
   PolicyEngine,
   SpendingLimitRule,
   ApprovalGateRule,
-  TelegramApprovalBot,
+  CallbackApprovalChannel,
   MemoryStore,
 } from "kova";
 
 // Create a shared in-memory store for counter persistence.
 const store = new MemoryStore();
 
-// Create a Telegram approval bot.
-// This bot sends approval requests to a Telegram chat and listens for approve/reject responses.
-// - token: the Telegram Bot API token (created via @BotFather). Keep this secret!
-// - chatId: the ID of the Telegram chat (or group) where approval messages are sent.
-// - defaultTimeout: how long to wait for a response before auto-denying (5 minutes).
-// - allowedUserIds: only these Telegram user IDs can approve/reject.
-//   This prevents unauthorized users in the group from approving transactions.
-const approval = new TelegramApprovalBot({
-  token: process.env.TELEGRAM_BOT_TOKEN!,
-  chatId: process.env.TELEGRAM_CHAT_ID!,
-  defaultTimeout: 300_000,
-  allowedUserIds: [123456789],
+// Create a callback-based approval channel.
+// You provide two callbacks: one to notify a human, one to wait for their decision.
+// This pattern works with any notification mechanism (Telegram, Slack, email, SMS, etc.).
+const approval = new CallbackApprovalChannel({
+  name: "my-approval",
+  onApprovalRequest: async (request) => {
+    // Send a notification to a human (e.g., via Telegram, Slack, email).
+    await notifyApprover(request);
+  },
+  waitForDecision: async (request) => {
+    // Wait for the human's response (e.g., poll a database, listen on a webhook).
+    return pollForResponse(request.id);
+  },
+  defaultTimeout: 300_000, // 5-minute timeout before auto-denying
 });
 
 // Create the PolicyEngine with spending limits and an approval gate.
@@ -229,7 +231,7 @@ const engine = new PolicyEngine(
     }),
 
     // ApprovalGateRule: transactions above 10 SOL (but under the 50 SOL hard cap)
-    // trigger a Telegram approval request. The 10-minute timeout means the human
+    // trigger an approval request. The 10-minute timeout means the human
     // has 10 minutes to respond before the request is auto-denied.
     new ApprovalGateRule({
       above: { amount: "10", token: "SOL" },
@@ -237,14 +239,14 @@ const engine = new PolicyEngine(
     }),
   ],
   store,
-  approval, // Pass the TelegramApprovalBot as the approval channel for the engine
+  approval, // Pass the approval channel to the engine
 );
 ```
 
 With this setup:
 
 - Transactions up to 10 SOL are auto-approved (if spending limits allow)
-- Transactions between 10 and 50 SOL trigger a Telegram approval request
+- Transactions between 10 and 50 SOL trigger an approval request
 - Transactions above 50 SOL are denied by the spending limit (never reach the approval gate)
 
 ::: warning Rule ordering matters
@@ -261,7 +263,7 @@ Place `ApprovalGateRule` **last** in your rule list. It is the most expensive ru
 
 ```typescript
 // Full end-to-end example: build an AgentWallet with rate limiting, spending limits,
-// and human approval for transactions above 10 SOL via Telegram.
+// and human approval for transactions above 10 SOL.
 import {
   AgentWallet,
   PolicyEngine,
@@ -271,7 +273,7 @@ import {
   SpendingLimitRule,
   RateLimitRule,
   ApprovalGateRule,
-  TelegramApprovalBot,
+  CallbackApprovalChannel,
 } from "kova";
 import { Keypair } from "@solana/web3.js";
 
@@ -280,13 +282,16 @@ const store = new MemoryStore();                                    // In-memory
 const signer = new LocalSigner(Keypair.generate());                 // Random keypair for testing on devnet
 const chain = new SolanaAdapter({ rpcUrl: "https://api.devnet.solana.com" }); // Solana devnet RPC
 
-// Set up the Telegram approval channel.
-// The bot will send a message like "Agent wants to transfer 15 SOL to 9WzD... Approve/Reject?"
-// and wait for the human's response.
-const approval = new TelegramApprovalBot({
-  token: process.env.TELEGRAM_BOT_TOKEN!,       // Bot API token from @BotFather
-  chatId: process.env.TELEGRAM_CHAT_ID!,        // Target chat for approval messages
-  allowedUserIds: [123456789],                   // Only this user can approve/reject
+// Set up the approval channel using callbacks.
+// The channel will notify a human and wait for their approve/reject decision.
+const approval = new CallbackApprovalChannel({
+  name: "my-approval",
+  onApprovalRequest: async (request) => {
+    await notifyApprover(request); // Send notification via your preferred channel
+  },
+  waitForDecision: async (request) => {
+    return pollForResponse(request.id); // Wait for human's response
+  },
 });
 
 // Build the PolicyEngine with three rules in recommended order (cheapest first).
@@ -301,7 +306,7 @@ const engine = new PolicyEngine(
     new SpendingLimitRule({ daily: { amount: "100", token: "SOL" } }),
 
     // Rule 3: Approval gate — transactions above 10 SOL require human approval.
-    // Most expensive rule (blocks execution for up to 5 minutes waiting for Telegram response).
+    // Most expensive rule (blocks execution for up to 5 minutes waiting for human response).
     // Only reached if rate limit and spending limit both pass.
     new ApprovalGateRule({
       above: { amount: "10", token: "SOL" },

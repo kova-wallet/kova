@@ -7,15 +7,11 @@
  * S6 enhancement: Wraps each rule.evaluate() in try/catch for fail-closed behavior.
  *
  * CONC-13 cross-reference: See security_audit_team9 CONC-13 for full analysis.
- * M-53 NOTE — STORE OPERATION TIMEOUTS:
- * Store operations (get, set, increment) in the critical evaluation path could block
- * indefinitely if the underlying store implementation hangs (e.g., SQLite lock contention,
- * network-backed store unreachable). Currently there is no timeout on these operations.
- * RECOMMENDATION: Implement store-level timeouts as a future enhancement. Each Store
- * implementation should wrap its operations with a configurable timeout (e.g., 5 seconds)
- * and throw a TimeoutError on expiration. The fail-closed error handling in evaluate()
- * will then correctly DENY the transaction rather than hanging forever. Alternatively,
- * wrap the entire evaluate() call in a Promise.race() with a timeout at the wallet level.
+ * M-53 FIX — STORE OPERATION TIMEOUTS:
+ * All store operations in the evaluation path are now wrapped with a configurable timeout
+ * via TimeoutStore. If any store operation exceeds the timeout (default: 5 seconds), it
+ * throws a TimeoutError which is caught by the fail-closed error handler, resulting in
+ * a DENY decision rather than an indefinite hang.
  *
  * ARCH-17 cross-reference: See security_audit_team10 ARCH-17 for full analysis.
  * M-57 NOTE — TIMING SIDE-CHANNEL IN POLICY EVALUATION:
@@ -35,6 +31,12 @@ import type { TransactionIntent } from "../core/intent.js";
 import type { PolicyRule, PolicyDecision, PolicyContext, PolicyEvaluationResult, PolicyRuleAudit } from "./types.js";
 import type { Store } from "../stores/interface.js";
 import type { ApprovalChannel } from "../approval/interface.js";
+
+/**
+ * M-53 FIX: Default timeout for store operations within policy evaluation (milliseconds).
+ * Prevents indefinite hangs when the store backend is unresponsive.
+ */
+const DEFAULT_STORE_OP_TIMEOUT_MS = 5_000;
 
 /**
  * H-33 fix: Sanitize internal error details from rule evaluation before returning
@@ -66,9 +68,15 @@ export class PolicyEngine {
    * of PolicyEngine.evaluate() could bypass it. Making it internal ensures all
    * evaluation paths are serialized regardless of the caller.
    */
+  // Mutable by design: reassigned on every evaluate() call to chain mutex promises.
   private evaluateLock: Promise<void> = Promise.resolve();
   /** MED-34 fix: Configurable timeout for mutex acquisition */
   private readonly mutexTimeoutMs: number;
+  /**
+   * M-53 FIX: Timeout for individual store operations during policy evaluation.
+   * Prevents indefinite hangs when the store backend is unresponsive.
+   */
+  private readonly storeOpTimeoutMs: number;
   /**
    * CRIT-03 fix: Optional function to convert token amounts to USD.
    * Injected by the wallet from the chain adapter, enabling USD-normalized spending limits.
@@ -90,6 +98,14 @@ export class PolicyEngine {
    */
   private readonly getValueInUSD?: (token: string, amount: string) => Promise<number>;
 
+  /**
+   * M-57 FIX: Minimum evaluation time in milliseconds for timing side-channel resistance.
+   * When > 0, all policy evaluations are padded to take at least this long, masking the
+   * number of rules evaluated and which rule denied. Default: 0 (disabled).
+   * Enable for deployments where policy configuration is confidential.
+   */
+  private readonly minEvaluationTimeMs: number;
+
   constructor(
     rules: PolicyRule[],
     store: Store,
@@ -97,6 +113,10 @@ export class PolicyEngine {
     getValueInUSD?: (token: string, amount: string) => Promise<number>,
     /** MED-34 fix: Configurable mutex timeout in ms. Default: 30 000 */
     mutexTimeoutMs?: number,
+    /** M-53 FIX: Configurable store operation timeout in ms. Default: 5 000 */
+    storeOpTimeoutMs?: number,
+    /** M-57 FIX: Minimum evaluation time in ms for timing-channel resistance. Default: 0 (disabled) */
+    minEvaluationTimeMs?: number,
   ) {
     if (rules.length === 0) {
       throw new Error(
@@ -107,11 +127,17 @@ export class PolicyEngine {
     // MED-T3-08 fix: Deep-freeze individual rule objects to prevent mutation by code
     // retaining references. Object.freeze() on the array is shallow — individual rule
     // objects could still be mutated without this.
+    // P-10 NOTE: Object.freeze is shallow on rule objects — it prevents property reassignment
+    // but does NOT prevent prototype mutation (e.g., Object.getPrototypeOf(rule).evaluate = ...).
+    // This is a known JS limitation. Prototype-level attacks are mitigated by the fact that
+    // rule objects are class instances with non-configurable prototype methods.
     this.rules = Object.freeze([...rules].map((rule) => Object.freeze(rule))) as PolicyRule[];
     this.store = store;
     this.approval = approval;
     this.getValueInUSD = getValueInUSD;
     this.mutexTimeoutMs = mutexTimeoutMs ?? DEFAULT_POLICY_MUTEX_TIMEOUT_MS;
+    this.storeOpTimeoutMs = storeOpTimeoutMs ?? DEFAULT_STORE_OP_TIMEOUT_MS;
+    this.minEvaluationTimeMs = minEvaluationTimeMs ?? 0;
   }
 
   /**
@@ -180,10 +206,27 @@ export class PolicyEngine {
     }
 
     try {
-      return await this.evaluateInternal(intent, now);
+      const paddingStart = performance.now();
+      const result = await this.evaluateInternal(intent, now);
+      return await this.padEvaluationTime(paddingStart, result);
     } finally {
       releaseLock!();
     }
+  }
+
+  /**
+   * M-57 FIX: Pad evaluation time to the configured minimum to resist timing side-channels.
+   * Applied to ALL return paths (DENY, ALLOW, error) so timing is uniform.
+   */
+  private async padEvaluationTime<T>(startTime: number, result: T): Promise<T> {
+    if (this.minEvaluationTimeMs > 0) {
+      const elapsed = performance.now() - startTime;
+      const remaining = this.minEvaluationTimeMs - elapsed;
+      if (remaining > 0) {
+        await new Promise((resolve) => setTimeout(resolve, remaining));
+      }
+    }
+    return result;
   }
 
   /**
@@ -243,7 +286,11 @@ export class PolicyEngine {
     // =========================================================================
 
     // --- Phase 1: Dry-run evaluation (no side effects) ---
-    const dryRunStore = new DryRunStore(this.store);
+    // M-53 FIX: Wrap the real store with a timeout layer before passing to DryRunStore.
+    // This ensures all store operations during Phase 1 (reads that fall through to the
+    // real store) are subject to the configured timeout, preventing indefinite hangs.
+    const timeoutStore = new TimeoutStore(this.store, this.storeOpTimeoutMs);
+    const dryRunStore = new DryRunStore(timeoutStore);
     // POLICY-013 fix: Deep-freeze the context by wrapping the store in a frozen
     // method-bound object. Shallow Object.freeze on the context only prevents
     // reassignment of `context.store`, but a malicious custom rule could still
@@ -256,6 +303,7 @@ export class PolicyEngine {
       setIfNotExists: dryRunStore.setIfNotExists.bind(dryRunStore),
       append: dryRunStore.append.bind(dryRunStore),
       getRecent: dryRunStore.getRecent.bind(dryRunStore),
+      clearList: dryRunStore.clearList.bind(dryRunStore),
     });
     const dryRunContext: PolicyContext = Object.freeze({
       store: frozenDryRunStore,
@@ -327,7 +375,9 @@ export class PolicyEngine {
     // race), we can identify which sliding window log entries were persisted by
     // earlier rules and warn about them. The TrackingStore also enables rollback
     // of increments for counters that were modified before the denial.
-    const trackingStore = new Phase2TrackingStore(this.store);
+    // M-53 FIX: Wrap the real store with a timeout layer for Phase 2 as well.
+    const phase2TimeoutStore = new TimeoutStore(this.store, this.storeOpTimeoutMs);
+    const trackingStore = new Phase2TrackingStore(phase2TimeoutStore);
     // POLICY-013 fix: Same frozen method-binding as dryRunContext to protect
     // the commit phase store from monkey-patching by custom rules.
     const frozenTrackingStore: Store = Object.freeze({
@@ -337,6 +387,7 @@ export class PolicyEngine {
       setIfNotExists: trackingStore.setIfNotExists.bind(trackingStore),
       append: trackingStore.append.bind(trackingStore),
       getRecent: trackingStore.getRecent.bind(trackingStore),
+      clearList: trackingStore.clearList.bind(trackingStore),
     });
     const commitContext: PolicyContext = Object.freeze({
       store: frozenTrackingStore,
@@ -356,6 +407,14 @@ export class PolicyEngine {
           // window logs from rules that ALLOWed before this denial would remain
           // inflated, gradually blocking legitimate transactions (DoS via ghost entries).
           await trackingStore.rollbackAll();
+          // M24 fix: Check if rollback had failures — if so, warn about phantom consumption
+          if (trackingStore.rollbackFailures > 0) {
+            process.emitWarning(
+              `PolicyEngine: ${trackingStore.rollbackFailures} rollback failure(s) detected after Phase 2 denial. ` +
+              `Some counters may remain inflated, reducing available budget.`,
+              { code: "KOVA_SECURITY_WARNING" },
+            );
+          }
           const totalMs = performance.now() - totalStart;
           return {
             decision,
@@ -366,6 +425,14 @@ export class PolicyEngine {
       } catch (err) {
         // CRIT-T4-01 fix: Roll back on commit-phase error too
         await trackingStore.rollbackAll();
+        // M24 fix: Check if rollback had failures
+        if (trackingStore.rollbackFailures > 0) {
+          process.emitWarning(
+            `PolicyEngine: ${trackingStore.rollbackFailures} rollback failure(s) detected after Phase 2 error. ` +
+            `Some counters may remain inflated, reducing available budget.`,
+            { code: "KOVA_SECURITY_WARNING" },
+          );
+        }
         // Fail-closed on commit-phase error
         const errorMsg = err instanceof Error ? err.message : String(err);
         const totalMs = performance.now() - totalStart;
@@ -438,6 +505,7 @@ export class PolicyEngine {
  * mechanism that captures both values and their remaining TTLs atomically.
  */
 class DryRunStore implements Store {
+  private static readonly MAX_OVERLAY_KEYS = 10_000;
   private readonly real: Store;
   /** Overlay of captured writes: key -> { value, ttl } */
   private readonly overlay: Map<string, { value: string; ttl?: number }> = new Map();
@@ -445,6 +513,12 @@ class DryRunStore implements Store {
   private readonly listOverlay: Map<string, string[]> = new Map();
   /** Track keys that were deleted in the dry-run */
   private readonly deletedKeys: Set<string> = new Set();
+
+  private checkOverlayLimit(map: Map<unknown, unknown>): void {
+    if (map.size >= DryRunStore.MAX_OVERLAY_KEYS) {
+      throw new Error(`DryRunStore overlay exceeded maximum key limit of ${DryRunStore.MAX_OVERLAY_KEYS}`);
+    }
+  }
 
   constructor(real: Store) {
     this.real = real;
@@ -462,6 +536,7 @@ class DryRunStore implements Store {
 
   async set(key: string, value: string, ttlSeconds?: number): Promise<void> {
     this.deletedKeys.delete(key);
+    if (!this.overlay.has(key)) this.checkOverlayLimit(this.overlay);
     this.overlay.set(key, { value, ttl: ttlSeconds });
   }
 
@@ -482,7 +557,11 @@ class DryRunStore implements Store {
     // LOW-T4-04 fix: Zero-floor clamping to prevent negative dry-run counters from
     // granting extra budget. Phase 2 provides the safety net via Phase2TrackingStore's
     // rollbackAll(), but this aligns DryRunStore behavior with real stores.
+    // P-14 NOTE: This zero-floor clamping means DryRunStore.increment never returns
+    // negative values. Real store implementations (MemoryStore, SqliteStore) should
+    // match this behavior to ensure consistent Phase 1/Phase 2 evaluation results.
     const newValue = Math.max(0, currentNum + amount);
+    if (!this.overlay.has(key)) this.checkOverlayLimit(this.overlay);
     this.overlay.set(key, { value: String(newValue) });
     return newValue;
   }
@@ -490,15 +569,25 @@ class DryRunStore implements Store {
   async setIfNotExists(key: string, value: string, ttlSeconds?: number): Promise<boolean> {
     const existing = await this.get(key);
     if (existing !== null) return false;
+    this.checkOverlayLimit(this.overlay);
     this.overlay.set(key, { value, ttl: ttlSeconds });
     return true;
   }
 
   async append(key: string, value: string): Promise<void> {
     // Capture list appends in overlay without modifying the real store
+    if (!this.listOverlay.has(key)) this.checkOverlayLimit(this.listOverlay);
     const existing = this.listOverlay.get(key) ?? [];
     existing.push(value);
     this.listOverlay.set(key, existing);
+  }
+
+  /**
+   * MED-2 fix: clearList is a no-op in dry-run mode since list mutations
+   * are captured in the overlay and never persisted to the real store.
+   */
+  async clearList(_key: string): Promise<void> {
+    return Promise.resolve();
   }
 
   async getRecent(key: string, count: number): Promise<string[]> {
@@ -555,6 +644,7 @@ class DryRunStore implements Store {
  * each tracked key by the amount it was incremented.
  */
 class Phase2TrackingStore implements Store {
+  private static readonly MAX_OVERLAY_KEYS = 10_000;
   private readonly real: Store;
   /** Track increments for rollback: key -> total amount incremented */
   private readonly incrementedKeys: Map<string, number> = new Map();
@@ -591,16 +681,27 @@ class Phase2TrackingStore implements Store {
     // HIGH-23 fix: Capture the previous value before overwriting so we can restore
     // it on rollback. Only capture the first write per key — subsequent writes to
     // the same key should still roll back to the original pre-Phase-2 value.
+    // MED-4 fix: Also capture the TTL for rollback. Since the Store interface does not
+    // expose a getTTL method, we cannot recover the original TTL. A conservative TTL
+    // (same as the new write's TTL) is used on rollback as a best-effort approximation.
+    // KNOWN LIMITATION: The original TTL cannot be preserved because the Store interface
+    // does not expose getTTL(). On rollback, the key may have a different TTL than it
+    // originally had before Phase 2.
     if (!this.setKeys.has(key)) {
+      if (this.setKeys.size >= Phase2TrackingStore.MAX_OVERLAY_KEYS) {
+        throw new Error(`Phase2TrackingStore setKeys exceeded maximum key limit of ${Phase2TrackingStore.MAX_OVERLAY_KEYS}`);
+      }
       const previousValue = await this.real.get(key);
-      this.setKeys.set(key, { previousValue });
+      this.setKeys.set(key, { previousValue, previousTtl: ttlSeconds });
     }
     return this.real.set(key, value, ttlSeconds);
   }
 
   async increment(key: string, amount: number): Promise<number> {
     const result = await this.real.increment(key, amount);
-    // Track the increment for potential rollback
+    if (!this.incrementedKeys.has(key) && this.incrementedKeys.size >= Phase2TrackingStore.MAX_OVERLAY_KEYS) {
+      throw new Error(`Phase2TrackingStore incrementedKeys exceeded maximum key limit of ${Phase2TrackingStore.MAX_OVERLAY_KEYS}`);
+    }
     const existing = this.incrementedKeys.get(key) ?? 0;
     this.incrementedKeys.set(key, existing + amount);
     return result;
@@ -614,7 +715,14 @@ class Phase2TrackingStore implements Store {
     // CRIT-T3-01 fix: Buffer appends instead of writing to the real store.
     // This ensures phantom sliding window entries are never persisted when
     // a later rule denies during Phase 2.
+    if (this.pendingAppends.length >= Phase2TrackingStore.MAX_OVERLAY_KEYS) {
+      throw new Error(`Phase2TrackingStore pendingAppends exceeded maximum limit of ${Phase2TrackingStore.MAX_OVERLAY_KEYS}`);
+    }
     this.pendingAppends.push({ key, value });
+  }
+
+  async clearList(key: string): Promise<void> {
+    return this.real.clearList(key);
   }
 
   async getRecent(key: string, count: number): Promise<string[]> {
@@ -660,15 +768,27 @@ class Phase2TrackingStore implements Store {
   }
 
   /**
+   * M24 fix: Count of rollback failures for caller inspection.
+   * If non-zero after rollbackAll(), some counters/keys could not be restored,
+   * meaning phantom consumption may persist (budget DoS risk).
+   */
+  rollbackFailures = 0;
+
+  /**
    * Roll back all increments and set() operations that were persisted during Phase 2.
    * CRIT-T3-01 fix: Also discards all buffered appends (no flush needed on denial).
    * HIGH-23 fix: Also rolls back set() operations by restoring previous values.
+   * M24 fix: Collects rollback failures and emits a single SecurityWarning listing
+   * all failed keys, and increments rollbackFailures counter for caller inspection.
    * Best-effort: individual rollback failures are swallowed (safe direction:
    * counters remain inflated, which means under-counting remaining budget).
    */
   async rollbackAll(): Promise<void> {
     // Discard buffered appends — they were never written to the real store
     this.pendingAppends.length = 0;
+
+    // M24 fix: Collect failed keys to emit a single warning after all rollbacks
+    const failedKeys: string[] = [];
 
     for (const [key, amount] of this.incrementedKeys) {
       try {
@@ -679,6 +799,7 @@ class Phase2TrackingStore implements Store {
         }
       } catch {
         // Best-effort rollback — failure means slight under-count (safe direction)
+        failedKeys.push(key);
       }
     }
     this.incrementedKeys.clear();
@@ -689,19 +810,90 @@ class Phase2TrackingStore implements Store {
     // This is best-effort — the key will exist with an empty value rather than
     // being absent, but this is the safe direction (subsequent reads will see
     // an empty/zero value rather than an attacker-influenced value).
-    for (const [key, { previousValue }] of this.setKeys) {
+    // MED-4 fix: Use the captured TTL on rollback as a conservative approximation.
+    for (const [key, { previousValue, previousTtl }] of this.setKeys) {
       try {
         if (previousValue !== null) {
-          await this.real.set(key, previousValue);
+          await this.real.set(key, previousValue, previousTtl);
         } else {
           // Key did not exist before Phase 2. Set to "0" as a safe default
           // since set() is primarily used for counter values in this context.
-          await this.real.set(key, "0");
+          await this.real.set(key, "0", previousTtl);
         }
       } catch {
         // Best-effort rollback — failure is safe direction
+        failedKeys.push(key);
       }
     }
     this.setKeys.clear();
+
+    // M24 fix: Track failures and emit a consolidated warning if any rollbacks failed.
+    // This enables callers (PolicyEngine) to detect and log phantom consumption,
+    // preventing silent budget DoS from unrecoverable rollback failures.
+    if (failedKeys.length > 0) {
+      this.rollbackFailures += failedKeys.length;
+      process.emitWarning(
+        `Phase2TrackingStore rollback failed for ${failedKeys.length} key(s): ${failedKeys.join(", ")}. ` +
+        `These keys may retain inflated values, gradually reducing available budget. ` +
+        `Manual reconciliation may be required.`,
+        { code: "KOVA_SECURITY_WARNING" },
+      );
+    }
+  }
+}
+
+/**
+ * M-53 FIX: TimeoutStore — Wraps all store operations with a configurable timeout.
+ * If any operation exceeds the timeout, it rejects with a descriptive error.
+ * The fail-closed error handling in PolicyEngine.evaluate() catches these rejections
+ * and returns DENY, preventing indefinite hangs when the store backend is unresponsive.
+ */
+class TimeoutStore implements Store {
+  private readonly real: Store;
+  private readonly timeoutMs: number;
+
+  constructor(real: Store, timeoutMs: number) {
+    this.real = real;
+    this.timeoutMs = timeoutMs;
+  }
+
+  private withTimeout<T>(operation: Promise<T>, label: string): Promise<T> {
+    if (this.timeoutMs <= 0) return operation;
+    let timeoutId: ReturnType<typeof setTimeout>;
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timeoutId = setTimeout(
+        () => reject(new Error(`Store operation timed out after ${this.timeoutMs}ms: ${label}`)),
+        this.timeoutMs,
+      );
+    });
+    return Promise.race([operation, timeout]).finally(() => clearTimeout(timeoutId));
+  }
+
+  get(key: string): Promise<string | null> {
+    return this.withTimeout(this.real.get(key), "get");
+  }
+
+  set(key: string, value: string, ttlSeconds?: number): Promise<void> {
+    return this.withTimeout(this.real.set(key, value, ttlSeconds), "set");
+  }
+
+  increment(key: string, amount: number): Promise<number> {
+    return this.withTimeout(this.real.increment(key, amount), "increment");
+  }
+
+  setIfNotExists(key: string, value: string, ttlSeconds?: number): Promise<boolean> {
+    return this.withTimeout(this.real.setIfNotExists(key, value, ttlSeconds), "setIfNotExists");
+  }
+
+  append(key: string, value: string): Promise<void> {
+    return this.withTimeout(this.real.append(key, value), "append");
+  }
+
+  getRecent(key: string, count: number): Promise<string[]> {
+    return this.withTimeout(this.real.getRecent(key, count), "getRecent");
+  }
+
+  clearList(key: string): Promise<void> {
+    return this.withTimeout(this.real.clearList(key), "clearList");
   }
 }

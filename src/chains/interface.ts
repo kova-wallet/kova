@@ -3,7 +3,7 @@
  * The core SDK knows nothing about specific chains.
  */
 
-import type { TransactionIntent } from "../core/intent.js";
+import type { ChainId, TransactionIntent } from "../core/intent.js";
 import type { UnsignedTransaction } from "../signers/interface.js";
 import type { TokenBalance } from "../core/result.js";
 
@@ -31,7 +31,7 @@ export interface SimulationResult {
 
 export interface ChainAdapter {
   /** Chain identifier (e.g., "solana", "ethereum") */
-  readonly chain: string;
+  readonly chain: ChainId;
 
   /** Get the wallet's balance for a specific token */
   getBalance(address: string, token: string): Promise<TokenBalance>;
@@ -57,9 +57,15 @@ export interface ChainAdapter {
    * CORE-002 / CHAIN-005 fix: Verify that the signed transaction's message bytes match
    * the original unsigned transaction. Detects if a compromised signer modified the
    * transaction instructions, accounts, or other data during signing.
-   * Throws if integrity check fails. No-ops if the chain doesn't support verification.
+   * Throws if integrity check fails.
+   *
+   * SOL-10 fix: This method is now required (non-optional). Adapters that cannot
+   * perform verification MUST throw a descriptive SolanaAdapterError (or equivalent)
+   * explaining why verification is unavailable, rather than silently skipping it.
+   * This ensures callers never accidentally skip integrity verification due to
+   * an adapter omitting the method.
    */
-  verifyTransactionIntegrity?(unsignedTxData: Uint8Array, signedTxData: Uint8Array): void;
+  verifyTransactionIntegrity(unsignedTxData: Uint8Array, signedTxData: Uint8Array): void;
 
   /** Broadcast a signed transaction to the network. Returns the transaction ID. */
   broadcast(signedTxData: Uint8Array): Promise<string>;
@@ -69,29 +75,6 @@ export interface ChainAdapter {
 
   /** Validate an address for this chain */
   isValidAddress(address: string): boolean;
-
-  /**
-   * CRIT-06 fix: Capture a pre-swap balance snapshot for post-swap verification.
-   * Call before broadcasting a swap transaction to record the output token balance.
-   * Optional — only applicable to chain adapters that support swap verification.
-   */
-  getPreSwapSnapshot?(ownerAddress: string, outputToken: string): Promise<{
-    outputToken: string; preBalance: bigint; snapshotTimestamp: number;
-  }>;
-
-  /**
-   * CRIT-06 fix: Verify that a swap produced the expected minimum output amount.
-   * Call after broadcast + confirmation to detect sandwich attacks and partial fills.
-   */
-  verifySwapOutput?(
-    ownerAddress: string,
-    preSwapSnapshot: { outputToken: string; preBalance: bigint; snapshotTimestamp: number },
-    minimumExpectedOut: bigint,
-    quotedOutAmount?: bigint,
-  ): Promise<{
-    passed: boolean; actualReceived: bigint; minimumExpected: bigint;
-    quotedAmount?: bigint; deficit?: bigint; warning?: string;
-  }>;
 
   /**
    * CRIT-07 fix: Refresh the blockhash on an unsigned transaction.

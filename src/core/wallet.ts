@@ -47,7 +47,7 @@ import { toOpenAITools as convertToOpenAITools, type OpenAITool } from "../adapt
 // imported for MED-T3-08 constructor validation of enabledTools).
 import { WALLET_TOOL_NAMES, WRITE_TOOL_NAMES, WRITE_RATE_LIMIT_PER_MINUTE, validateToolInput, type WalletToolName } from "../adapters/tools.js";
 import { SpendingLimitRule } from "../policy/rules/spending-limit.js";
-import { normalizeTokenId } from "../policy/utils.js";
+import { normalizeTokenId, displayTokenId } from "../policy/utils.js";
 import { AllowlistRule } from "../policy/rules/allowlist.js";
 import { RateLimitRule } from "../policy/rules/rate-limit.js";
 import { TimeWindowRule } from "../policy/rules/time-window.js";
@@ -56,8 +56,46 @@ import { CircuitBreaker, type CircuitBreakerConfig } from "./circuit-breaker.js"
 import { PrefixedStore } from "../stores/prefixed.js";
 import type { ChainId } from "./intent.js";
 
+/**
+ * M10 fix: Extended ChainAdapter interface for post-build intent verification.
+ * Adapters that implement verifyIntentMatch() enable TOCTOU protection by confirming
+ * that the built transaction matches the policy-approved intent.
+ */
+interface ChainAdapterWithIntentVerification extends ChainAdapter {
+  verifyIntentMatch(intent: TransactionIntent, txData: Uint8Array): void;
+}
+
 /** Maximum number of history entries that can be requested */
 const MAX_HISTORY_LIMIT = 1000;
+
+/**
+ * M-53 FIX: Create a store wrapper that enforces a timeout on all operations.
+ * Used by the circuit breaker and other components that call the store directly
+ * outside of the wallet's withStoreTimeout() method. Prevents indefinite hangs
+ * when the store backend is unresponsive.
+ */
+function createTimeoutStore(real: Store, timeoutMs: number): Store {
+  function withTimeout<T>(operation: Promise<T>, label: string): Promise<T> {
+    if (timeoutMs <= 0) return operation;
+    let timeoutId: ReturnType<typeof setTimeout>;
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timeoutId = setTimeout(
+        () => reject(new Error(`Store operation timed out after ${timeoutMs}ms: ${label}`)),
+        timeoutMs,
+      );
+    });
+    return Promise.race([operation, timeout]).finally(() => clearTimeout(timeoutId));
+  }
+  return {
+    get: (key: string) => withTimeout(real.get(key), "get"),
+    set: (key: string, value: string, ttl?: number) => withTimeout(real.set(key, value, ttl), "set"),
+    increment: (key: string, amount: number) => withTimeout(real.increment(key, amount), "increment"),
+    setIfNotExists: (key: string, value: string, ttl?: number) => withTimeout(real.setIfNotExists(key, value, ttl), "setIfNotExists"),
+    append: (key: string, value: string) => withTimeout(real.append(key, value), "append"),
+    getRecent: (key: string, count: number) => withTimeout(real.getRecent(key, count), "getRecent"),
+    clearList: (key: string) => withTimeout(real.clearList(key), "clearList"),
+  };
+}
 
 /**
  * M-23 fix: Default timeout for mutex acquisition in milliseconds.
@@ -142,7 +180,7 @@ const MAX_ACCOUNTS_JSON_LENGTH = 65_536; // 64KB
  * that could mislead operators reviewing audit logs.
  */
 function stripControlChars(value: string): string {
-  return value.replace(/[\x00-\x1F\x7F-\x9F\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g, "");
+  return value.replace(/[\x00-\x1F\x7F-\x9F\u00AD\u034F\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF\u{E0000}-\u{E007F}]/gu, "");
 }
 
 const DECIMAL_AMOUNT_REGEX = /^\d+(\.\d+)?$/;
@@ -154,21 +192,22 @@ const DECIMAL_AMOUNT_REGEX = /^\d+(\.\d+)?$/;
  * semantically identical intents could produce different hashes due to key ordering
  * differences across JSON.stringify implementations or object construction order.
  */
-function canonicalJsonStringify(value: unknown): string {
+function canonicalJsonStringify(value: unknown, depth = 0): string {
+  if (depth > 20) return JSON.stringify("[max depth]");
   if (value === null || value === undefined) return JSON.stringify(value);
   if (typeof value !== "object") return JSON.stringify(value);
   if (Array.isArray(value)) {
-    return "[" + value.map(canonicalJsonStringify).join(",") + "]";
+    return "[" + value.map((v) => canonicalJsonStringify(v, depth + 1)).join(",") + "]";
   }
   const obj = value as Record<string, unknown>;
   // MED-T3-05 fix: Filter out prototype pollution keys (__proto__, constructor, prototype).
   // Unlike the audit logger's sortKeysDeep() which already filters these, this function
   // did not, creating an inconsistency. A crafted intent with __proto__ keys could inject
   // unexpected properties during deserialization of the canonical JSON output.
-  const DANGEROUS_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+  const DANGEROUS_KEYS = new Set(["__proto__", "constructor", "prototype", "toString", "valueOf", "hasOwnProperty"]);
   const sortedKeys = Object.keys(obj).filter((k) => !DANGEROUS_KEYS.has(k)).sort();
   const entries = sortedKeys.map(
-    (key) => JSON.stringify(key) + ":" + canonicalJsonStringify(obj[key])
+    (key) => JSON.stringify(key) + ":" + canonicalJsonStringify(obj[key], depth + 1)
   );
   return "{" + entries.join(",") + "}";
 }
@@ -180,12 +219,16 @@ function canonicalJsonStringify(value: unknown): string {
  */
 function normalizeAmountForHash(amount: string): string {
   // Strip leading zeros but preserve "0" before decimal point
-  // e.g., "00.5" -> "0.5", "007" -> "7", "0.5" -> "0.5", "0" -> "0"
-  const normalized = amount.replace(/^0+/, "");
+  let normalized = amount.replace(/^0+/, "");
   if (normalized === "" || normalized.startsWith(".")) {
-    return "0" + normalized;
+    normalized = "0" + normalized;
   }
-  return normalized;
+  // AUDIT-HIGH-12 fix: Strip trailing zeros after decimal point
+  // "1.50" -> "1.5", "1.00" -> "1", "1.0" -> "1"
+  if (normalized.includes(".")) {
+    normalized = normalized.replace(/\.?0+$/, "");
+  }
+  return normalized || "0";
 }
 
 /**
@@ -244,13 +287,17 @@ function sanitizeTransactionError(message: string): string {
  * that, when spread or assigned, can pollute Object.prototype and affect all
  * downstream code. This recursively removes these keys from parsed objects.
  */
-function stripDangerousKeys(obj: unknown): unknown {
+// AUDIT-M67 fix: Add depth limit (matching MAX_NESTING_DEPTH=20 from serialization.ts)
+// to prevent stack overflow from deeply nested objects injected via forged cache entries.
+const MAX_STRIP_DEPTH = 20;
+function stripDangerousKeys(obj: unknown, depth = 0): unknown {
   if (obj === null || typeof obj !== "object") return obj;
-  if (Array.isArray(obj)) return obj.map(stripDangerousKeys);
+  if (depth > MAX_STRIP_DEPTH) return undefined; // Truncate deeply nested objects
+  if (Array.isArray(obj)) return obj.map((item) => stripDangerousKeys(item, depth + 1));
   const clean: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
     if (key === "__proto__" || key === "constructor" || key === "prototype") continue;
-    clean[key] = stripDangerousKeys(value);
+    clean[key] = stripDangerousKeys(value, depth + 1);
   }
   return clean;
 }
@@ -293,10 +340,15 @@ export interface AgentWalletConfig {
   /** Optional audit logger. If not provided, one is created using the store. */
   logger?: AuditLogger;
   /**
-   * Circuit breaker configuration. Set to `false` to disable.
+   * Circuit breaker configuration.
+   * Use `{ dangerouslyDisable: true }` to explicitly disable the circuit breaker.
+   * Passing `false` is deprecated and will emit a warning; use the object form instead.
    * Default: enabled with threshold=5, cooldownMs=300000 (5 min)
+   *
+   * M60 fix: Renamed from `false` to `{ dangerouslyDisable: true }` to require
+   * explicit opt-out, making it clear that disabling the circuit breaker is dangerous.
    */
-  circuitBreaker?: Partial<CircuitBreakerConfig> | false;
+  circuitBreaker?: Partial<CircuitBreakerConfig> | { dangerouslyDisable: true } | false;
   /** Callback invoked when an audit log write fails */
   onAuditFailure?: AuditFailureCallback;
   /**
@@ -358,8 +410,17 @@ export interface AgentWalletConfig {
    * passed as a parameter. Any call without the correct token is rejected.
    * This prevents unauthorized code that obtains an AgentWallet reference
    * from executing transactions.
+   *
+   * M59 fix: When authToken is NOT provided and dangerouslyDisableAuth is not true,
+   * the constructor throws an error. This forces callers to either provide auth
+   * or explicitly opt out.
    */
   authToken?: string;
+  /**
+   * M59 fix: When true, allows the wallet to operate without an authToken.
+   * Without this flag, omitting authToken causes a construction error.
+   */
+  dangerouslyDisableAuth?: boolean;
   /**
    * CRIT-05 fix: Wallet-level agent identifier, set at construction time.
    * Used for security-critical decisions (circuit breaker isolation,
@@ -373,14 +434,37 @@ export interface AgentWalletConfig {
    * and development environments where the caller is the wallet owner.
    * DO NOT enable in production for untrusted agent callers — detailed
    * denial messages enable policy reconnaissance.
+   *
+   * M61 fix: When verboseErrors is true and NODE_ENV is "production",
+   * the constructor throws unless dangerouslyAllowVerboseErrorsInProduction is also true.
    */
   verboseErrors?: boolean;
+  /**
+   * M61 fix: When true, allows verboseErrors to be enabled in production.
+   * This is dangerous because verbose policy denial messages enable reconnaissance.
+   */
+  dangerouslyAllowVerboseErrorsInProduction?: boolean;
   /**
    * M-53 fix: Timeout in milliseconds for individual store operations (get, set, increment).
    * Prevents indefinite hangs when the store backend is unresponsive (e.g., Redis down,
    * SQLite locked). Default: 5000 (5 seconds).
    */
   storeTimeoutMs?: number;
+  /**
+   * C-02 fix: When true (default), throw an error if another process holds the
+   * store-based advisory lock, instead of just emitting a warning and proceeding.
+   * This enforces single-process access to the store at transaction time, preventing
+   * TOCTOU races, spending limit bypasses, and audit log inconsistencies.
+   * Set to false to restore the previous warning-only behavior.
+   */
+  strictAdvisoryLock?: boolean;
+  /**
+   * ARCH-03 FIX: When true, throw an error if wallet_execute_custom is in enabledTools
+   * but no program allowlist (allowPrograms/denyPrograms) or approval gate is configured.
+   * This prevents accidental exposure of arbitrary instruction execution without guardrails.
+   * Default: false (warning only). Set to true for production deployments.
+   */
+  requireProgramAllowlistForCustom?: boolean;
 }
 
 /** Default safe tools when no enabledTools is configured */
@@ -391,6 +475,8 @@ const DEFAULT_ENABLED_TOOLS: ReadonlySet<string> = new Set([
 
 export class AgentWallet {
   // DATA-008 fix: Track unprefixed store instances to warn about sharing collisions.
+  // Intentionally shared across all AgentWallet instances: WeakSet doesn't prevent GC
+  // of stores, and global tracking is needed to warn when multiple wallets share a store.
   private static readonly unprefixedStores = new WeakSet<Store>();
   private readonly signer: Signer;
   private readonly chain: ChainAdapter;
@@ -414,6 +500,8 @@ export class AgentWallet {
   private inflightCount = 0;
   /** CRIT-14 fix: When true, new execute() calls are rejected (graceful shutdown) */
   private draining = false;
+  /** M53 fix: Re-entrancy guard — true when execute mutex is held by the current call */
+  private executingMutexHeld = false;
   /** H-06 fix: Set of tool names enabled for dispatch */
   private readonly enabledTools: ReadonlySet<string>;
   /** CRIT-04 fix: Optional capability token for caller authentication */
@@ -424,6 +512,10 @@ export class AgentWallet {
   private readonly verboseErrors: boolean;
   /** M-53 fix: Timeout for store operations (milliseconds) */
   private readonly storeTimeoutMs: number;
+  /** C-02 fix: When true, throw on advisory lock conflict instead of warning */
+  private readonly strictAdvisoryLock: boolean;
+  /** AUDIT-HIGH-11 fix: Snapshot env var at construction to prevent runtime manipulation */
+  private readonly auditStderrEnabled!: boolean;
   /**
    * CRIT-13 fix: Unique identifier for this process + wallet instance.
    * Used as the value for the store-based advisory lock to detect when
@@ -536,8 +628,24 @@ export class AgentWallet {
     // Previously, the circuit breaker received the unprefixed store, meaning all wallets
     // sharing a store backend shared a single circuit breaker state. A malicious agent on
     // one wallet could block ALL other wallets by triggering consecutive denials.
-    if (config.circuitBreaker !== false) {
-      this.circuitBreaker = new CircuitBreaker(effectiveStore, config.circuitBreaker ?? undefined);
+    // M-53 FIX: Wrap the circuit breaker's store with timeouts to prevent indefinite hangs
+    // in check() and recordOutcome() when the store backend is unresponsive.
+    // M60 fix: Check for both legacy `false` and new `{ dangerouslyDisable: true }` forms.
+    const cbDisabled = config.circuitBreaker === false ||
+      (typeof config.circuitBreaker === "object" && config.circuitBreaker !== null && "dangerouslyDisable" in config.circuitBreaker && (config.circuitBreaker as { dangerouslyDisable: boolean }).dangerouslyDisable === true);
+    if (config.circuitBreaker === false) {
+      process.emitWarning(
+        "circuitBreaker: false is deprecated. Use { dangerouslyDisable: true } instead to explicitly opt out of circuit breaker protection.",
+        "DeprecationWarning",
+      );
+    }
+    if (!cbDisabled) {
+      const cbStoreTimeout = config.storeTimeoutMs ?? DEFAULT_STORE_TIMEOUT_MS;
+      const cbStore = createTimeoutStore(effectiveStore, cbStoreTimeout);
+      const cbConfig = (config.circuitBreaker && typeof config.circuitBreaker === "object" && !("dangerouslyDisable" in config.circuitBreaker))
+        ? config.circuitBreaker as Partial<CircuitBreakerConfig>
+        : undefined;
+      this.circuitBreaker = new CircuitBreaker(cbStore, cbConfig);
     }
 
     // M-23 fix: Configurable mutex timeout to prevent indefinite blocking
@@ -547,12 +655,32 @@ export class AgentWallet {
     this.enabledTools = config.enabledTools ?? DEFAULT_ENABLED_TOOLS;
 
     // CRIT-04 fix: Store auth token for caller authentication
+    // M59 fix: Require authToken unless dangerouslyDisableAuth is set.
+    // This forces callers to either provide authentication or explicitly opt out.
+    if (!config.authToken && !config.dangerouslyDisableAuth) {
+      throw new Error(
+        "AgentWallet: authToken is required. Any code with a wallet reference can execute " +
+        "transactions without authentication. Provide an authToken or set " +
+        "{ dangerouslyDisableAuth: true } to explicitly opt out.",
+      );
+    }
     this.authToken = config.authToken;
 
     // CRIT-05 fix: Store wallet-level agentId for security-critical decisions
     this.walletAgentId = config.agentId;
+
+    // M61 fix: Block verboseErrors in production unless explicitly overridden.
+    if (config.verboseErrors && process.env.NODE_ENV === "production" && !config.dangerouslyAllowVerboseErrorsInProduction) {
+      throw new Error(
+        "verboseErrors cannot be enabled in production. Verbose policy denial messages " +
+        "expose exact amounts, limits, and rule names, enabling policy reconnaissance. " +
+        "Set dangerouslyAllowVerboseErrorsInProduction: true to override.",
+      );
+    }
     this.verboseErrors = config.verboseErrors ?? false;
     this.storeTimeoutMs = config.storeTimeoutMs ?? DEFAULT_STORE_TIMEOUT_MS;
+    this.strictAdvisoryLock = config.strictAdvisoryLock ?? true;
+    this.auditStderrEnabled = process.env.NODE_ENV === "test" || process.env.KOVA_AUDIT_STDERR === "1";
 
     // CRIT-13 fix: Generate a unique identifier for this process + wallet instance.
     // Combines process.pid with a random UUID to ensure uniqueness across both
@@ -573,6 +701,66 @@ export class AgentWallet {
           "This tool will not be dispatched by the wallet.",
           { code: "KOVA_CONFIG_WARNING" },
         );
+      }
+    }
+
+    // ARCH-03 FIX: Warn when wallet_execute_custom is enabled without program allowlist.
+    // wallet_execute_custom allows arbitrary on-chain instruction execution. Without a
+    // program allowlist, the policy engine evaluates custom intents as opaque blobs —
+    // spending limits can't assess true value, and allowlists can't evaluate recipients.
+    // A compromised agent with this tool can bypass all semantic policy checks.
+    if (this.enabledTools.has("wallet_execute_custom")) {
+      const rules = config.policy.getRules();
+      const hasAllowlistWithPrograms = rules.some((rule) => {
+        if (rule.name === "allowlist" && "getConfig" in rule) {
+          const allowlistConfig = (rule as AllowlistRule).getConfig();
+          return (allowlistConfig.allowPrograms && allowlistConfig.allowPrograms.length > 0) ||
+                 (allowlistConfig.denyPrograms && allowlistConfig.denyPrograms.length > 0);
+        }
+        return false;
+      });
+      const hasApprovalGate = rules.some((rule) => rule.name === "approval-gate");
+      if (!hasAllowlistWithPrograms && !hasApprovalGate) {
+        const message =
+          "SECURITY: wallet_execute_custom is enabled without a program allowlist or approval gate. " +
+          "A compromised agent can submit arbitrary on-chain instructions, bypassing spending limits " +
+          "and semantic policy checks. Configure allowPrograms/denyPrograms in your AllowlistRule " +
+          "or add an ApprovalGateRule to require human approval for custom intents.";
+        if (config.requireProgramAllowlistForCustom) {
+          throw new Error(message);
+        }
+        process.emitWarning(message, { code: "KOVA_CUSTOM_TOOL_WARNING" });
+      }
+    }
+
+    // M62 fix: Cross-validate policy rules against enabledTools.
+    // For each policy rule that references an intent type, warn if the corresponding
+    // tool is not in enabledTools. This catches dead-weight rules that provide no
+    // protection because the tool they govern is not enabled.
+    const intentTypeToTool: Record<string, string> = {
+      transfer: "wallet_transfer",
+      swap: "wallet_swap",
+      mint: "wallet_mint",
+      stake: "wallet_stake",
+      custom: "wallet_execute_custom",
+    };
+    const policyRules = config.policy.getRules();
+    for (const rule of policyRules) {
+      // SpendingLimitRule covers transfer, swap, stake intent types
+      if (rule instanceof SpendingLimitRule) {
+        for (const [intentType, toolName] of Object.entries(intentTypeToTool)) {
+          // Spending limits apply to transfer, swap, and stake
+          if (["transfer", "swap", "stake"].includes(intentType) && !this.enabledTools.has(toolName)) {
+            process.emitWarning(
+              `Policy rule "${rule.name}" references intent type "${intentType}" but the ` +
+              `corresponding tool "${toolName}" is not in enabledTools. This rule will have ` +
+              `no effect for "${intentType}" intents. Add "${toolName}" to enabledTools or ` +
+              `remove the rule if it is not needed.`,
+              { code: "KOVA_POLICY_TOOL_MISMATCH" },
+            );
+            break; // One warning per rule is sufficient
+          }
+        }
       }
     }
 
@@ -607,6 +795,16 @@ export class AgentWallet {
   async drain(timeoutMs = 30_000): Promise<void> {
     this.draining = true;
 
+    // C-12 NOTE — DRAIN TIMEOUT vs APPROVAL TIMEOUT INTERACTION:
+    // The default drain timeout (30s) may be shorter than an in-flight approval wait
+    // (ApprovalGateRule DEFAULT_TIMEOUT_MS = 5 minutes). If drain() is called while a
+    // transaction is awaiting human approval, the 30s timeout will expire before the
+    // approval resolves, and destroy() will be called with the approval still pending.
+    // This is by design — drain() prioritizes shutdown over completion. Operators who
+    // need approval-aware shutdown should either:
+    //   1. Set a drain timeout longer than the approval timeout (e.g., 6 minutes)
+    //   2. Cancel pending approvals before calling drain()
+    //   3. Accept that in-flight approval transactions may be interrupted
     const deadline = Date.now() + timeoutMs;
     while (this.inflightCount > 0 && Date.now() < deadline) {
       // AUDIT-M-5: 50ms polling is acceptable for drain() which runs at most once per lifecycle
@@ -646,12 +844,19 @@ export class AgentWallet {
     // AUDIT-M-1 fix: Mark wallet as destroyed to prevent use-after-destroy.
     this.destroyed = true;
 
+    // L58 fix: Wait for any in-flight execution to complete before destroying resources.
+    // This prevents a race where destroy() zeros the HMAC key while execute() is still using it.
+    try {
+      await this.executeLock;
+    } catch {
+      // executeLock rejection is non-fatal during destroy
+    }
+
     // Destroy circuit breaker (stops heartbeat interval timer, allows clean process exit)
     if (this.circuitBreaker) {
       try {
         await this.circuitBreaker.destroy();
       } catch (err: unknown) {
-        // ARCH-15 fix: Emit observable warning instead of silently swallowing.
         const msg = err instanceof Error ? err.message : "Unknown error";
         process.emitWarning(`AgentWallet.destroy: circuit breaker cleanup failed: ${msg}`, "KovaDestroyWarning");
       }
@@ -661,7 +866,6 @@ export class AgentWallet {
     try {
       await this.logger.destroy();
     } catch (err: unknown) {
-      // ARCH-15 fix: Emit observable warning instead of silently swallowing.
       const msg = err instanceof Error ? err.message : "Unknown error";
       process.emitWarning(`AgentWallet.destroy: audit logger cleanup failed: ${msg}`, "KovaDestroyWarning");
     }
@@ -670,7 +874,6 @@ export class AgentWallet {
     try {
       await this.signer.destroy();
     } catch (err: unknown) {
-      // ARCH-15 fix: Emit observable warning instead of silently swallowing.
       const msg = err instanceof Error ? err.message : "Unknown error";
       process.emitWarning(`AgentWallet.destroy: signer cleanup failed: ${msg}`, "KovaDestroyWarning");
     }
@@ -679,8 +882,22 @@ export class AgentWallet {
     // from memory dumps, heap snapshots, or core files. This key protects the
     // idempotency cache from forgery — leaving it in memory after destroy() is
     // unnecessary exposure.
-    if (this.idempotencyHmacKey) {
-      this.idempotencyHmacKey.fill(0);
+    //
+    // C-10 KNOWN LIMITATION — ORPHANED CACHE ENTRIES:
+    // Zeroing the HMAC key makes all existing idempotency cache entries unverifiable.
+    // If a new wallet instance is created with a different (or auto-generated) HMAC key,
+    // cached entries from the previous instance will fail HMAC verification and be
+    // treated as cache misses, allowing duplicate transaction execution. Operators
+    // MUST use a persistent idempotencyHmacKey (stored in a secret manager or env var)
+    // that survives process restarts and wallet re-creation to maintain idempotency
+    // guarantees across wallet lifecycle boundaries.
+    try {
+      if (this.idempotencyHmacKey) {
+        this.idempotencyHmacKey.fill(0);
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "Unknown error";
+      process.emitWarning(`AgentWallet.destroy: HMAC key cleanup failed: ${msg}`, "KovaDestroyWarning");
     }
   }
 
@@ -713,6 +930,8 @@ export class AgentWallet {
     // Prevents unauthorized code that obtains a wallet reference from executing transactions.
     // AUDIT-CRIT-1 fix: Use constant-time comparison to prevent timing side-channel attacks.
     if (this.authToken && !this.verifyAuthToken(authToken)) {
+      // M38 fix: Log pre-policy rejection for auth failure
+      await this.logPrePolicyAudit("unknown", undefined, undefined, "AUTH_FAILED", "Invalid or missing authentication token");
       return {
         status: "failed",
         summary: "Authentication failed: invalid or missing auth token",
@@ -729,10 +948,14 @@ export class AgentWallet {
     // Prevents use-after-destroy where wallet methods continue to operate after
     // key material has been zeroed, which could produce undefined behavior.
     if (this.destroyed) {
+      const destroyedIntentId = (intent && typeof intent === "object" && "id" in intent ? (intent as TransactionIntent).id : undefined) ?? "unknown";
+      // M38 fix: Log pre-policy rejection for use-after-destroy
+      // Note: logger may also be destroyed, but logPrePolicyAudit is best-effort
+      await this.logPrePolicyAudit(destroyedIntentId, undefined, undefined, "WALLET_DESTROYED", "Wallet has been destroyed");
       return {
         status: "failed",
         summary: "Wallet has been destroyed",
-        intentId: (intent && typeof intent === "object" && "id" in intent ? (intent as TransactionIntent).id : undefined) ?? "unknown",
+        intentId: destroyedIntentId,
         timestamp: Date.now(),
         error: {
           code: "WALLET_DRAINING",
@@ -745,10 +968,13 @@ export class AgentWallet {
     // This prevents new work from entering the pipeline after drain() has been called,
     // ensuring that all in-flight transactions complete before destroy() zeroes keys.
     if (this.draining) {
+      const drainingIntentId = (intent && typeof intent === "object" && "id" in intent ? (intent as TransactionIntent).id : undefined) ?? "unknown";
+      // M38 fix: Log pre-policy rejection for draining wallet
+      await this.logPrePolicyAudit(drainingIntentId, undefined, undefined, "WALLET_DRAINING", "Wallet is shutting down");
       return {
         status: "failed",
         summary: "Wallet is shutting down, no new transactions accepted",
-        intentId: (intent && typeof intent === "object" && "id" in intent ? (intent as TransactionIntent).id : undefined) ?? "unknown",
+        intentId: drainingIntentId,
         timestamp: Date.now(),
         error: {
           code: "WALLET_DRAINING",
@@ -769,6 +995,8 @@ export class AgentWallet {
     try {
       intent = structuredClone(intent);
     } catch {
+      // M38 fix: Log pre-policy rejection for non-cloneable intent
+      await this.logPrePolicyAudit("unknown", undefined, undefined, "VALIDATION_FAILED", "Intent contains non-cloneable values");
       return {
         status: "failed",
         summary: "Validation failed: intent contains non-cloneable values",
@@ -784,6 +1012,14 @@ export class AgentWallet {
     // S1-09 fix: Validate intent structure before any processing
     const validationError = this.validateIntent(intent);
     if (validationError) {
+      // M38 fix: Log pre-policy rejection for validation failure
+      await this.logPrePolicyAudit(
+        intent.id ?? "unknown",
+        typeof intent.type === "string" ? intent.type : undefined,
+        typeof intent.chain === "string" ? intent.chain : undefined,
+        "VALIDATION_FAILED",
+        "Intent validation failed",
+      );
       return {
         status: "failed",
         summary: `Validation failed: ${validationError}`,
@@ -845,6 +1081,14 @@ export class AgentWallet {
     if (lockResult === "timeout") {
       // Release our slot in the lock chain so subsequent callers aren't permanently blocked
       releaseLock!();
+      // M38 fix: Log pre-policy rejection for mutex timeout
+      await this.logPrePolicyAudit(
+        intent.id ?? "unknown",
+        intent.type,
+        intent.chain,
+        "MUTEX_TIMEOUT",
+        "Execute mutex acquisition timed out",
+      );
       return {
         status: "failed",
         summary: "Transaction failed: execute mutex acquisition timed out",
@@ -864,27 +1108,82 @@ export class AgentWallet {
     // The lock is advisory only — a warning is emitted, but execution proceeds.
     // A TTL ensures stale locks from crashed processes auto-expire.
     try {
-      const existingLock = await this.withStoreTimeout(this.store.get(ADVISORY_LOCK_KEY), "advisory-lock-get");
-      if (existingLock !== null && existingLock !== this.processId) {
-        process.emitWarning(
-          `AgentWallet: another process (${existingLock}) holds the advisory lock on this store. ` +
-          "Concurrent access from multiple processes can cause TOCTOU races, " +
-          "spending limit bypasses, and audit log inconsistencies. " +
-          "Use a single process per store, or use separate stores with storePrefix.",
-          "KovaAdvisoryLockWarning",
-        );
+      // AUDIT-H5 fix: Use setIfNotExists for atomic advisory lock acquisition
+      // instead of get-then-set which has a TOCTOU race where two processes can
+      // both see no lock and both set their own processId.
+      const lockAcquired = await this.withStoreTimeout(
+        this.store.setIfNotExists(ADVISORY_LOCK_KEY, this.processId, ADVISORY_LOCK_TTL_SECONDS),
+        "advisory-lock-acquire",
+      );
+      if (!lockAcquired) {
+        // Lock exists -- check if it belongs to us (re-entrant) or another process
+        const existingLock = await this.withStoreTimeout(this.store.get(ADVISORY_LOCK_KEY), "advisory-lock-get");
+        if (existingLock !== null && existingLock !== this.processId) {
+          const lockMessage =
+            `AgentWallet: another process (${existingLock}) holds the advisory lock on this store. ` +
+            "Concurrent access from multiple processes can cause TOCTOU races, " +
+            "spending limit bypasses, and audit log inconsistencies. " +
+            "Use a single process per store, or use separate stores with storePrefix.";
+          // C-02 fix: When strictAdvisoryLock is true (default), throw an error to
+          // block execution instead of proceeding with a warning. This enforces
+          // single-process access and prevents silent security degradation.
+          if (this.strictAdvisoryLock) {
+            releaseLock!();
+            // M38 fix: Log pre-policy rejection for advisory lock conflict
+            await this.logPrePolicyAudit(
+              intent.id ?? "unknown", intent.type, intent.chain,
+              "ADVISORY_LOCK_CONFLICT", "Another process holds the advisory lock",
+            );
+            return {
+              status: "failed",
+              summary: "Transaction blocked: another process holds the advisory lock",
+              intentId: intent.id ?? "unknown",
+              timestamp: Date.now(),
+              error: {
+                code: "TRANSACTION_FAILED",
+                message: lockMessage,
+              },
+            };
+          }
+          process.emitWarning(lockMessage, "KovaAdvisoryLockWarning");
+        } else {
+          // Our own lock -- refresh TTL
+          await this.withStoreTimeout(this.store.set(ADVISORY_LOCK_KEY, this.processId, ADVISORY_LOCK_TTL_SECONDS), "advisory-lock-refresh");
+        }
       }
-      await this.withStoreTimeout(this.store.set(ADVISORY_LOCK_KEY, this.processId, ADVISORY_LOCK_TTL_SECONDS), "advisory-lock-set");
     } catch {
-      // Non-fatal: if the store is unavailable or times out, we still proceed.
-      // The advisory lock is best-effort — store failures should not block execution.
+      // AUDIT-CRIT-3 fix: When strictAdvisoryLock is true, store failures during
+      // advisory lock acquisition block execution instead of silently proceeding.
+      if (this.strictAdvisoryLock) {
+        releaseLock!();
+        // M38 fix: Log pre-policy rejection for store unavailability during advisory lock
+        await this.logPrePolicyAudit(
+          intent.id ?? "unknown", intent.type, intent.chain,
+          "ADVISORY_LOCK_STORE_ERROR", "Store unavailable during advisory lock acquisition",
+        );
+        return {
+          status: "failed",
+          summary: "Transaction blocked: store unavailable for advisory lock",
+          intentId: intent.id ?? "unknown",
+          timestamp: Date.now(),
+          error: {
+            code: "TRANSACTION_FAILED",
+            message: "Store unavailable during advisory lock acquisition. Cannot guarantee single-process safety.",
+          },
+        };
+      }
+      // Non-strict mode: advisory lock is best-effort — store failures do not block execution.
     }
 
     // CRIT-14 fix: Track in-flight transactions so drain() can wait for completion.
     this.inflightCount++;
+    // M53 fix: Set re-entrancy guard so handleToolCall can detect if it's called
+    // from within execute() (which would deadlock on the mutex).
+    this.executingMutexHeld = true;
     try {
       return await this.executeInternal(intent);
     } finally {
+      this.executingMutexHeld = false;
       this.inflightCount--;
       releaseLock!();
     }
@@ -894,7 +1193,10 @@ export class AgentWallet {
   private async executeInternal(intent: TransactionIntent): Promise<TransactionResult> {
     // 1. Normalize the intent (assign ID, timestamp)
     const normalizedIntent = this.normalizeIntent(intent);
-    const intentId = normalizedIntent.id!;
+    if (!normalizedIntent.id) {
+      throw new Error("normalizeIntent failed to assign an intent ID");
+    }
+    const intentId = normalizedIntent.id;
 
     // S1-02 fix: Check for duplicate intent ID
     // H-18 KNOWN LIMITATION: Idempotency cache race in multi-instance deployments.
@@ -923,8 +1225,10 @@ export class AgentWallet {
     // M-44 fix: Use the full SHA-256 hash (64 hex chars) instead of a truncated
     // 64-bit slice to avoid birthday collisions at ~2^32 operations.
     const paramsForHash = structuredClone({ type: normalizedIntent.type, chain: normalizedIntent.chain, params: normalizedIntent.params });
-    // Normalize amount fields in params for idempotency deduplication
-    const hashParams = paramsForHash.params as unknown as Record<string, unknown>;
+    // H10 fix: Normalize amount fields in params for idempotency deduplication.
+    // Use a targeted cast to { amount?: string } which is safe because we check
+    // typeof before writing, and only transfer/swap/stake carry an amount field.
+    const hashParams = paramsForHash.params as { amount?: string };
     if (typeof hashParams.amount === "string") {
       hashParams.amount = normalizeAmountForHash(hashParams.amount);
     }
@@ -1002,7 +1306,12 @@ export class AgentWallet {
             typeof parsed.summary === "string" &&
             (parsed.status === "confirmed" || parsed.status === "denied" || parsed.status === "failed" || parsed.status === "pending")
           ) {
-            return parsed as TransactionResult;
+            // L59 fix: A "confirmed" result must have a non-empty txId; otherwise treat as cache miss.
+            if (parsed.status === "confirmed" && (typeof parsed.txId !== "string" || parsed.txId === "")) {
+              // Invalid confirmed entry without txId — proceed with fresh execution
+            } else {
+              return parsed as TransactionResult;
+            }
           }
           // Invalid cache schema — proceed with fresh execution
         }
@@ -1013,6 +1322,12 @@ export class AgentWallet {
 
     // S6: Check if audit logging is broken — refuse transactions when audit is down
     if (this.logger.isCircuitOpen()) {
+      // M38 fix: Log pre-policy rejection for audit circuit breaker open.
+      // Note: audit is broken, so this is best-effort — the logger may reject.
+      await this.logPrePolicyAudit(
+        intentId, normalizedIntent.type, normalizedIntent.chain,
+        "AUDIT_CIRCUIT_OPEN", "Audit logging circuit breaker is open",
+      );
       return {
         status: "failed",
         summary: "Transaction blocked: audit logging is unavailable",
@@ -1048,10 +1363,15 @@ export class AgentWallet {
           if (err instanceof Error && err.message.includes("[KOVA CRITICAL]")) throw err;
         }
       }
+      // H13 fix: Pre-check circuit breaker before policy evaluation to avoid
+      // unnecessary policy evaluation when the circuit is already open.
+      // We use checkAndRecord("PENDING") for a read-only cooldown check here,
+      // since PENDING is a no-op for recording. The actual recording happens
+      // after policy evaluation via a second checkAndRecord() call below.
       let cbReason: string | null;
       try {
         // CRIT-05 fix: Pass wallet-level agentId for per-agent circuit breaker isolation
-        cbReason = await this.circuitBreaker.check(undefined, normalizedIntent.type, this.walletAgentId);
+        cbReason = await this.circuitBreaker.checkAndRecord("PENDING", undefined, normalizedIntent.type, this.walletAgentId);
       } catch {
         // H-31: Store error during circuit breaker check — fail-closed (deny)
         // HIGH-25 fix: Use process.emitWarning instead of console.error to avoid
@@ -1059,6 +1379,11 @@ export class AgentWallet {
         process.emitWarning(
           "Circuit breaker check failed (fail-closed)",
           { code: "KOVA_CIRCUIT_BREAKER_WARNING" },
+        );
+        // M38 fix: Log pre-policy rejection for circuit breaker store error
+        await this.logPrePolicyAudit(
+          intentId, normalizedIntent.type, normalizedIntent.chain,
+          "CIRCUIT_BREAKER_STORE_ERROR", "Circuit breaker check failed (fail-closed)",
         );
         return {
           status: "denied",
@@ -1072,6 +1397,11 @@ export class AgentWallet {
         };
       }
       if (cbReason) {
+        // M38 fix: Log pre-policy rejection for circuit breaker open
+        await this.logPrePolicyAudit(
+          intentId, normalizedIntent.type, normalizedIntent.chain,
+          "CIRCUIT_BREAKER_OPEN", "Circuit breaker is open",
+        );
         return {
           status: "denied",
           summary: `Denied by circuit breaker: ${cbReason}`,
@@ -1093,19 +1423,40 @@ export class AgentWallet {
     const policyDecision = evaluationResult.decision;
     const ruleAudits = evaluationResult.ruleAudits;
 
-    // S6: Record outcome for circuit breaker
+    // H13 fix: Use checkAndRecord() to atomically combine cooldown check with
+    // outcome recording, eliminating the TOCTOU window between separate check()
+    // and recordOutcome() calls. The pre-policy PENDING check above only verified
+    // cooldown state; this call records the actual policy decision.
     // CORE-011: Pass intent type for per-intent-type circuit breaker isolation
-    // H-31 fix: Wrap recordOutcome in try/catch — store errors during recording
-    // should not break the transaction flow, but are logged for observability.
+    // H-31 fix: Wrap in try/catch — store errors during recording should not break
+    // the transaction flow, but are logged for observability.
     if (this.circuitBreaker) {
       try {
         // CRIT-05 fix: Pass wallet-level agentId for per-agent circuit breaker isolation
-        await this.circuitBreaker.recordOutcome(policyDecision.decision, undefined, normalizedIntent.type, this.walletAgentId);
+        const postPolicyCbReason = await this.circuitBreaker.checkAndRecord(policyDecision.decision, undefined, normalizedIntent.type, this.walletAgentId);
+        // If the circuit breaker opened between pre-check and now (e.g., another
+        // serialized call triggered cooldown), respect the cooldown.
+        if (postPolicyCbReason) {
+          await this.logPrePolicyAudit(
+            intentId, normalizedIntent.type, normalizedIntent.chain,
+            "CIRCUIT_BREAKER_OPEN", "Circuit breaker opened during policy evaluation",
+          );
+          return {
+            status: "denied",
+            summary: `Denied by circuit breaker: ${postPolicyCbReason}`,
+            intentId,
+            timestamp: Date.now(),
+            error: {
+              code: "CIRCUIT_BREAKER_OPEN",
+              message: postPolicyCbReason,
+            },
+          };
+        }
       } catch {
         // HIGH-25 fix: Use process.emitWarning instead of console.error to avoid
         // leaking store error details to stderr.
         process.emitWarning(
-          "Circuit breaker recordOutcome failed",
+          "Circuit breaker checkAndRecord failed",
           { code: "KOVA_CIRCUIT_BREAKER_WARNING" },
         );
         // Non-fatal: the transaction has already been evaluated by policy.
@@ -1191,21 +1542,33 @@ export class AgentWallet {
     try {
       const signerAddress = await this.signer.getAddress();
 
-      // CRIT-06 fix: Capture pre-swap balance snapshot for post-swap verification.
-      // For swap intents, record the output token balance before broadcasting so we
-      // can verify the swap produced the expected minimum output (detects sandwich attacks).
-      let preSwapSnapshot: { outputToken: string; preBalance: bigint; snapshotTimestamp: number } | undefined;
-      if (normalizedIntent.type === "swap" && this.chain.getPreSwapSnapshot) {
-        const swapParams = normalizedIntent.params as { toToken: string };
-        try {
-          preSwapSnapshot = await this.chain.getPreSwapSnapshot(signerAddress, swapParams.toToken);
-        } catch {
-          // Non-fatal: if snapshot fails, skip post-swap verification but continue the swap
-        }
-      }
+      // M49 fix: Strip extra properties from params before passing to the chain adapter.
+      // Without this, a malicious agent could inject extra fields on params that influence
+      // adapter behavior (e.g., a rogue "programId" on a transfer intent). Destructure
+      // only known fields for each intent type and rebuild a clean intent.
+      const sanitizedIntent = this.sanitizeIntentParams(normalizedIntent);
 
       // Build unsigned transaction
-      let unsignedTx = await this.chain.buildTransaction(normalizedIntent, signerAddress);
+      let unsignedTx = await this.chain.buildTransaction(sanitizedIntent, signerAddress);
+
+      // M10 fix: Post-build verification — confirm that the built transaction matches
+      // the intent. Policy evaluated the intent (high-level), but the chain adapter built
+      // the actual transaction afterward. Without this check, a compromised or buggy adapter
+      // could build a transaction that differs from the policy-approved intent.
+      // This calls verifyIntentMatch on the chain adapter if available; otherwise it is
+      // a mandatory security gap that is logged.
+      if (typeof (this.chain as ChainAdapterWithIntentVerification).verifyIntentMatch === 'function') {
+        (this.chain as ChainAdapterWithIntentVerification).verifyIntentMatch(sanitizedIntent, unsignedTx.data);
+      } else {
+        // M10: Adapter does not implement intent-to-transaction verification.
+        // This is a known security gap — log it as a warning, not silently skip.
+        process.emitWarning(
+          'ChainAdapter does not implement verifyIntentMatch(). ' +
+          'The built transaction cannot be verified against the policy-approved intent. ' +
+          'A compromised adapter could build a different transaction than what was approved.',
+          'SecurityWarning'
+        );
+      }
 
       // CRIT-02 fix: Simulate transaction before signing to detect on-chain errors early.
       // This catches insufficient balance, program errors, and other issues without spending fees.
@@ -1231,7 +1594,20 @@ export class AgentWallet {
           error: simError,
         };
 
-        await this.logAudit(normalizedIntent, ruleAudits, policyDecision, undefined);
+        // M42 fix: Add retry logic for simulation failure audit logging, matching the
+        // retry pattern used by denied/confirmed paths. Without retries, transient audit
+        // store failures cause simulation failures to be silently unlogged.
+        let simAuditLogged = false;
+        for (let attempt = 0; attempt < 3 && !simAuditLogged; attempt++) {
+          try {
+            await this.logAudit(normalizedIntent, ruleAudits, policyDecision, undefined);
+            simAuditLogged = true;
+          } catch {
+            if (attempt < 2) await new Promise((r) => setTimeout(r, 100 * (attempt + 1)));
+          }
+        }
+        // M42: Audit failure for simulation failures is non-fatal — the failure result is
+        // still returned. The simulation already failed, so no on-chain action occurred.
         // H-02 fix: Roll back spending counters on simulation failure
         await this.rollbackSpendingCounters(normalizedIntent);
         return simResult;
@@ -1257,8 +1633,17 @@ export class AgentWallet {
       // match the original unsigned transaction. Detects if a compromised signer modified
       // the transaction instructions, accounts, or other data during signing.
       // The chain adapter's verifyTransactionIntegrity() throws if the message was altered.
-      if (this.chain.verifyTransactionIntegrity) {
+      // AUDIT-CRIT-6 fix: verifyTransactionIntegrity is required by the ChainAdapter
+      // interface. If the adapter implements it, call it; if not, emit a warning.
+      if (typeof this.chain.verifyTransactionIntegrity === 'function') {
         this.chain.verifyTransactionIntegrity(unsignedTx.data, signedTx.data);
+      } else {
+        process.emitWarning(
+          'ChainAdapter does not implement verifyTransactionIntegrity(). ' +
+          'Signed transaction integrity cannot be verified — a compromised signer ' +
+          'could alter transaction data undetected.',
+          'SecurityWarning'
+        );
       }
 
       // AUDIT-HIGH-4 fix: Separate broadcast from post-broadcast operations.
@@ -1276,29 +1661,6 @@ export class AgentWallet {
 
       // Everything below is post-broadcast — tx is on-chain regardless of errors here.
 
-      // CRIT-06 fix: Post-swap verification — check that the swap produced the expected
-      // minimum output amount. Detects sandwich attacks and partial fills by comparing
-      // pre-swap and post-swap balances of the output token.
-      if (preSwapSnapshot && this.chain.verifySwapOutput && normalizedIntent.type === "swap") {
-        const minimumExpectedOut = BigInt(0);
-        try {
-          const verification = await this.chain.verifySwapOutput(
-            signerAddress,
-            preSwapSnapshot,
-            minimumExpectedOut,
-          );
-          if (!verification.passed) {
-            process.emitWarning(
-              "Swap output verification failed: received amount below minimum expected. " +
-              "This may indicate a sandwich attack or partial fill.",
-              { code: "KOVA_SWAP_VERIFICATION_WARNING" },
-            );
-          }
-        } catch {
-          // Non-fatal: verification failure doesn't invalidate the swap transaction
-        }
-      }
-
       const result: TransactionResult = {
         status: "confirmed",
         txId,
@@ -1306,6 +1668,13 @@ export class AgentWallet {
         intentId,
         timestamp: Date.now(),
       };
+
+      // C-03 fix: Cache the confirmed result in the idempotency store BEFORE attempting
+      // audit logging. Previously, audit failure caused the result to never be cached and
+      // returned status: "failed" — even though the transaction was confirmed on-chain.
+      // This caused callers to retry, potentially executing a duplicate transaction.
+      // By caching first, idempotency protection is preserved regardless of audit outcome.
+      await this.cacheResult(idempotencyKey, result);
 
       // MED-25 fix: Retry audit logging for confirmed transactions.
       let auditLogged = false;
@@ -1318,14 +1687,22 @@ export class AgentWallet {
         }
       }
 
-      // H-30 fix: If audit logging failed for a confirmed transaction, report it.
+      // C-03 fix: If audit logging failed for a confirmed transaction, return the
+      // confirmed result with a warning instead of returning status: "failed".
+      // The transaction IS on-chain — returning "failed" is a lie that causes callers
+      // to retry and potentially double-spend. The confirmed result was already cached
+      // above, so idempotency will protect against retries regardless.
       if (!auditLogged) {
-        if (process.env.NODE_ENV === "test" || process.env.KOVA_AUDIT_STDERR === "1") {
+        if (this.auditStderrEnabled) {
           try {
             // eslint-disable-next-line no-console
+            // M40 fix: Redact intentId and type from stderr fallback to prevent
+            // leaking sensitive data (intent IDs and transaction types) to log
+            // aggregators or container runtimes that may lack audit-level access controls.
+            const redactedId = intentId ? `${intentId.slice(0, 4)}...[redacted]` : "[redacted]";
             console.error("[KOVA AUDIT FALLBACK]", JSON.stringify({
-              intentId,
-              type: normalizedIntent.type,
+              intentId: redactedId,
+              type: "[redacted]",
               status: "confirmed",
             }));
           } catch {
@@ -1333,19 +1710,18 @@ export class AgentWallet {
           }
         }
         return {
-          status: "failed",
-          summary: "Transaction confirmed on-chain but audit logging failed. Manual investigation required.",
+          status: "confirmed",
+          txId,
+          summary: result.summary,
           intentId,
-          timestamp: Date.now(),
-          error: {
-            code: "STORE_ERROR",
-            message: "Transaction was confirmed on-chain but the audit trail could not be written. " +
-              "The transaction ID has been logged to stderr. Contact operations for manual reconciliation.",
-          },
+          timestamp: result.timestamp,
+          warnings: [
+            "Transaction confirmed on-chain but audit logging failed after 3 attempts. " +
+            "Manual investigation required. Contact operations for reconciliation.",
+          ],
         };
       }
 
-      await this.cacheResult(idempotencyKey, result);
       return result;
     } catch (err) {
       const rawMessage = err instanceof Error ? err.message : String(err);
@@ -1364,7 +1740,15 @@ export class AgentWallet {
         error,
       };
 
-      await this.logAudit(normalizedIntent, ruleAudits, policyDecision, undefined);
+      // C-08 fix: Wrap logAudit in a separate try/catch so that an audit failure
+      // in the error path does not prevent rollback from executing. Previously, if
+      // logAudit threw here, the rollbackSpendingCounters call was skipped entirely,
+      // leaving spending counters permanently inflated for a failed transaction.
+      try {
+        await this.logAudit(normalizedIntent, ruleAudits, policyDecision, undefined);
+      } catch {
+        // Audit failure in error path — non-fatal, proceed to rollback
+      }
       // AUDIT-HIGH-4 fix: Only roll back spending counters if the broadcast did NOT succeed.
       // Rolling back after a successful broadcast creates a budget under-count, allowing
       // the agent to spend more than the configured limit.
@@ -1391,6 +1775,8 @@ export class AgentWallet {
    * RPC errors are sanitized to prevent leaking endpoint URLs and internal details.
    */
   async getBalance(token: string): Promise<TokenBalance> {
+    // C-07 fix: Guard against use-after-destroy on read methods
+    if (this.destroyed) throw new Error("Wallet has been destroyed");
     if (typeof token !== "string" || token.trim() === "") {
       throw new Error("getBalance: 'token' must be a non-empty string");
     }
@@ -1412,6 +1798,8 @@ export class AgentWallet {
    * Get the wallet's address.
    */
   async getAddress(): Promise<string> {
+    // C-07 fix: Guard against use-after-destroy on read methods
+    if (this.destroyed) throw new Error("Wallet has been destroyed");
     return this.signer.getAddress();
   }
 
@@ -1420,6 +1808,8 @@ export class AgentWallet {
    * Agents can use this to plan within their limits.
    */
   async getPolicy(): Promise<PolicySummary> {
+    // C-07 fix: Guard against use-after-destroy on read methods
+    if (this.destroyed) throw new Error("Wallet has been destroyed");
     const rules = this.policy.getRules();
     // MED-38 fix: Redact the policy name to prevent rule-set reconnaissance.
     // Previously exposed exact rule names joined (e.g., "spending-limit+allowlist+rate-limit"),
@@ -1481,6 +1871,8 @@ export class AgentWallet {
    * M-58 fix: Supports optional address redaction via redactAddresses parameter.
    */
   async getTransactionHistory(limit: number = 10, options?: { redactAddresses?: boolean }): Promise<TransactionResult[]> {
+    // C-07 fix: Guard against use-after-destroy on read methods
+    if (this.destroyed) throw new Error("Wallet has been destroyed");
     if (typeof limit !== "number") {
       throw new Error("getTransactionHistory: 'limit' must be a number");
     }
@@ -1540,6 +1932,25 @@ export class AgentWallet {
    */
   private writeTimestamps: number[] = [];
 
+  /**
+   * M54 fix: Atomic check-and-update for write rate limiting.
+   * Prunes expired timestamps and appends the current one in a single method call,
+   * avoiding the previous pattern where writeTimestamps was mutated in multiple
+   * separate steps outside the execute mutex.
+   * Returns true if the write is allowed, false if rate limit is exceeded.
+   */
+  private checkWriteRateLimit(): boolean {
+    const now = Date.now();
+    const windowStart = now - 60_000;
+    // Prune + check in one step
+    this.writeTimestamps = this.writeTimestamps.filter((ts) => ts >= windowStart);
+    if (this.writeTimestamps.length >= WRITE_RATE_LIMIT_PER_MINUTE) {
+      return false;
+    }
+    this.writeTimestamps.push(now);
+    return true;
+  }
+
   async handleToolCall(name: string, input: Record<string, unknown>, authToken?: string): Promise<ToolCallResult> {
     // CRIT-04 fix: Verify caller authentication if authToken is configured.
     // AUDIT-CRIT-1 fix: Use constant-time comparison to prevent timing side-channel attacks.
@@ -1549,6 +1960,12 @@ export class AgentWallet {
     // AUDIT-M-1 fix: Reject tool calls after destroy() has been called.
     if (this.destroyed) {
       return { success: false, error: "Wallet has been destroyed" };
+    }
+    // M53 fix: Detect re-entrant calls. If handleToolCall is called from within
+    // execute() (e.g., via a callback or middleware), calling this.execute() again
+    // would deadlock on the mutex. Fail immediately with a clear error.
+    if (this.executingMutexHeld) {
+      return { success: false, error: "Re-entrant tool call detected: handleToolCall cannot be called from within execute()" };
     }
     try {
       // INPUT-001 fix: Validate and sanitize tool input INSIDE handleToolCall to ensure
@@ -1571,17 +1988,15 @@ export class AgentWallet {
       // INPUT-001 fix: Enforce write rate limit floor for write operations.
       // Same logic as safeHandleToolCall but instance-scoped to this wallet.
       // AUDIT-HIGH-2 fix: Use filter instead of O(n) shift() loop to avoid CPU DoS.
+      // M54 fix: Use self-contained atomic check-and-update via checkWriteRateLimit()
+      // to avoid mutating writeTimestamps outside the execute mutex.
       if (WRITE_TOOL_NAMES.has(name)) {
-        const now = Date.now();
-        const windowStart = now - 60_000;
-        this.writeTimestamps = this.writeTimestamps.filter((ts) => ts >= windowStart);
-        if (this.writeTimestamps.length >= WRITE_RATE_LIMIT_PER_MINUTE) {
+        if (!this.checkWriteRateLimit()) {
           return {
             success: false,
             error: `Write rate limit exceeded (${WRITE_RATE_LIMIT_PER_MINUTE} per minute). Try again later.`,
           };
         }
-        this.writeTimestamps.push(now);
       }
 
       // H-06 fix: Check tool enablement before dispatch. Only tools in the configured
@@ -1703,14 +2118,14 @@ export class AgentWallet {
   private verifyAuthToken(provided?: string): boolean {
     if (!this.authToken) return true;
     if (!provided) return false;
-    const expected = Buffer.from(this.authToken);
-    const actual = Buffer.from(provided);
-    if (expected.length !== actual.length) {
-      // Constant-time: compare against expected to avoid leaking length info
-      timingSafeEqual(expected, expected);
-      return false;
-    }
-    return timingSafeEqual(expected, actual);
+    // C-04 fix: Hash both tokens to a fixed length (SHA-256, 32 bytes) before comparison.
+    // Previously, tokens of different lengths took a different code path (early return false
+    // after a self-comparison), which leaked the expected token's length via timing analysis.
+    // By hashing first, both sides are always 32 bytes regardless of input length,
+    // eliminating the length-dependent branch entirely.
+    const hashA = createHash("sha256").update(this.authToken).digest();
+    const hashB = createHash("sha256").update(provided).digest();
+    return timingSafeEqual(hashA, hashB);
   }
 
   /**
@@ -1752,6 +2167,10 @@ export class AgentWallet {
 	      if (intent.id.includes("\0")) {
 	        return "Intent ID contains null bytes";
 	      }
+      // AUDIT-LOW-12 fix: Restrict intent IDs to ASCII to prevent homoglyph confusion
+      if (!/^[\x20-\x7E]+$/.test(intent.id)) {
+        return "Intent ID must contain only printable ASCII characters";
+      }
 	    }
 
 	    if (intent.createdAt !== undefined) {
@@ -1771,6 +2190,17 @@ export class AgentWallet {
 	        if (metadata.reason.length > MAX_REASON_LENGTH) {
 	          return `Metadata reason exceeds maximum length of ${MAX_REASON_LENGTH} characters`;
 	        }
+	        // M52 fix: Restrict metadata.reason to printable ASCII characters before policy
+	        // evaluation. Control characters (C0, DEL, C1) could corrupt audit logs, enable
+	        // log injection, or bypass pattern-based policy rules. Limit to 500 chars to
+	        // prevent oversized policy evaluation payloads.
+	        if (metadata.reason.length > 500) {
+	          return "Metadata 'reason' exceeds maximum length of 500 characters";
+	        }
+	        // M52 fix: Strip control characters from reason before policy evaluation.
+	        // This prevents log injection and policy bypass via embedded control chars.
+	        // eslint-disable-next-line no-control-regex
+	        metadata.reason = metadata.reason.replace(/[\x00-\x1F\x7F-\x9F]/g, "");
 	      }
 	      // M-56 fix: SECURITY NOTE — agentId is self-reported by the agent and MUST NOT
 	      // be used for authorization decisions. An agent can impersonate any other agent
@@ -1804,6 +2234,14 @@ export class AgentWallet {
 	          return "Metadata 'taskId' contains invalid characters. Only alphanumeric, hyphens, underscores, dots, and @ are allowed";
 	        }
 	      }
+
+	      // L44 fix: Strip unknown metadata keys — only allow reason, agentId, taskId.
+	      const ALLOWED_METADATA_KEYS = new Set(["reason", "agentId", "taskId"]);
+	      for (const key of Object.keys(metadata)) {
+	        if (!ALLOWED_METADATA_KEYS.has(key)) {
+	          delete metadata[key];
+	        }
+	      }
 	    }
 
 	    // Type-specific validation with HIGH-10 max length checks
@@ -1835,6 +2273,27 @@ export class AgentWallet {
 	      if (typeof toToken !== "string" || toToken.trim() === "") return "Swap: 'toToken' must be a non-empty string";
 	      if (toToken.trim() !== toToken) return "Swap: 'toToken' must not include leading or trailing whitespace";
 	      if (toToken.length > MAX_TOKEN_LENGTH) return `Swap: 'toToken' exceeds max length of ${MAX_TOKEN_LENGTH}`;
+	      // M9 fix: Validate that fromToken and toToken are either known token symbols
+	      // (SOL, USDC, USDT) or valid base58 Solana addresses. Without this, arbitrary
+	      // strings could reach the chain adapter and cause unpredictable behavior or
+	      // be used for injection attacks against swap routing APIs.
+	      const KNOWN_SWAP_SYMBOLS = new Set(["SOL", "USDC", "USDT"]);
+	      const normalizedFrom = fromToken.toUpperCase();
+	      const normalizedTo = toToken.toUpperCase();
+	      if (!KNOWN_SWAP_SYMBOLS.has(normalizedFrom)) {
+	        try {
+	          if (!this.chain.isValidAddress(fromToken)) return `Swap: 'fromToken' is not a known token symbol (SOL, USDC, USDT) or valid ${this.chain.chain} address`;
+	        } catch {
+	          return `Swap: failed to validate fromToken address for chain "${this.chain.chain}"`;
+	        }
+	      }
+	      if (!KNOWN_SWAP_SYMBOLS.has(normalizedTo)) {
+	        try {
+	          if (!this.chain.isValidAddress(toToken)) return `Swap: 'toToken' is not a known token symbol (SOL, USDC, USDT) or valid ${this.chain.chain} address`;
+	        } catch {
+	          return `Swap: failed to validate toToken address for chain "${this.chain.chain}"`;
+	        }
+	      }
 	      if (typeof amount !== "string" || amount.trim() === "") return "Swap: 'amount' must be a non-empty string";
 	      const amountErr = validateDecimalAmount(amount);
 	      if (amountErr) return `Swap: ${amountErr}`;
@@ -1876,6 +2335,18 @@ export class AgentWallet {
 	        }
 	        // HIGH-T3-03 fix: SSRF protection for https URLs. Reject hostnames that
 	        // resolve to private/reserved IP ranges, localhost, or link-local addresses.
+	        //
+	        // C-09 LIMITATION — DNS REBINDING:
+	        // The checks below validate the hostname string but do NOT resolve it via DNS.
+	        // A hostname like "evil.attacker.com" could pass these checks at validation time
+	        // but resolve to a private IP (e.g., 127.0.0.1) at fetch time — a DNS rebinding
+	        // attack. For full protection, the code that fetches metadataUri should:
+	        //   1. Resolve the hostname to an IP address before connecting
+	        //   2. Validate the resolved IP against private/reserved ranges
+	        //   3. Pin the resolved IP for the connection (prevent TOCTOU between resolve and connect)
+	        // This requires changes at the HTTP client layer (chain adapter or fetch wrapper),
+	        // which is outside the scope of this validation function.
+	        // TODO: Implement DNS resolution validation in the metadata fetch layer.
 	        if (parsed.protocol === "https:") {
 	          const hostname = parsed.hostname.toLowerCase();
 	          if (
@@ -1949,6 +2420,20 @@ export class AgentWallet {
 	      if (typeof data !== "string") return "Custom: 'data' must be a string";
 	      if (data.trim() !== data) return "Custom: 'data' must not include leading or trailing whitespace";
 	      if (data.length > MAX_DATA_LENGTH) return `Custom: 'data' exceeds max length of ${MAX_DATA_LENGTH}`;
+	      // M8 fix: Validate that custom intent data is valid base64. The data field is
+	      // expected to contain base64-encoded instruction data for on-chain programs.
+	      // Without validation, malformed data could propagate to the chain adapter and
+	      // cause opaque transaction failures or be used for injection attacks.
+	      if (data.length > 0) {
+	        if (!/^[A-Za-z0-9+/]*={0,2}$/.test(data) || data.length % 4 !== 0) {
+	          return "Custom: 'data' must be a valid base64-encoded string";
+	        }
+	        try {
+	          Buffer.from(data, "base64");
+	        } catch {
+	          return "Custom: 'data' must be a valid base64-encoded string";
+	        }
+	      }
 	      if (!Array.isArray(accounts)) return "Custom: 'accounts' must be an array";
 	      if (accounts.length > MAX_ACCOUNTS) return `Custom: 'accounts' exceeds max count of ${MAX_ACCOUNTS}`;
 	      for (const account of accounts) {
@@ -1980,7 +2465,7 @@ export class AgentWallet {
       !isTransferIntent(intent) && !isSwapIntent(intent) &&
       !isMintIntent(intent) && !isStakeIntent(intent) && !isCustomIntent(intent)
     ) {
-      return `Intent params do not match the expected shape for type "${intent.type}"`;
+      return `Intent params do not match the expected shape for type "${(intent as TransactionIntent).type}"`;
     }
 
     return null;
@@ -1993,6 +2478,7 @@ export class AgentWallet {
    *  from a concurrent instance. If another instance already cached a result for this
    *  intent, we preserve theirs rather than overwriting with ours (first-writer-wins). */
   private async cacheResult(key: string, result: TransactionResult): Promise<void> {
+    if (this.destroyed) return; // AUDIT-HIGH-13: Don't use HMAC key after destroy
     try {
       // T6-F7 fix: Strip sensitive fields from the cached result before serialization.
       // The idempotency cache has a 24-hour default TTL, meaning full transaction details
@@ -2045,7 +2531,14 @@ export class AgentWallet {
   }
 
   /**
-   * Assign ID and timestamp if not already set.
+   * Assign ID and timestamp if not already set, and normalize all intent fields
+   * in a single pass.
+   *
+   * M50 fix: Centralized normalization of ALL fields (amounts, tokens, addresses)
+   * in one place before any processing (validation, policy, building). Previously,
+   * normalization was fragmented across wallet, policy, and chain adapter layers,
+   * creating inconsistency risks.
+   *
    * CORE-018 fix: Clamp createdAt to within ±5 minutes of current time to prevent
    * stale or future-dated intents from bypassing time-window policy rules.
    */
@@ -2057,11 +2550,80 @@ export class AgentWallet {
     if (Math.abs(createdAt - now) > MAX_CLOCK_DRIFT_MS) {
       createdAt = now; // Clamp stale/future timestamps to current time
     }
+
+    // M50 fix: Normalize all params fields in one pass.
+    let normalizedParams = intent.params;
+
+    if (isTransferIntent(intent)) {
+      const { to, amount, token } = intent.params;
+      normalizedParams = {
+        to: to.trim(),
+        amount: amount.trim(),
+        token: normalizeTokenId(token),
+      };
+    } else if (isSwapIntent(intent)) {
+      const { fromToken, toToken, amount, maxSlippage } = intent.params;
+      normalizedParams = {
+        fromToken: normalizeTokenId(fromToken),
+        toToken: normalizeTokenId(toToken),
+        amount: amount.trim(),
+        ...(maxSlippage !== undefined ? { maxSlippage } : {}),
+      };
+    } else if (isStakeIntent(intent)) {
+      const { amount, token, validator } = intent.params;
+      normalizedParams = {
+        amount: amount.trim(),
+        token: normalizeTokenId(token),
+        ...(validator ? { validator: validator.trim() } : {}),
+      };
+    } else if (isMintIntent(intent)) {
+      const { collection, metadataUri, to } = intent.params;
+      normalizedParams = {
+        collection: collection.trim(),
+        metadataUri: metadataUri.trim(),
+        ...(to ? { to: to.trim() } : {}),
+      };
+    }
+    // Custom intents: no normalization needed (programId, data, accounts are exact)
+
     return {
-      ...intent,
       id: intent.id ?? randomUUID(),
+      type: intent.type,
+      chain: intent.chain,
+      params: normalizedParams,
+      ...(intent.metadata !== undefined ? { metadata: intent.metadata } : {}),
       createdAt,
-    };
+    } as TransactionIntent;
+  }
+
+  /**
+   * M49 fix: Strip extra/unknown properties from intent params before passing to the
+   * chain adapter. Without this, a malicious agent could inject extra fields (e.g., a
+   * rogue "programId" on a transfer intent) that influence adapter behavior.
+   * Only known fields for each intent type are kept; everything else is dropped.
+   */
+  private sanitizeIntentParams(intent: TransactionIntent): TransactionIntent {
+    if (isTransferIntent(intent)) {
+      const { to, amount, token } = intent.params;
+      return { ...intent, params: { to, amount, token } };
+    }
+    if (isSwapIntent(intent)) {
+      const { fromToken, toToken, amount, maxSlippage } = intent.params;
+      return { ...intent, params: { fromToken, toToken, amount, ...(maxSlippage !== undefined ? { maxSlippage } : {}) } };
+    }
+    if (isMintIntent(intent)) {
+      const { collection, metadataUri, to } = intent.params;
+      return { ...intent, params: { collection, metadataUri, ...(to ? { to } : {}) } };
+    }
+    if (isStakeIntent(intent)) {
+      const { amount, token, validator } = intent.params;
+      return { ...intent, params: { amount, token, ...(validator ? { validator } : {}) } };
+    }
+    if (isCustomIntent(intent)) {
+      const { programId, data, accounts } = intent.params;
+      return { ...intent, params: { programId, data, accounts } };
+    }
+    return intent;
   }
 
   /**
@@ -2073,12 +2635,12 @@ export class AgentWallet {
     if (isTransferIntent(intent)) {
       const { to, amount, token } = intent.params;
       const shortAddr = to.length > 8 ? `${to.slice(0, 4)}...${to.slice(-4)}` : to;
-      return `Sent ${stripControlChars(amount)} ${stripControlChars(token)} to ${stripControlChars(shortAddr)}`;
+      return `Sent ${stripControlChars(amount)} ${stripControlChars(displayTokenId(token))} to ${stripControlChars(shortAddr)}`;
     }
 
     if (isSwapIntent(intent)) {
       const { fromToken, toToken, amount } = intent.params;
-      return `Swapped ${stripControlChars(amount)} ${stripControlChars(fromToken)} for ${stripControlChars(toToken)}`;
+      return `Swapped ${stripControlChars(amount)} ${stripControlChars(displayTokenId(fromToken))} for ${stripControlChars(displayTokenId(toToken))}`;
     }
 
     if (isMintIntent(intent)) {
@@ -2087,7 +2649,7 @@ export class AgentWallet {
 
     if (isStakeIntent(intent)) {
       const { amount, token } = intent.params;
-      return `Staked ${stripControlChars(amount)} ${stripControlChars(token)}`;
+      return `Staked ${stripControlChars(amount)} ${stripControlChars(displayTokenId(token))}`;
     }
 
     return `Executed ${stripControlChars(intent.type)} on ${stripControlChars(intent.chain)}`;
@@ -2131,7 +2693,6 @@ export class AgentWallet {
 
 	    const common = {
 	      ...(id ? { id } : {}),
-	      type: intent.type,
 	      chain: intent.chain,
 	      ...(createdAt !== undefined ? { createdAt } : {}),
 	      ...(metadata ? { metadata } : {}),
@@ -2141,6 +2702,7 @@ export class AgentWallet {
 	      const { to, amount, token } = intent.params;
 	      return {
 	        ...common,
+	        type: "transfer" as const,
 	        params: {
 	          to: to.slice(0, MAX_ADDRESS_LENGTH),
 	          amount: amount.slice(0, MAX_AMOUNT_LENGTH),
@@ -2153,6 +2715,7 @@ export class AgentWallet {
 	      const { fromToken, toToken, amount, maxSlippage } = intent.params;
 	      return {
 	        ...common,
+	        type: "swap" as const,
 	        params: {
 	          fromToken: fromToken.slice(0, MAX_TOKEN_LENGTH),
 	          toToken: toToken.slice(0, MAX_TOKEN_LENGTH),
@@ -2166,6 +2729,7 @@ export class AgentWallet {
 	      const { collection, metadataUri, to } = intent.params;
 	      return {
 	        ...common,
+	        type: "mint" as const,
 	        params: {
 	          collection: collection.slice(0, MAX_ADDRESS_LENGTH),
 	          metadataUri: metadataUri.slice(0, MAX_URI_LENGTH),
@@ -2178,6 +2742,7 @@ export class AgentWallet {
 	      const { amount, token, validator } = intent.params;
 	      return {
 	        ...common,
+	        type: "stake" as const,
 	        params: {
 	          amount: amount.slice(0, MAX_AMOUNT_LENGTH),
 	          token: token.slice(0, MAX_TOKEN_LENGTH),
@@ -2190,6 +2755,7 @@ export class AgentWallet {
 	      const { programId, data, accounts } = intent.params;
 	      return {
 	        ...common,
+	        type: "custom" as const,
 	        params: {
 	          programId: programId.slice(0, MAX_ADDRESS_LENGTH),
 	          data: data.slice(0, MAX_DATA_LENGTH),
@@ -2204,10 +2770,12 @@ export class AgentWallet {
 	      };
 	    }
 
+	    // Fallback for malformed intents that pass none of the type guards
 	    return {
 	      ...common,
-	      params: intent.params,
-	    } as TransactionIntent;
+	      type: (intent as TransactionIntent).type,
+	      params: { _redacted: "unrecognized intent type" },
+	    } as unknown as TransactionIntent;
 	  }
 
 	  /**
@@ -2254,6 +2822,51 @@ export class AgentWallet {
 	      }
 	    }
 	  }
+
+  /**
+   * M38 fix: Log an audit entry for pre-policy rejections (auth failures, validation
+   * errors, circuit breaker blocks, mutex timeouts, etc.). These rejections happen
+   * before policy evaluation, so there are no rule audits or policy decisions to record.
+   * A synthetic DENY decision is created with the rejection reason and a "pre-policy"
+   * rule marker so operators can distinguish pre-policy rejections from policy denials
+   * in the audit log.
+   *
+   * This is best-effort — if audit logging itself fails, the rejection still proceeds.
+   * The caller's early-return behavior is not affected.
+   */
+  private async logPrePolicyAudit(
+    intentId: string,
+    intentType: string | undefined,
+    chain: string | undefined,
+    code: string,
+    reason: string,
+  ): Promise<void> {
+    try {
+      // Use type assertion for params since pre-policy synthetic intents have no
+      // meaningful params — the rejection happened before params were validated.
+      const syntheticIntent = {
+        id: intentId,
+        type: (intentType ?? "unknown") as TransactionIntent["type"],
+        chain: (chain ?? "unknown") as ChainId,
+        params: {} as unknown,
+      } as TransactionIntent;
+      const syntheticDecision: AuditEntry["finalDecision"] = {
+        decision: "DENY",
+        rule: "pre-policy",
+        reason: `[${code}] ${reason}`,
+      };
+      const entry: AuditEntry = {
+        timestamp: Date.now(),
+        intentId,
+        intent: syntheticIntent,
+        policyDecisions: [],
+        finalDecision: syntheticDecision,
+      };
+      await this.logger.log(entry);
+    } catch {
+      // Best-effort — pre-policy audit failure must not block the rejection
+    }
+  }
 
   /**
    * H-02 fix: Best-effort rollback of spending counters after post-policy transaction

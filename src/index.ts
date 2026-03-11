@@ -48,6 +48,7 @@ export type {
   TokenBalance,
   PolicySummary,
 } from "./core/result.js";
+export { MAX_RESULT_WARNINGS, appendWarning } from "./core/result.js";
 
 // ---------------------------------------------------------------------------
 // Policy — Public API (builder interface)
@@ -76,8 +77,6 @@ export type {
 // These are exported for advanced use cases and testing, but most consumers
 // should use the Policy builder above instead of instantiating rules directly.
 // ---------------------------------------------------------------------------
-/** @internal — Use {@link Policy} builder instead of constructing directly. */
-export { PolicyEngine } from "./policy/engine.js";
 /** @internal — Use {@link Policy.spendingLimit} instead. */
 export { SpendingLimitRule } from "./policy/rules/spending-limit.js";
 /** @internal — Use {@link Policy.allowlist} instead. */
@@ -120,7 +119,10 @@ export { SolanaAdapter } from "./chains/solana/adapter.js";
 // Approval — Public API
 // ---------------------------------------------------------------------------
 export type { ApprovalChannel, ApprovalRequest, ApprovalResult, ApprovalDecision } from "./approval/interface.js";
-export { TelegramApprovalBot } from "./approval/telegram.js";
+export { CallbackApprovalChannel } from "./approval/callback.js";
+export type { CallbackApprovalChannelConfig } from "./approval/callback.js";
+export { WebhookApprovalChannel } from "./approval/webhook.js";
+export type { WebhookApprovalChannelConfig } from "./approval/webhook.js";
 
 // ---------------------------------------------------------------------------
 // Circuit Breaker — Internal
@@ -154,3 +156,12 @@ export { toOpenAITools } from "./adapters/openai.js";
 export type { OpenAITool } from "./adapters/openai.js";
 export { createLangChainTools } from "./adapters/langchain.js";
 export type { LangChainToolDefinition } from "./adapters/langchain.js";
+
+// ---------------------------------------------------------------------------
+// Oracles — Price feed providers for USD valuation
+// Pyth oracle and multi-oracle consensus for production price feeds.
+// ---------------------------------------------------------------------------
+export { createPythPriceProvider, parsePythPriceAccount, PYTH_MAINNET_FEEDS, PYTH_DEVNET_FEEDS } from "./oracles/pyth.js";
+export type { PythPriceProviderConfig, PythPriceProvider } from "./oracles/pyth.js";
+export { createConsensusProvider } from "./oracles/consensus.js";
+export type { ConsensusProviderConfig, ConsensusProvider, PriceProviderFn } from "./oracles/consensus.js";

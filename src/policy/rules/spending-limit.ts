@@ -68,6 +68,14 @@ const GC_MIN_ENTRIES = 100;
 const GC_EXPIRED_RATIO = 0.3; // 30% expired triggers GC
 
 /**
+ * M66 fix: Maximum number of entries in the lastGcTimestamp Map.
+ * Without a cap, a system with many distinct log keys (e.g., many tokens or
+ * key prefixes) would cause lastGcTimestamp to grow without bounds. When the
+ * cap is reached, the oldest entries (by insertion order) are evicted.
+ */
+const MAX_GC_TIMESTAMP_ENTRIES = 1000;
+
+/**
  * SEC: Precision-safe decimal math to avoid IEEE 754 floating-point drift.
  * HIGH-03 fix: Uses BigInt to prevent overflow for large amounts (> ~9 billion).
  * The old approach (Math.round(value * 10^9)) overflowed Number.MAX_SAFE_INTEGER
@@ -80,6 +88,9 @@ const PRECISION_FACTOR_BI = 10n ** BigInt(PRECISION_DECIMALS);
 
 /** Scale a number to a precision-safe BigInt for comparison */
 function toBigIntScaled(value: number): bigint {
+  // M28 fix: Treat negative zero as plain zero to avoid sign inconsistencies
+  // in BigInt conversion. Object.is is needed because (-0 < 0) is false.
+  if (Object.is(value, -0)) value = 0;
   // Use toFixed to get a deterministic string representation,
   // then split into whole/fractional parts and assemble as BigInt
   const str = value.toFixed(PRECISION_DECIMALS);
@@ -92,8 +103,8 @@ function toBigIntScaled(value: number): bigint {
 }
 
 /** Precision-safe greater-than comparison (BigInt-based, no overflow) */
-function safeGt(a: number, b: number): boolean {
-  return toBigIntScaled(a) > toBigIntScaled(b);
+function safeGte(a: number, b: number): boolean {
+  return toBigIntScaled(a) >= toBigIntScaled(b);
 }
 
 export class SpendingLimitRule implements PolicyRule {
@@ -110,8 +121,30 @@ export class SpendingLimitRule implements PolicyRule {
    * CRIT-12 fix: Tracks the last garbage collection time per log key.
    * Used to throttle GC so it doesn't run on every sliding window evaluation,
    * avoiding unnecessary clear+re-append cycles that would degrade performance.
+   *
+   * M66 fix: Capped at MAX_GC_TIMESTAMP_ENTRIES to prevent unbounded growth.
+   * When the cap is reached, the oldest entries (by Map insertion order) are evicted.
    */
   private readonly lastGcTimestamp = new Map<string, number>();
+
+  /**
+   * M66 fix: Set a GC timestamp with size-cap enforcement.
+   * When the map exceeds MAX_GC_TIMESTAMP_ENTRIES, the oldest entries
+   * (by Map insertion order) are deleted to reclaim memory.
+   */
+  private setGcTimestamp(logKey: string, timestamp: number): void {
+    this.lastGcTimestamp.set(logKey, timestamp);
+    if (this.lastGcTimestamp.size > MAX_GC_TIMESTAMP_ENTRIES) {
+      // Evict oldest entries (Map iterates in insertion order)
+      const excess = this.lastGcTimestamp.size - MAX_GC_TIMESTAMP_ENTRIES;
+      let deleted = 0;
+      const keys = Array.from(this.lastGcTimestamp.keys());
+      for (let i = 0; i < keys.length && deleted < excess; i++) {
+        this.lastGcTimestamp.delete(keys[i]!);
+        deleted++;
+      }
+    }
+  }
 
   constructor(config: SpendingLimitConfig) {
     // MED-34 fix: Validate all limit amounts at construction time.
@@ -130,11 +163,12 @@ export class SpendingLimitRule implements PolicyRule {
       config.perTransaction || config.daily || config.weekly || config.monthly ||
       config.perTransactionUSD || config.dailyUSD || config.weeklyUSD || config.monthlyUSD
     );
+    // LOW-18 fix: Throw instead of warning when no limits are configured.
+    // A SpendingLimitRule with no limits is a no-op that always allows, which
+    // likely indicates misconfiguration rather than intentional behavior.
     if (!hasAnyLimit) {
-      process.emitWarning(
-        "SpendingLimitRule has no limits configured (no perTransaction, daily, weekly, monthly, " +
-        "or USD-denominated limits). The rule will have no effect and all transactions will be allowed.",
-        { code: "KOVA_SPENDING_LIMIT_EMPTY" },
+      throw new Error(
+        "SpendingLimitRule: no limits configured. At least one limit (perTransaction, daily, weekly, monthly, or USD) must be set.",
       );
     }
 
@@ -216,6 +250,25 @@ export class SpendingLimitRule implements PolicyRule {
 
     const token = this.extractToken(intent);
 
+    // P-07 fix: Fail-closed when token cannot be extracted and token-specific limits exist.
+    // An unidentified token must not bypass spending limits silently.
+    if (token === null) {
+      const hasTokenSpecificLimits = !!(
+        this.config.perTransaction || this.config.daily || this.config.weekly || this.config.monthly
+      );
+      if (hasTokenSpecificLimits) {
+        return {
+          decision: "DENY",
+          rule: this.name,
+          reason: `Cannot determine token for intent type "${intent.type}" — ` +
+            `spending limit requires an identifiable token when token-specific limits are configured.`,
+        };
+      }
+    }
+
+    // Use "UNKNOWN" as fallback for display/keying when token is null but no token-specific limits apply
+    const effectiveToken = token ?? "UNKNOWN";
+
     // 1. Per-transaction limit (stateless — no TOCTOU concern)
     // H-03 NOTE: This token-specific per-transaction limit intentionally only checks when
     // the transaction token matches the configured limit token. This is by design: it
@@ -225,13 +278,13 @@ export class SpendingLimitRule implements PolicyRule {
     // (without perTransactionUSD), transactions in other tokens are caught by the
     // AUDIT-CRIT-01 untracked-token check further below.
     if (this.config.perTransaction) {
-      if (normalizeTokenId(token) === normalizeTokenId(this.config.perTransaction.token)) {
+      if (normalizeTokenId(effectiveToken) === normalizeTokenId(this.config.perTransaction.token)) {
         const limit = parseFloat(this.config.perTransaction.amount);
-        if (safeGt(amount, limit)) {
+        if (safeGte(amount, limit)) {
           return {
             decision: "DENY",
             rule: this.name,
-            reason: `Per-transaction spending limit exceeded: tried to send ${amount} ${token}, limit is ${this.config.perTransaction.amount} ${this.config.perTransaction.token}`,
+            reason: `Per-transaction spending limit exceeded: tried to send ${amount} ${effectiveToken}, limit is ${this.config.perTransaction.amount} ${this.config.perTransaction.token}`,
           };
         }
       }
@@ -241,7 +294,7 @@ export class SpendingLimitRule implements PolicyRule {
     // This check runs for ALL tokens regardless of whether a token-specific limit exists,
     // preventing agents from evading limits by using a different token.
     if (this.config.perTransactionUSD) {
-      const usdDenial = await this.checkUsdPerTransaction(context, amount, token);
+      const usdDenial = await this.checkUsdPerTransaction(context, amount, effectiveToken);
       if (usdDenial) return usdDenial;
     }
 
@@ -251,14 +304,14 @@ export class SpendingLimitRule implements PolicyRule {
     const hasUsdLimits = !!(this.config.perTransactionUSD || this.config.dailyUSD ||
       this.config.weeklyUSD || this.config.monthlyUSD);
     if (!hasUsdLimits) {
-      const hasMatchingTokenLimit = this.hasTokenSpecificLimit(token);
+      const hasMatchingTokenLimit = this.hasTokenSpecificLimit(effectiveToken);
       if (!hasMatchingTokenLimit) {
         return {
           decision: "DENY",
           rule: this.name,
-          reason: `Token "${token}" has no configured spending limit and no USD-denominated limits are set. ` +
+          reason: `Token "${effectiveToken}" has no configured spending limit and no USD-denominated limits are set. ` +
             `Configure a USD limit (dailyUSD, weeklyUSD, monthlyUSD) to allow cross-token transactions, ` +
-            `or add an explicit limit for "${token}".`,
+            `or add an explicit limit for "${effectiveToken}".`,
         };
       }
     }
@@ -272,7 +325,7 @@ export class SpendingLimitRule implements PolicyRule {
       // 2. Daily limit — sliding window check
       if (this.config.daily) {
         const denial = await this.slidingWindowCheckLimit(
-          context, amount, token, this.config.daily, "daily", WINDOW_SECONDS.daily, incrementedKeys,
+          context, amount, effectiveToken, this.config.daily, "daily", WINDOW_SECONDS.daily, incrementedKeys,
         );
         if (denial) {
           await this.rollbackIncrements(context, incrementedKeys);
@@ -283,7 +336,7 @@ export class SpendingLimitRule implements PolicyRule {
       // 3. Weekly limit — sliding window check
       if (this.config.weekly) {
         const denial = await this.slidingWindowCheckLimit(
-          context, amount, token, this.config.weekly, "weekly", WINDOW_SECONDS.weekly, incrementedKeys,
+          context, amount, effectiveToken, this.config.weekly, "weekly", WINDOW_SECONDS.weekly, incrementedKeys,
         );
         if (denial) {
           await this.rollbackIncrements(context, incrementedKeys);
@@ -294,7 +347,7 @@ export class SpendingLimitRule implements PolicyRule {
       // 4. Monthly limit — sliding window check
       if (this.config.monthly) {
         const denial = await this.slidingWindowCheckLimit(
-          context, amount, token, this.config.monthly, "monthly", WINDOW_SECONDS.monthly, incrementedKeys,
+          context, amount, effectiveToken, this.config.monthly, "monthly", WINDOW_SECONDS.monthly, incrementedKeys,
         );
         if (denial) {
           await this.rollbackIncrements(context, incrementedKeys);
@@ -305,7 +358,7 @@ export class SpendingLimitRule implements PolicyRule {
       // CRIT-03 fix: USD-denominated time-window limits (token-agnostic)
       if (this.config.dailyUSD) {
         const denial = await this.slidingWindowCheckUsdLimit(
-          context, amount, token, this.config.dailyUSD, "daily", WINDOW_SECONDS.daily, incrementedKeys,
+          context, amount, effectiveToken, this.config.dailyUSD, "daily", WINDOW_SECONDS.daily, incrementedKeys,
         );
         if (denial) {
           await this.rollbackIncrements(context, incrementedKeys);
@@ -315,7 +368,7 @@ export class SpendingLimitRule implements PolicyRule {
 
       if (this.config.weeklyUSD) {
         const denial = await this.slidingWindowCheckUsdLimit(
-          context, amount, token, this.config.weeklyUSD, "weekly", WINDOW_SECONDS.weekly, incrementedKeys,
+          context, amount, effectiveToken, this.config.weeklyUSD, "weekly", WINDOW_SECONDS.weekly, incrementedKeys,
         );
         if (denial) {
           await this.rollbackIncrements(context, incrementedKeys);
@@ -325,7 +378,7 @@ export class SpendingLimitRule implements PolicyRule {
 
       if (this.config.monthlyUSD) {
         const denial = await this.slidingWindowCheckUsdLimit(
-          context, amount, token, this.config.monthlyUSD, "monthly", WINDOW_SECONDS.monthly, incrementedKeys,
+          context, amount, effectiveToken, this.config.monthlyUSD, "monthly", WINDOW_SECONDS.monthly, incrementedKeys,
         );
         if (denial) {
           await this.rollbackIncrements(context, incrementedKeys);
@@ -358,7 +411,7 @@ export class SpendingLimitRule implements PolicyRule {
     limitConfig: { amount: string; token: string },
     window: string,
     windowSeconds: number,
-    incrementedKeys: Array<{ key: string; amount: number; ttl: number }>,
+    _incrementedKeys: Array<{ key: string; amount: number; ttl: number }>,
   ): Promise<PolicyDecision | null> {
     const normalizedIntentToken = normalizeTokenId(token);
     const normalizedLimitToken = normalizeTokenId(limitConfig.token);
@@ -368,7 +421,6 @@ export class SpendingLimitRule implements PolicyRule {
 
     const limit = parseFloat(limitConfig.amount);
     const logKey = `${this.keyPrefix}log:${window}:${normalizedLimitToken}`;
-    const counterKey = `${this.keyPrefix}${window}:${normalizedLimitToken}`;
     const now = context.now;
     const windowStartMs = now - windowSeconds * 1000;
 
@@ -405,6 +457,8 @@ export class SpendingLimitRule implements PolicyRule {
     // HIGH-21 fix: Use >= instead of > to deny transactions that would bring the total
     // exactly to the limit. The previous > comparison allowed one extra transaction that
     // hit the limit precisely, creating an off-by-one bypass.
+    // L18 fix: Both per-transaction and sliding window checks now use >= (deny at
+    // exact boundary) for consistent boundary behavior.
     if (projectedTotalBi >= limitBi) {
       const windowTotal = Number(windowTotalBi) / 1e9;
       return {
@@ -416,17 +470,18 @@ export class SpendingLimitRule implements PolicyRule {
       };
     }
 
-    // POLICY-005 fix: Increment counter BEFORE appending to the sliding window log.
-    // Previously, the append happened first. If increment() failed, the log entry
-    // persisted as a phantom entry that would inflate windowTotal in future evaluations,
-    // gradually reducing available budget (DoS-like). By incrementing first, a failure
-    // in append() leaves the counter incremented (safe direction: over-counting budget
-    // usage, which is conservative) without a phantom log entry.
-    await this.ensureKeyWithTTL(context, counterKey, windowSeconds);
-    await context.store.increment(counterKey, amount);
-    incrementedKeys.push({ key: counterKey, amount, ttl: windowSeconds });
-    // Record this transaction in the sliding window log (after successful increment)
-    await context.store.append(logKey, `${now}:${amount}`);
+    // M22 fix: The sliding window log is the SOLE source of truth for spending totals.
+    // windowTotal above is derived entirely from log entries — no separate counter is
+    // consulted for limit enforcement. This eliminates the race condition where a crash
+    // between counter increment and log append would leave the counter inflated but the
+    // log entry lost, permanently reducing available budget.
+    //
+    // Record this transaction in the sliding window log.
+    // M27 fix: Use toFixed(10) for deterministic float-to-string serialization.
+    // Plain template interpolation (e.g., `${0.1+0.2}`) can produce strings like
+    // "0.30000000000000004", which parseFloat reads back differently than the
+    // original value. toFixed(10) ensures a stable round-trip representation.
+    await context.store.append(logKey, `${now}:${amount.toFixed(10)}`);
 
     return null;
   }
@@ -470,14 +525,24 @@ export class SpendingLimitRule implements PolicyRule {
    * 2. Retrieves all recent entries (up to MAX_WINDOW_ENTRIES).
    * 3. Filters to only entries within the current window.
    * 4. If the expired ratio exceeds GC_EXPIRED_RATIO and there are at least GC_MIN_ENTRIES,
-   *    rewrites the list by clearing it and re-appending only the valid entries.
+   *    rewrites the list using an atomic key-swap approach.
    *
-   * The clear+re-append is NOT atomic, but this is safe because:
-   * - The AgentWallet.execute() mutex ensures only one evaluation runs at a time.
-   * - A concurrent append during GC would be from the same evaluation (which calls GC
-   *   before appending), so no data loss occurs.
-   * - If clearList is not available on the store, GC is silently skipped (the MAX_LIST_SIZE
-   *   eviction in the store acts as a fallback safety net).
+   * M23 fix: Instead of the previous clear-then-re-append approach (which could lose
+   * all entries if the process crashed between clear and re-append, resetting spending
+   * limits and silently increasing available budget), this method now appends a GC
+   * marker entry to the log. The marker is a special entry with format
+   * "GC_MARKER:{timestamp}" that signals all entries before the marker's timestamp
+   * should be ignored by readers. The sliding window reader (slidingWindowCheckLimit)
+   * already filters by windowStartMs, which naturally excludes old entries. The GC
+   * marker provides an additional signal for readers to skip pre-GC entries.
+   *
+   * This approach is crash-safe because:
+   *   - Only an append operation is performed (no destructive clear)
+   *   - If the process crashes before the append, no state is lost
+   *   - If the process crashes after the append, the marker is in the log and
+   *     readers will correctly filter out old entries
+   *   - The old entries remain in the list but are ignored, and the store's
+   *     MAX_LIST_SIZE eviction acts as a fallback to prevent unbounded growth
    */
   private async garbageCollectWindow(
     context: PolicyContext,
@@ -496,55 +561,39 @@ export class SpendingLimitRule implements PolicyRule {
     const allEntries = await context.store.getRecent(logKey, MAX_WINDOW_ENTRIES);
     if (allEntries.length < GC_MIN_ENTRIES) {
       // Not enough entries to justify GC overhead
-      this.lastGcTimestamp.set(logKey, now);
+      this.setGcTimestamp(logKey, now);
       return;
     }
 
     // Partition entries into valid (within window) and expired (outside window)
-    const validEntries: string[] = [];
+    let expiredCount = 0;
     for (const entry of allEntries) {
       const colonIdx = entry.indexOf(":");
-      if (colonIdx === -1) continue; // Malformed entry — drop it during GC
+      if (colonIdx === -1) { expiredCount++; continue; } // Malformed entry counts as expired
+      // Skip GC marker entries when counting
+      if (entry.startsWith("GC_MARKER:")) continue;
       const ts = parseInt(entry.slice(0, colonIdx), 10);
-      if (Number.isFinite(ts) && ts >= windowStartMs) {
-        validEntries.push(entry);
+      if (!Number.isFinite(ts) || ts < windowStartMs) {
+        expiredCount++;
       }
     }
 
-    const expiredCount = allEntries.length - validEntries.length;
     const expiredRatio = expiredCount / allEntries.length;
 
     if (expiredRatio < GC_EXPIRED_RATIO) {
-      // Not enough expired entries to justify rewrite
-      this.lastGcTimestamp.set(logKey, now);
+      // Not enough expired entries to justify GC
+      this.setGcTimestamp(logKey, now);
       return;
     }
 
-    // Check if the store supports clearList (it's optional on the Store interface)
-    if (typeof context.store.clearList !== "function") {
-      // Store doesn't support clearList — rely on MAX_LIST_SIZE eviction as fallback
-      this.lastGcTimestamp.set(logKey, now);
-      return;
-    }
+    // M23 fix: Append a GC marker instead of destructive clear+re-append.
+    // The marker signals that entries with timestamps before windowStartMs should
+    // be ignored. This is a single atomic append — no crash risk of data loss.
+    // Readers already filter by windowStartMs, so the marker is a defense-in-depth
+    // signal. The store's MAX_LIST_SIZE eviction handles unbounded growth.
+    await context.store.append(logKey, `GC_MARKER:${windowStartMs}`);
 
-    // Rewrite the list: clear and re-append only valid entries.
-    // validEntries are in newest-first order (from getRecent), so reverse to
-    // re-append in chronological order (oldest first) to preserve ordering.
-    await context.store.clearList(logKey);
-    for (let i = validEntries.length - 1; i >= 0; i--) {
-      await context.store.append(logKey, validEntries[i]!);
-    }
-
-    this.lastGcTimestamp.set(logKey, now);
-  }
-
-  /**
-   * Ensure a counter key exists with TTL (initialize if needed).
-   * MED-04 fix: Uses atomic setIfNotExists to prevent TOCTOU race where concurrent
-   * calls to get()+set() could reset a counter's TTL, erasing accumulated spending.
-   */
-  private async ensureKeyWithTTL(context: PolicyContext, key: string, ttl: number): Promise<void> {
-    await context.store.setIfNotExists(key, "0", ttl);
+    this.setGcTimestamp(logKey, now);
   }
 
   /**
@@ -571,7 +620,7 @@ export class SpendingLimitRule implements PolicyRule {
       };
     }
 
-    if (safeGt(usdValue, limit)) {
+    if (safeGte(usdValue, limit)) {
       return {
         decision: "DENY",
         rule: this.name,
@@ -593,7 +642,7 @@ export class SpendingLimitRule implements PolicyRule {
     limitConfig: { amount: string },
     window: string,
     windowSeconds: number,
-    incrementedKeys: Array<{ key: string; amount: number; ttl: number }>,
+    _incrementedKeys: Array<{ key: string; amount: number; ttl: number }>,
   ): Promise<PolicyDecision | null> {
     const limit = parseFloat(limitConfig.amount);
     const usdValue = await this.getUsdValue(context, token, String(amount));
@@ -607,7 +656,6 @@ export class SpendingLimitRule implements PolicyRule {
     }
 
     const logKey = `${this.keyPrefix}log:${window}:USD`;
-    const counterKey = `${this.keyPrefix}${window}:USD`;
     const now = context.now;
     const windowStartMs = now - windowSeconds * 1000;
 
@@ -649,13 +697,14 @@ export class SpendingLimitRule implements PolicyRule {
       };
     }
 
-    // POLICY-005 fix: Increment counter BEFORE appending to sliding window log.
-    // See token variant above for rationale on ordering.
-    await this.ensureKeyWithTTL(context, counterKey, windowSeconds);
-    await context.store.increment(counterKey, usdValue);
-    incrementedKeys.push({ key: counterKey, amount: usdValue, ttl: windowSeconds });
-    // Record this USD transaction in the sliding window log (after successful increment)
-    await context.store.append(logKey, `${now}:${usdValue}`);
+    // M22 fix: The sliding window log is the SOLE source of truth for USD spending totals.
+    // See slidingWindowCheckLimit for rationale — no separate counter is used for limit
+    // enforcement, eliminating the crash-induced counter/log divergence issue.
+    //
+    // Record this USD transaction in the sliding window log.
+    // M27 fix: Use toFixed(10) for deterministic float-to-string serialization.
+    // See slidingWindowCheckLimit for rationale.
+    await context.store.append(logKey, `${now}:${usdValue.toFixed(10)}`);
 
     return null;
   }
@@ -729,115 +778,131 @@ export class SpendingLimitRule implements PolicyRule {
    *
    * L-03 NOTE: For amounts requiring exact precision beyond 15 significant digits
    * (e.g., EVM token amounts with 18 decimals), string-based or BigNumber arithmetic
-   * should be used instead of parseFloat. The safeGt() comparison function mitigates
+   * should be used instead of parseFloat. The safeGte() comparison function mitigates
    * drift in limit comparisons via BigInt-based scaling, but the extracted amount
    * itself is approximate when using parseFloat. This is acceptable for most Solana
    * use cases (9 decimals max), but EVM integrations should consider BigNumber parsing.
    */
   private extractAmount(intent: TransactionIntent): number | null {
-    const params = intent.params as unknown as Record<string, unknown>;
-    if ("amount" in params && typeof params.amount === "string") {
-      // H-15 FIX: Reject amounts with more than 18 decimal places
-      const dotIndex = params.amount.indexOf(".");
-      if (dotIndex !== -1) {
-        const decimalPlaces = params.amount.length - dotIndex - 1;
-        if (decimalPlaces > 18) {
-          process.emitWarning(
-            `Amount "${params.amount}" has ${decimalPlaces} decimal places (max 18). ` +
-            `Rejecting to prevent precision loss with parseFloat.`,
-            "KovaPrecisionWarning",
-          );
-          return null;
-        }
-      }
+    // H10 fix: Use discriminated union narrowing instead of unsafe double-cast.
+    // Extract amount string from intent types that carry an amount field.
+    let amountStr: string | undefined;
+    switch (intent.type) {
+      case "transfer":
+        amountStr = typeof intent.params.amount === "string" ? intent.params.amount : undefined;
+        break;
+      case "swap":
+        amountStr = typeof intent.params.amount === "string" ? intent.params.amount : undefined;
+        break;
+      case "stake":
+        amountStr = typeof intent.params.amount === "string" ? intent.params.amount : undefined;
+        break;
+      default:
+        return null;
+    }
+    if (amountStr === undefined) return null;
 
-      // POLICY-017 fix: Reject amounts with leading zeros (e.g., "007", "00.5").
-      // Leading zeros can cause ambiguity (octal interpretation in some parsers) and
-      // may indicate malformed input intended to bypass limit comparisons.
-      // Exception: "0" and "0.xxx" are valid (single leading zero before decimal point).
-      if (/^0\d/.test(params.amount)) {
+    // H-15 FIX: Reject amounts with more than 18 decimal places
+    const dotIndex = amountStr.indexOf(".");
+    if (dotIndex !== -1) {
+      const decimalPlaces = amountStr.length - dotIndex - 1;
+      if (decimalPlaces > 18) {
         process.emitWarning(
-          `Amount "${params.amount}" has leading zeros, which is ambiguous. ` +
-          `Rejecting to prevent potential parsing inconsistencies.`,
-          "KovaAmountWarning",
-        );
-        return null;
-      }
-
-      // POLICY-010 fix: BigInt-based amount extraction for integer amounts.
-      // If the amount string represents a pure integer (no decimal point), parse as
-      // BigInt first for precision, then convert to number with a safety check.
-      // This prevents silent precision loss for large token amounts (e.g., lamports).
-      if (/^\d+$/.test(params.amount)) {
-        try {
-          const bigAmount = BigInt(params.amount);
-          if (bigAmount <= 0n) {
-            // LOW-T4-07 fix: Log diagnostic when a zero/negative integer amount is encountered.
-            // This is fail-closed (treated as 0 spend by returning null, which triggers DENY
-            // via CRIT-01), but the silent failure could mask upstream bugs that produce
-            // invalid amounts. The warning aids debugging without changing behavior.
-            if (bigAmount < 0n) {
-              process.emitWarning(
-                "Negative integer amount encountered in extractAmount. " +
-                "This is treated as unquantifiable (DENY). Investigate upstream intent construction.",
-                { code: "KOVA_SPENDING_LIMIT_WARNING" },
-              );
-            }
-            return null;
-          }
-          const asNumber = Number(bigAmount);
-          if (asNumber > Number.MAX_SAFE_INTEGER) {
-            process.emitWarning(
-              `Amount ${params.amount} exceeds safe integer range, precision may be lost`,
-              "KovaPrecisionWarning",
-            );
-          }
-          return asNumber;
-        } catch {
-          return null;
-        }
-      }
-      // H-15 FIX: Validate decimal amount format before parseFloat.
-      // Only allow strings that match a valid decimal number pattern to prevent
-      // parseFloat from silently accepting malformed input like "123abc".
-      if (!/^\d+\.\d+$/.test(params.amount)) {
-        return null;
-      }
-      const parsed = parseFloat(params.amount);
-      if (isNaN(parsed) || !Number.isFinite(parsed) || parsed <= 0) {
-        // LOW-T4-07 fix: Log diagnostic when a negative decimal amount is encountered.
-        // Fail-closed: negative amounts are treated as 0 spend (returns null -> DENY),
-        // but imprecise diagnostics could mask bugs in upstream intent construction.
-        if (Number.isFinite(parsed) && parsed < 0) {
-          process.emitWarning(
-            "Negative decimal amount encountered in extractAmount. " +
-            "This is treated as unquantifiable (DENY). Investigate upstream intent construction.",
-            { code: "KOVA_SPENDING_LIMIT_WARNING" },
-          );
-        }
-        return null;
-      }
-      if (parsed > Number.MAX_SAFE_INTEGER) {
-        process.emitWarning(
-          `Amount ${params.amount} exceeds safe integer range, precision may be lost`,
+          `Amount "${amountStr}" has ${decimalPlaces} decimal places (max 18). ` +
+          `Rejecting to prevent precision loss with parseFloat.`,
           "KovaPrecisionWarning",
         );
+        return null;
       }
-      return parsed;
     }
-    return null;
+
+    // POLICY-017 fix: Reject amounts with leading zeros (e.g., "007", "00.5").
+    // Leading zeros can cause ambiguity (octal interpretation in some parsers) and
+    // may indicate malformed input intended to bypass limit comparisons.
+    // Exception: "0" and "0.xxx" are valid (single leading zero before decimal point).
+    if (/^0\d/.test(amountStr)) {
+      process.emitWarning(
+        `Amount "${amountStr}" has leading zeros, which is ambiguous. ` +
+        `Rejecting to prevent potential parsing inconsistencies.`,
+        "KovaAmountWarning",
+      );
+      return null;
+    }
+
+    // POLICY-010 fix: BigInt-based amount extraction for integer amounts.
+    // If the amount string represents a pure integer (no decimal point), parse as
+    // BigInt first for precision, then convert to number with a safety check.
+    // This prevents silent precision loss for large token amounts (e.g., lamports).
+    if (/^\d+$/.test(amountStr)) {
+      try {
+        const bigAmount = BigInt(amountStr);
+        if (bigAmount <= 0n) {
+          // LOW-T4-07 fix: Log diagnostic when a zero/negative integer amount is encountered.
+          if (bigAmount < 0n) {
+            process.emitWarning(
+              "Negative integer amount encountered in extractAmount. " +
+              "This is treated as unquantifiable (DENY). Investigate upstream intent construction.",
+              { code: "KOVA_SPENDING_LIMIT_WARNING" },
+            );
+          }
+          return null;
+        }
+        const asNumber = Number(bigAmount);
+        if (asNumber > Number.MAX_SAFE_INTEGER) {
+          process.emitWarning(
+            `Amount ${amountStr} exceeds safe integer range, precision may be lost`,
+            "KovaPrecisionWarning",
+          );
+        }
+        return asNumber;
+      } catch {
+        return null;
+      }
+    }
+    // H-15 FIX: Validate decimal amount format before parseFloat.
+    if (!/^\d+\.\d+$/.test(amountStr)) {
+      return null;
+    }
+    const parsed = parseFloat(amountStr);
+    if (isNaN(parsed) || !Number.isFinite(parsed) || parsed <= 0) {
+      // LOW-T4-07 fix: Log diagnostic when a negative decimal amount is encountered.
+      if (Number.isFinite(parsed) && parsed < 0) {
+        process.emitWarning(
+          "Negative decimal amount encountered in extractAmount. " +
+          "This is treated as unquantifiable (DENY). Investigate upstream intent construction.",
+          { code: "KOVA_SPENDING_LIMIT_WARNING" },
+        );
+      }
+      return null;
+    }
+    if (parsed > Number.MAX_SAFE_INTEGER) {
+      process.emitWarning(
+        `Amount ${amountStr} exceeds safe integer range, precision may be lost`,
+        "KovaPrecisionWarning",
+      );
+    }
+    return parsed;
   }
 
-  /** Extract the token symbol from an intent's params */
-  private extractToken(intent: TransactionIntent): string {
-    const params = intent.params as unknown as Record<string, unknown>;
-    if ("token" in params && typeof params.token === "string") {
-      return params.token;
+  /**
+   * Extract the token symbol from an intent's params.
+   * P-07 fix: Returns null instead of "UNKNOWN" when token is not extractable.
+   * This enables fail-closed behavior: the calling code denies intents with null
+   * token when token-specific limits are configured, preventing unidentified tokens
+   * from bypassing spending limits.
+   */
+  private extractToken(intent: TransactionIntent): string | null {
+    // H10 fix: Use discriminated union narrowing instead of unsafe double-cast.
+    switch (intent.type) {
+      case "transfer":
+        return typeof intent.params.token === "string" ? intent.params.token : null;
+      case "swap":
+        return typeof intent.params.fromToken === "string" ? intent.params.fromToken : null;
+      case "stake":
+        return typeof intent.params.token === "string" ? intent.params.token : null;
+      default:
+        return null;
     }
-    if ("fromToken" in params && typeof params.fromToken === "string") {
-      return params.fromToken;
-    }
-    return "UNKNOWN";
   }
 
   /**

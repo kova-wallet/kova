@@ -110,6 +110,28 @@ function createRedisMock() {
       return String(newVal);
     },
 
+    async eval(_script: string, numKeys: number, ...args: string[]): Promise<string | [string, string, string]> {
+      // CRIT-1 fix: Updated mock to match the new atomic Lua script that takes
+      // 2 KEYS (counter key + HMAC key) and returns [newValue, oldValue, oldHmac].
+      const key = args[0]!;
+      const hmacKey = numKeys >= 2 ? args[1]! : undefined;
+      const amount = args[numKeys]!;
+      // Simulate the Lua script: GET old value+HMAC, INCRBYFLOAT + round + clamp to 0
+      isExpired(key);
+      const existing = kv.get(key);
+      const oldValue = existing ? existing.value : "";
+      const oldHmac = hmacKey ? (kv.get(hmacKey)?.value ?? "") : "";
+      const current = existing ? parseFloat(existing.value) : 0;
+      const newVal = Math.max(0, current + parseFloat(amount));
+      const rounded = parseFloat(newVal.toFixed(10)).toString();
+      const entry: { value: string; expiresAt?: number } = { value: rounded };
+      if (existing?.expiresAt) {
+        entry.expiresAt = existing.expiresAt;
+      }
+      kv.set(key, entry);
+      return [rounded, oldValue, oldHmac];
+    },
+
     async rpush(key: string, value: string): Promise<number> {
       const list = lists.get(key) ?? [];
       list.push(value);
@@ -147,6 +169,10 @@ function createRedisMock() {
       // no-op
     },
 
+    on(_event: string, _handler: (...args: unknown[]) => void): void {
+      // no-op for mock
+    },
+
     // Expose internals for test assertions
     _kv: kv,
     _lists: lists,
@@ -161,7 +187,7 @@ describe("RedisStore", () => {
 
   beforeEach(() => {
     redisMock = createRedisMock();
-    store = new RedisStore({ client: redisMock as unknown as Redis });
+    store = new RedisStore({ client: redisMock as unknown as Redis, requireHmacKey: false });
   });
 
   describe("get/set", () => {
@@ -367,20 +393,20 @@ describe("RedisStore", () => {
     it("should clear all entries in a list", async () => {
       await store.append("list", "entry1");
       await store.append("list", "entry2");
-      await store.clearList!("list");
+      await store.clearList("list");
       expect(await store.getRecent("list", 10)).toEqual([]);
     });
 
     it("should not affect other lists", async () => {
       await store.append("list1", "a");
       await store.append("list2", "b");
-      await store.clearList!("list1");
+      await store.clearList("list1");
       expect(await store.getRecent("list1", 10)).toEqual([]);
       expect(await store.getRecent("list2", 10)).toEqual(["b"]);
     });
 
     it("should not throw when clearing non-existent list", async () => {
-      await expect(store.clearList!("nonexistent")).resolves.not.toThrow();
+      await expect(store.clearList("nonexistent")).resolves.not.toThrow();
     });
   });
 
@@ -414,6 +440,7 @@ describe("RedisStore", () => {
       const prefixedStore = new RedisStore({
         client: redisMock as unknown as Redis,
         keyPrefix: "app:",
+        requireHmacKey: false,
       });
       await prefixedStore.set("key1", "value1");
       // Verify the key in the underlying mock has the prefix
@@ -425,6 +452,7 @@ describe("RedisStore", () => {
       const prefixedStore = new RedisStore({
         client: redisMock as unknown as Redis,
         keyPrefix: "app:",
+        requireHmacKey: false,
       });
       await prefixedStore.append("log", "entry1");
       // List key should be prefixed with both keyPrefix and listPrefix

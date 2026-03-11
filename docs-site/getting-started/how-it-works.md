@@ -132,7 +132,7 @@ kova is made up of composable pieces. Here they are from most central to most sp
 | **Signer** | Holds keys, signs transactions | `LocalSigner` (dev) or `MpcSigner` (production) |
 | **ChainAdapter** | Talks to the blockchain, builds and broadcasts transactions | `SolanaAdapter` (more chains planned) |
 | **AI Adapters** | Converts wallet operations to tool schemas for AI frameworks | `toAnthropicTools()`, `toOpenAITools()`, `createLangChainTools()` |
-| **ApprovalChannel** | Human-in-the-loop approval for high-value transactions | `TelegramApprovalBot` (optional) |
+| **ApprovalChannel** | Human-in-the-loop approval for high-value transactions | `CallbackApprovalChannel`, `WebhookApprovalChannel` (optional) |
 | **AuditLogger** | Tamper-evident transaction log with hash chain integrity | Optional but recommended |
 | **CircuitBreaker** | Blocks all transactions after too many consecutive denials | Auto-managed by AgentWallet |
 

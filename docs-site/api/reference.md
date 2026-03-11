@@ -27,7 +27,7 @@ new AgentWallet(config: AgentWalletConfig)
 | `chain` | `ChainAdapter` | Yes | Blockchain adapter (e.g., SolanaAdapter) |
 | `policy` | `PolicyEngine` | Yes | Policy engine that evaluates every transaction |
 | `store` | `Store` | Yes | State storage for counters, logs, and audit entries |
-| `approval` | `ApprovalChannel` | No | Approval channel for human-in-the-loop (e.g., TelegramApprovalBot) |
+| `approval` | `ApprovalChannel` | No | Approval channel for human-in-the-loop (e.g., CallbackApprovalChannel, WebhookApprovalChannel) |
 | `logger` | `AuditLogger` | No | Tamper-evident audit logger |
 | `circuitBreaker` | `CircuitBreakerConfig` | No | Circuit breaker configuration |
 | `onAuditFailure` | `AuditFailureCallback` | No | Callback fired on audit integrity failures |
@@ -1021,7 +1021,7 @@ interface TransactionStatusResult {
 
 ### SolanaAdapter
 
-Chain adapter for the Solana blockchain. Supports native SOL transfers, SPL token transfers, and Jupiter swaps.
+Chain adapter for the Solana blockchain. Supports native SOL transfers, SPL token transfers, and token swaps.
 
 ```typescript
 // Create a SolanaAdapter connected to a Solana RPC endpoint.
@@ -1034,18 +1034,20 @@ new SolanaAdapter(config: SolanaAdapterConfig)
 |-----------|------|----------|-------------|
 | `rpcUrl` | `string` | Yes | Solana RPC endpoint URL |
 | `commitment` | `string` | No | Commitment level: `"processed"`, `"confirmed"`, or `"finalized"` |
-| `jupiterApiUrl` | `string` | No | Jupiter quote API URL (for swaps) |
-| `jupiterPriceApiUrl` | `string` | No | Jupiter price API URL (for USD values) |
+| `network` | `string` | No | Network selection: `"mainnet-beta"`, `"devnet"`, `"testnet"`, or `"auto"` |
+| `dnsCache` | `Map` | No | Per-instance DNS cache for multi-tenant isolation |
+| `priceProvider` | `(token: string) => Promise<number \| null>` | No | Price oracle for USD valuation |
 
 ```typescript
-// Import and configure the Solana adapter.
-import { SolanaAdapter } from "kova";
+// Import and configure the Solana adapter with a Pyth price oracle.
+import { SolanaAdapter, createPythPriceProvider } from "kova";
+import { Connection } from "@solana/web3.js";
 
+const connection = new Connection("https://api.mainnet-beta.solana.com");
 const chain = new SolanaAdapter({
   rpcUrl: "https://api.mainnet-beta.solana.com",  // Solana mainnet RPC
   commitment: "confirmed",                         // Wait for supermajority confirmation
-  jupiterApiUrl: "https://quote-api.jup.ag/v6",   // Jupiter swap quotes
-  jupiterPriceApiUrl: "https://price.jup.ag/v6",  // Jupiter token prices (for USD conversion)
+  priceProvider: createPythPriceProvider(connection), // Pyth on-chain price oracle
 });
 ```
 
@@ -1100,36 +1102,68 @@ type ApprovalDecision = "approved" | "rejected" | "timeout";
 
 ---
 
-### TelegramApprovalBot
+### CallbackApprovalChannel
 
-Sends approval requests as Telegram messages with inline Approve/Reject buttons.
+Flexible approval channel that uses two callbacks: one to notify a human, one to wait for their decision.
 
 ```typescript
-// Create a TelegramApprovalBot that sends approval messages to a Telegram chat.
-new TelegramApprovalBot(config: TelegramApprovalBotConfig)
+new CallbackApprovalChannel(config: CallbackApprovalChannelConfig)
 ```
 
-#### TelegramApprovalBotConfig
+#### CallbackApprovalChannelConfig
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `token` | `string` | Yes | Telegram bot token from @BotFather |
-| `chatId` | `string` | Yes | Chat ID to send approval requests to |
+| `name` | `string` | No | Channel name for audit logs (default: `"callback"`) |
+| `onApprovalRequest` | `(request: ApprovalRequest) => Promise<void>` | Yes | Callback to notify a human approver |
+| `waitForDecision` | `(request: ApprovalRequest) => Promise<ApprovalResult>` | Yes | Callback to wait for the human's decision |
 | `defaultTimeout` | `number` | No | Default timeout in ms (default: 300000 = 5 min) |
-| `allowedUserIds` | `string[]` | No | User IDs allowed to approve/reject |
-| `pollInterval` | `number` | No | Polling interval in ms for callback responses |
 
 ```typescript
-// Import and configure the Telegram approval bot.
-import { TelegramApprovalBot } from "kova";
+import { CallbackApprovalChannel } from "kova";
 
-const approval = new TelegramApprovalBot({
-  token: process.env.TELEGRAM_BOT_TOKEN!,  // Bot token from @BotFather
-  chatId: process.env.TELEGRAM_CHAT_ID!,   // Chat ID to send approval messages to
-  defaultTimeout: 300000,                   // 5-minute timeout before auto-rejecting
-  allowedUserIds: ["123456789"],            // Only this user can approve/reject
-  pollInterval: 2000,                       // Poll for button clicks every 2 seconds
+const approval = new CallbackApprovalChannel({
+  name: "my-approval",
+  onApprovalRequest: async (request) => {
+    await notifyApprover(request);
+  },
+  waitForDecision: async (request) => {
+    return pollForResponse(request.id);
+  },
+  defaultTimeout: 300_000,
 });
+```
+
+### WebhookApprovalChannel
+
+HTTP webhook-based approval for systems that communicate via HTTP callbacks.
+
+```typescript
+new WebhookApprovalChannel(config: WebhookApprovalChannelConfig)
+```
+
+#### WebhookApprovalChannelConfig
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `name` | `string` | No | Channel name for audit logs (default: `"webhook"`) |
+| `webhookUrl` | `string` | Yes | URL to POST approval requests to |
+| `hmacSecret` | `string` | Yes | Shared secret for HMAC-SHA256 signing (min 16 chars) |
+| `callbackPort` | `number` | No | Port for callback server (0 = OS-assigned) |
+| `callbackPath` | `string` | No | Path for incoming decision callbacks |
+| `defaultTimeout` | `number` | No | Default timeout in ms (default: 300000 = 5 min) |
+
+```typescript
+import { WebhookApprovalChannel } from "kova";
+
+const approval = new WebhookApprovalChannel({
+  webhookUrl: "https://your-approval-service.com/approve",
+  hmacSecret: process.env.APPROVAL_HMAC_SECRET!,
+  callbackPort: 0,
+  defaultTimeout: 300_000,
+});
+
+await approval.start();
 ```
 
 ---

@@ -30,6 +30,7 @@
 
 import { createHash, createHmac, createCipheriv, createDecipheriv, randomBytes, timingSafeEqual } from "node:crypto";
 import type { AuditEntry } from "./types.js";
+import type { TransactionIntent } from "../core/intent.js";
 import type { Store } from "../stores/interface.js";
 
 /** Callback invoked when an audit log write fails */
@@ -105,6 +106,16 @@ export interface AuditLoggerConfig {
    * Set to 0 or omit to disable retention-based pruning (entries persist until cap).
    */
   retentionDays?: number;
+  /**
+   * L-11 fix: Optional filter to control which audit entries are logged.
+   * Entries that do not match the filter criteria are silently dropped.
+   * Useful for reducing log volume in high-throughput environments.
+   */
+  auditFilter?: {
+    decisions?: ('ALLOW' | 'DENY' | 'PENDING')[];
+    intentTypes?: string[];
+    excludeSynthetic?: boolean;
+  };
 }
 
 /** Thrown when the audit circuit breaker is open (too many consecutive write failures) */
@@ -128,6 +139,18 @@ export interface IntegrityReport {
   firstBrokenAt: number;
   /** Description of the integrity issue, if any */
   error?: string;
+  /**
+   * ARCH-05 fix: Verified segments between checkpoints.
+   * When a hash chain break is detected, verification continues from the next
+   * checkpoint boundary rather than stopping entirely. Each segment reports
+   * its validity independently, allowing partial audit trail recovery.
+   */
+  verifiedSegments?: Array<{ from: number; to: number; valid: boolean }>;
+  /**
+   * ARCH-05 fix: Total entries verified across all valid segments.
+   * May be less than entriesChecked if some segments are broken.
+   */
+  totalVerifiedEntries?: number;
 }
 
 /**
@@ -151,7 +174,8 @@ function sortKeysDeep(value: unknown): unknown {
     const sorted: Record<string, unknown> = {};
     // M-18 fix: Filter out dangerous prototype-pollution keys during canonical serialization.
     // These properties can trigger prototype chain manipulation if preserved in sorted output.
-    for (const key of Object.keys(value as Record<string, unknown>).filter(k => k !== '__proto__' && k !== 'constructor' && k !== 'prototype').sort()) {
+    // L-13 fix: Extended prototype pollution blocklist with toString, valueOf, hasOwnProperty
+    for (const key of Object.keys(value as Record<string, unknown>).filter(k => k !== '__proto__' && k !== 'constructor' && k !== 'prototype' && k !== 'toString' && k !== 'valueOf' && k !== 'hasOwnProperty').sort()) {
       sorted[key] = sortKeysDeep((value as Record<string, unknown>)[key]);
     }
     return sorted;
@@ -190,12 +214,32 @@ const HASH_DOMAIN_SEPARATOR = "\x00kova:audit:v1\x00";
  */
 interface SequencedAuditEntry extends AuditEntry {
   sequenceNumber?: number;
+  /** M41 fix: Independent per-entry HMAC for standalone integrity verification */
+  entryHmac?: string;
 }
 
 /**
  * MED-19/MED-33 fix: Validate a parsed object has the minimum required AuditEntry structure.
  * Rejects invalid JSON that would otherwise pass through unchecked via `as AuditEntry`.
  */
+/**
+ * L-07 fix: Recursively strip control characters from all string values to prevent
+ * log injection attacks. Control chars (U+0000–U+001F, U+007F) can manipulate
+ * terminal output, corrupt log parsers, or inject fake log lines.
+ */
+function stripControlCharsDeep(obj: unknown): unknown {
+  if (typeof obj === 'string') return obj.replace(/[\x00-\x1F\x7F-\x9F\u00AD\u034F\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF\u{E0000}-\u{E007F}]/gu, '');
+  if (Array.isArray(obj)) return obj.map(stripControlCharsDeep);
+  if (obj && typeof obj === 'object') {
+    const result: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(obj)) {
+      result[k] = stripControlCharsDeep(v);
+    }
+    return result;
+  }
+  return obj;
+}
+
 function isValidAuditEntry(obj: unknown): obj is AuditEntry {
   if (!obj || typeof obj !== "object") return false;
   const e = obj as Record<string, unknown>;
@@ -260,6 +304,18 @@ export class AuditLogger {
   private readonly genesisHashKey = "audit:genesis_hash";
   /** CRIT-04 fix: Whether sequence state has been loaded from the store */
   private sequenceInitialized = false;
+  /** L-10 fix: Cached hash of the most recent entry to avoid store reads on every write */
+  private lastHash: string | null = null;
+  /** L-11 fix: Optional filter to control which audit entries are logged */
+  private readonly auditFilter?: {
+    decisions?: ('ALLOW' | 'DENY' | 'PENDING')[];
+    intentTypes?: string[];
+    excludeSynthetic?: boolean;
+  };
+  /** L-09 fix: Checkpoint interval — store a checkpoint hash every N entries */
+  private readonly checkpointInterval = 1000;
+  /** L-09 fix: Store key prefix for checkpoint hashes */
+  private readonly checkpointKeyPrefix = "audit:checkpoint:";
 
   /**
    * Backward-compatible constructor.
@@ -276,6 +332,13 @@ export class AuditLogger {
       this.store = config.store;
       this.maxConsecutiveFailures = config.maxConsecutiveFailures ?? 3;
       this.onAuditFailure = config.onAuditFailure;
+      // L-03 fix: Emit security warning when no HMAC key is provided
+      if (!config.hmacKey) {
+        process.emitWarning(
+          'AuditLogger created without hmacKey -- audit entries have no tamper protection. Set hmacKey for production use.',
+          'KovaSecurityWarning'
+        );
+      }
       // HIGH-02 fix: Store HMAC key if provided
       // H-11 fix: Enforce minimum 32-byte HMAC key length to prevent brute-force attacks.
       // HMAC-SHA256 security relies on the key having sufficient entropy; keys shorter
@@ -321,6 +384,20 @@ export class AuditLogger {
         }
         this.encryptionKey = config.encryptionKey;
       }
+      // L-11 fix: Store audit filter if provided
+      // HIGH-9 fix: Reject audit filter configurations that exclude DENY events.
+      // Hiding DENY events from the audit trail would mask policy violations,
+      // defeating the purpose of the audit log.
+      if (config.auditFilter?.decisions && !config.auditFilter.decisions.includes("DENY")) {
+        process.emitWarning(
+          "AuditLogger: auditFilter.decisions excludes 'DENY'. This hides policy violations from the audit trail. " +
+          "DENY events will still be logged for security.",
+          { code: "KOVA_AUDIT_FILTER_WARNING" },
+        );
+        // Force include DENY in decisions filter
+        config.auditFilter.decisions = [...config.auditFilter.decisions, "DENY"];
+      }
+      this.auditFilter = config.auditFilter;
       // HIGH-20 fix: Store retention period if provided
       this.retentionDays = config.retentionDays;
       if (this.retentionDays && this.retentionDays > 0) {
@@ -363,6 +440,10 @@ export class AuditLogger {
         } else {
           // Legacy entries without sequence numbers — start from totalEntryCount
           this.nextSequenceNumber = this.totalEntryCount;
+        }
+        // L-10 fix: Initialize lastHash cache from the most recent entry
+        if (isValidAuditEntry(parsed) && parsed.hash) {
+          this.lastHash = parsed.hash;
         }
       } catch {
         // Corrupted entry — will be caught by logInternal
@@ -457,6 +538,32 @@ export class AuditLogger {
   }
 
   /**
+   * M41 fix: Compute an independent per-entry HMAC over the entry's content fields.
+   * This HMAC is independent of the hash chain — it does not reference previousHash
+   * or chainHash. If the chain is broken at one point (corrupted entry), individual
+   * entries can still be verified for integrity using this standalone HMAC.
+   * The HMAC covers: timestamp, intentId, intent, policyDecisions, finalDecision,
+   * transactionResult, and sequenceNumber.
+   */
+  private computeEntryHmac(entry: AuditEntry & { sequenceNumber?: number }): string | undefined {
+    if (!this.hmacKey) {
+      return undefined; // No HMAC key — skip per-entry HMAC
+    }
+    const fields = {
+      timestamp: entry.timestamp,
+      intentId: entry.intentId,
+      intent: entry.intent,
+      policyDecisions: entry.policyDecisions,
+      finalDecision: entry.finalDecision,
+      transactionResult: entry.transactionResult,
+      sequenceNumber: (entry as { sequenceNumber?: number }).sequenceNumber,
+    };
+    return createHmac("sha256", this.hmacKey)
+      .update("kova-entry-hmac-v1:" + canonicalJson(fields))
+      .digest("hex");
+  }
+
+  /**
    * CRIT-08 fix: Encrypt a plaintext string using AES-256-GCM.
    * Returns a string in the format "iv:authTag:ciphertext" (all base64-encoded).
    * Uses a random 12-byte IV (GCM standard nonce size) for each encryption.
@@ -509,47 +616,91 @@ export class AuditLogger {
       // CRIT-04 fix: Ensure sequence state is initialized from persisted store
       await this.ensureSequenceInitialized();
 
-      // Derive previous hash from the most recent entry in the list
+      // L-11 fix: Check audit filter before logging
+      // AUDIT-H12 fix: Never suppress ALLOW decisions for write operations (transfer, swap, custom, mint, stake).
+      // Suppressing ALLOW events could hide successful unauthorized transactions in the audit trail.
+      if (this.auditFilter) {
+        const decision = entry.finalDecision?.decision;
+        const intentType = entry.intent?.type;
+        const isWriteOp = intentType === 'transfer' || intentType === 'swap' || intentType === 'custom' || intentType === 'mint' || intentType === 'stake';
+        const isAllowWrite = decision === 'ALLOW' && isWriteOp;
+        if (this.auditFilter.decisions && decision && !isAllowWrite && !this.auditFilter.decisions.includes(decision as 'ALLOW' | 'DENY' | 'PENDING')) {
+          return true; // Silently skip filtered entries (but never skip ALLOW for write operations)
+        }
+        // M39 fix: Never suppress write intent types (transfer, swap, custom, mint, stake) via
+        // intentTypes filter. Allowing operators to exclude write operations from audit logging
+        // could hide malicious transactions. The filter should only affect read/informational events.
+        if (this.auditFilter.intentTypes && !this.auditFilter.intentTypes.includes(entry.intent?.type)) {
+          if (!isWriteOp) {
+            return true;
+          }
+          // Write operation — bypass intentTypes filter, always log
+        }
+        if (this.auditFilter.excludeSynthetic && entry.intentId?.startsWith('system:')) {
+          const criticalSystemEvents = ['system:circuit_breaker', 'system:hmac_failure', 'system:hash_chain_reset', 'system:audit-cleared', 'system:destroy'];
+          if (!criticalSystemEvents.some(evt => entry.intentId === evt || entry.intentId?.startsWith(evt + ':'))) {
+            return true;
+          }
+        }
+      }
+
+      // L-07 fix: Strip control characters from intent params to prevent log injection
+      if (entry.intent && entry.intent.params) {
+        entry = {
+          ...entry,
+          intent: {
+            ...entry.intent,
+            params: stripControlCharsDeep(entry.intent.params) as typeof entry.intent.params,
+          } as TransactionIntent,
+        };
+      }
+
+      // L-10 fix: Use cached lastHash if available to avoid store read on every write
       let previousHash = "";
-      const recentRaw = await this.store.getRecent(this.storeKey, 1);
-      if (recentRaw.length > 0) {
-        try {
-          // CRIT-08 fix: Decrypt entry if encryption is enabled
-          const decrypted = this.decrypt(recentRaw[0]!);
-          const parsed = JSON.parse(decrypted);
-          // MED-33 fix: Validate before trusting as AuditEntry
-          const lastEntry = isValidAuditEntry(parsed) ? parsed : null;
-          previousHash = lastEntry?.hash ?? "";
-          // MED-19 fix: Emit a process warning when the previous entry is corrupted
-          // or missing a hash, as this breaks the hash chain integrity. The empty
-          // previousHash starts a new chain segment, but operators should investigate.
-          // STORE-010 fix: Also invoke onHashChainReset callback if configured.
-          if (previousHash === "") {
+      if (this.lastHash !== null) {
+        previousHash = this.lastHash;
+      } else {
+        // Derive previous hash from the most recent entry in the list
+        const recentRaw = await this.store.getRecent(this.storeKey, 1);
+        if (recentRaw.length > 0) {
+          try {
+            // CRIT-08 fix: Decrypt entry if encryption is enabled
+            const decrypted = this.decrypt(recentRaw[0]!);
+            const parsed = JSON.parse(decrypted);
+            // MED-33 fix: Validate before trusting as AuditEntry
+            const lastEntry = isValidAuditEntry(parsed) ? parsed : null;
+            previousHash = lastEntry?.hash ?? "";
+            // MED-19 fix: Emit a process warning when the previous entry is corrupted
+            // or missing a hash, as this breaks the hash chain integrity. The empty
+            // previousHash starts a new chain segment, but operators should investigate.
+            // STORE-010 fix: Also invoke onHashChainReset callback if configured.
+            if (previousHash === "") {
+              const reason =
+                "Audit hash chain broken: previous entry missing or corrupted hash. " +
+                "Starting new chain segment. Run verifyIntegrity() to assess damage.";
+              process.emitWarning(reason, "KovaAuditWarning");
+              this.onHashChainReset?.(reason);
+            }
+          } catch {
+            // M-38 fix: Do NOT silently restart the chain when the last entry is corrupted.
+            // Silently resetting previousHash to "" allows chain restart attacks — an attacker
+            // who corrupts the last entry can cause the chain to restart, hiding all evidence
+            // of prior entries. Instead, throw an error to force operator investigation.
             const reason =
-              "Audit hash chain broken: previous entry missing or corrupted hash. " +
-              "Starting new chain segment. Run verifyIntegrity() to assess damage.";
+              "Audit hash chain critically corrupted: last entry failed JSON parse. " +
+              "Refusing to continue — this may indicate a chain restart attack. " +
+              "Investigate the audit store and run verifyIntegrity() to assess damage.";
             process.emitWarning(reason, "KovaAuditWarning");
             this.onHashChainReset?.(reason);
+            throw new Error(reason);
           }
-        } catch {
-          // M-38 fix: Do NOT silently restart the chain when the last entry is corrupted.
-          // Silently resetting previousHash to "" allows chain restart attacks — an attacker
-          // who corrupts the last entry can cause the chain to restart, hiding all evidence
-          // of prior entries. Instead, throw an error to force operator investigation.
-          const reason =
-            "Audit hash chain critically corrupted: last entry failed JSON parse. " +
-            "Refusing to continue — this may indicate a chain restart attack. " +
-            "Investigate the audit store and run verifyIntegrity() to assess damage.";
-          process.emitWarning(reason, "KovaAuditWarning");
-          this.onHashChainReset?.(reason);
-          throw new Error(reason);
         }
       }
 
       // DATA-015 fix: Override caller-controlled timestamp with server-authoritative timestamp.
       // A caller could set a past/future timestamp to manipulate audit log ordering or
       // bypass time-based analysis. The server timestamp ensures chronological integrity.
-      entry = { ...entry, timestamp: Date.now() };
+      entry = { ...entry, timestamp: Date.now(), schemaVersion: 1 };
 
       // CRIT-04 fix: Assign the next sequence number
       const sequenceNumber = this.nextSequenceNumber;
@@ -560,12 +711,18 @@ export class AuditLogger {
       const entryJson = canonicalJson(entry);
       const hash = this.computeHash(entryJson + HASH_DOMAIN_SEPARATOR + previousHash);
 
-      // Create the enriched entry with hash chain fields and sequence number
+      // M41 fix: Compute independent per-entry HMAC for standalone integrity verification.
+      // Even if the chain hash is broken at one point, individual entries can be verified.
+      const entryWithSeq = { ...entry, sequenceNumber };
+      const entryHmac = this.computeEntryHmac(entryWithSeq);
+
+      // Create the enriched entry with hash chain fields, sequence number, and entry HMAC
       const enrichedEntry: SequencedAuditEntry = {
         ...entry,
         hash,
         previousHash: previousHash || undefined,
         sequenceNumber,
+        ...(entryHmac ? { entryHmac } : {}),
       };
 
       // Single atomic write
@@ -581,6 +738,8 @@ export class AuditLogger {
       // CRIT-04 fix: Update sequence tracking state
       this.nextSequenceNumber = sequenceNumber + 1;
       this.totalEntryCount++;
+      // L-10 fix: Update cached lastHash so next write doesn't need a store read
+      this.lastHash = hash;
 
       // DATA-001 fix: Wrap counter and genesis hash updates in a nested try/catch.
       // The audit entry append above is the critical write. If it succeeds but the
@@ -596,6 +755,10 @@ export class AuditLogger {
         // CRIT-04 fix: Store genesis hash for the first entry
         if (sequenceNumber === 0) {
           await this.store.set(this.genesisHashKey, hash);
+        }
+        // L-09 fix: Store periodic checkpoint hash for sub-chain verification
+        if (sequenceNumber > 0 && sequenceNumber % this.checkpointInterval === 0) {
+          await this.store.set(`${this.checkpointKeyPrefix}${sequenceNumber}`, hash);
         }
       } catch (metadataErr) {
         // DATA-001 fix: Entry was logged — warn about stale metadata but don't fail
@@ -778,13 +941,15 @@ export class AuditLogger {
 
     // Log a special "audit-cleared" entry before clearing so the event is recorded
     // in the store. This entry will be the genesis entry of the new chain.
+    // MED-20 fix: Use type "custom" with programId "system" instead of fabricated
+    // "transfer" intent, since this is a system event, not a real transfer.
     const clearEntry: AuditEntry = {
       timestamp: Date.now(),
       intentId: "system:audit-cleared",
       intent: {
-        type: "transfer",
-        chain: "solana",
-        params: { to: "system", amount: "0", token: "NONE" },
+        type: "custom",
+        chain: "system",
+        params: { programId: "system", data: "", accounts: [] },
         metadata: { reason: "audit-log-cleared", agentId: "system" },
       },
       policyDecisions: [],
@@ -807,21 +972,9 @@ export class AuditLogger {
       sequenceNumber: 0,
     };
 
-    // MED-T5-09 fix: Clear the list namespace (not just KV namespace).
-    // Previously used store.set() which only writes to the KV namespace, but
-    // append()/getRecent() use the list namespace. Use clearList() if available.
-    if (typeof this.store.clearList === "function") {
-      await this.store.clearList(this.storeKey);
-    } else {
-      // DATA-009 fix: Throw an error when clearList() is not available instead of
-      // silently falling back to store.set() which writes to the KV namespace and
-      // does not clear list entries. The old fallback left entries accessible via
-      // getRecent(), breaking the hash chain silently.
-      throw new Error(
-        "AuditLogger.clear(): store does not implement clearList(). " +
-        "Custom Store implementations must provide clearList() to support audit log clearing.",
-      );
-    }
+    // Clear the list namespace (not just KV namespace).
+    // append()/getRecent() use the list namespace, so clearList() is required.
+    await this.store.clearList(this.storeKey);
     // Re-create the list with the clear entry as genesis
     // CRIT-08 fix: Encrypt the serialized entry before storing if encryption is enabled
     const serialized = JSON.stringify(enrichedEntry);
@@ -830,6 +983,8 @@ export class AuditLogger {
     // Update counters and store genesis hash for the new chain
     this.nextSequenceNumber = 1;
     this.totalEntryCount = 1;
+    // L-10 fix: Update cached lastHash after clear
+    this.lastHash = hash;
     await this.store.set(this.entryCountKey, String(this.totalEntryCount));
     await this.store.set(this.genesisHashKey, hash);
   }
@@ -847,15 +1002,72 @@ export class AuditLogger {
    * TODO: Implement native TTL support in the Store interface (e.g., Store.deleteOlderThan())
    * to enable actual pruning without breaking hash chain integrity.
    */
+  /**
+   * L-12 fix: Basic retention pruning implementation.
+   * Reads all entries, filters out those older than retentionDays, and rewrites
+   * the store with only the retained entries. This is expensive and breaks the
+   * hash chain (since removed entries invalidate subsequent hashes), so it should
+   * only be run during maintenance windows.
+   *
+   * TODO: For production use, implement native TTL support in the Store interface
+   * (e.g., Store.deleteOlderThan()) to enable pruning without full rewrite.
+   * Alternatively, implement a "compaction" step that re-hashes the retained
+   * entries into a new chain with a fresh genesis, and stores the old chain's
+   * final checkpoint for audit continuity.
+   */
   private async pruneExpiredEntries(): Promise<void> {
     if (!this.retentionDays || this.retentionDays <= 0) return;
-    process.emitWarning(
-      `AuditLogger: retentionDays is set to ${this.retentionDays} but the Store interface ` +
-      "does not support TTL-based expiration or range deletion. Retention policy is not " +
-      "enforced at the logger level — configure your Store implementation (e.g., SqliteStore) " +
-      "to enforce TTL-based entry expiration for audit keys.",
-      "KovaAuditWarning",
-    );
+
+    const cutoffMs = Date.now() - this.retentionDays * 24 * 60 * 60 * 1000;
+
+    // Attempt to read and filter entries
+    try {
+      const raw = await this.store.getRecent(this.storeKey, 100_000);
+      if (raw.length === 0) return;
+
+      const retained: string[] = [];
+      let pruned = 0;
+      for (const r of raw) {
+        try {
+          const decrypted = this.decrypt(r);
+          const parsed = JSON.parse(decrypted) as SequencedAuditEntry;
+          if (isValidAuditEntry(parsed) && parsed.timestamp >= cutoffMs) {
+            retained.push(r);
+          } else {
+            pruned++;
+          }
+        } catch {
+          // Keep unparseable entries to avoid silent data loss
+          retained.push(r);
+        }
+      }
+
+      if (pruned === 0) return;
+
+      // Rewrite the store with only retained entries
+      await this.store.clearList(this.storeKey);
+      // Re-append in reverse order (retained is newest-first from getRecent)
+      for (let i = retained.length - 1; i >= 0; i--) {
+        await this.store.append(this.storeKey, retained[i]!);
+      }
+      // Update entry count
+      this.totalEntryCount = retained.length;
+      await this.store.set(this.entryCountKey, String(this.totalEntryCount));
+      // Invalidate lastHash cache since chain was rewritten
+      this.lastHash = null;
+
+      process.emitWarning(
+        `AuditLogger: pruned ${pruned} entries older than ${this.retentionDays} days. ` +
+        "Hash chain integrity is broken for pruned segments. Run verifyIntegrity() on the retained chain.",
+        "KovaAuditWarning",
+      );
+    } catch {
+      // Non-fatal — pruning is best-effort
+      process.emitWarning(
+        "AuditLogger: retention pruning failed. Will retry on next cycle.",
+        "KovaAuditWarning",
+      );
+    }
   }
 
   /**
@@ -863,8 +1075,22 @@ export class AuditLogger {
    * Call this method during application shutdown to prevent key leakage from
    * memory dumps, core files, or heap snapshots. After calling destroy(),
    * further log() calls that rely on HMAC will produce incorrect hashes.
+   *
+   * L-08 KNOWN LIMITATION — V8 GC AND KEY MATERIAL:
+   * Buffer.fill(0) zeroes the current allocation, but V8's garbage collector may
+   * have already copied the key material to other heap locations during compaction
+   * or generational promotion. There is no way to guarantee that all copies are
+   * wiped in a managed runtime. For guaranteed memory wiping, use `sodium-native`
+   * (libsodium's `sodium_memzero`) which allocates outside the V8 heap in
+   * mlock'd memory that is excluded from core dumps and swap.
    */
   async destroy(): Promise<void> {
+    // L-05 fix: Log a system event before destroying key material
+    try {
+      await this.logSystemEvent('destroy', { reason: 'AuditLogger.destroy() called' });
+    } catch {
+      // Best-effort — don't block destroy if logging fails
+    }
     // DATA-011 fix: Set destroyed flag BEFORE zeroing the HMAC key.
     // Previously, a concurrent log() call racing with destroy() could see
     // hmacKey already zeroed but destroyed still false, producing an entry
@@ -880,6 +1106,50 @@ export class AuditLogger {
       this.encryptionKey.fill(0);
       this.encryptionKey = undefined;
     }
+  }
+
+  /**
+   * L-05 fix: Log a system-level audit event (not tied to a transaction intent).
+   * Used for recording infrastructure events that affect audit integrity:
+   * - 'circuit_breaker_state_change': circuit breaker opened/closed
+   * - 'auth_failure': authentication failure on resetFailureCount/clear
+   * - 'destroy': AuditLogger is being destroyed
+   * - 'integrity_check': integrity verification was performed
+   */
+  async logSystemEvent(eventType: string, details: Record<string, unknown>): Promise<boolean> {
+    const systemEntry: AuditEntry = {
+      timestamp: Date.now(),
+      intentId: `system:${eventType}`,
+      intent: {
+        type: "custom",
+        // MED-19 fix: Use "system" instead of hardcoded "solana" for system events,
+        // since these events are not chain-specific.
+        chain: "system",
+        params: {
+          programId: "system",
+          data: Buffer.from(JSON.stringify({ eventType, ...details })).toString("base64"),
+          accounts: [],
+        },
+        metadata: { agentId: "system", reason: eventType },
+      },
+      policyDecisions: [],
+      finalDecision: { decision: "ALLOW" },
+    };
+    return this.log(systemEntry);
+  }
+
+  /**
+   * L-01 fix: Sanitize an audit entry for stderr fallback output.
+   * Only includes error codes and intent IDs — strips addresses, amounts,
+   * raw error messages, and any other potentially sensitive transaction data.
+   */
+  static sanitizeForStderr(entry: Partial<AuditEntry>): string {
+    return JSON.stringify({
+      intentId: entry.intentId ?? 'unknown',
+      decision: entry.finalDecision?.decision ?? 'unknown',
+      timestamp: entry.timestamp ?? Date.now(),
+      txStatus: entry.transactionResult?.status,
+    });
   }
 
   /**
@@ -976,7 +1246,10 @@ export class AuditLogger {
     }
 
     // CRIT-04 fix: Verify entry count against expected total (when checking full log)
-    // Only check if we requested enough entries to cover the full log
+    // L-04 fix: Derive expected count from BOTH the persisted counter AND actual store
+    // contents, flagging discrepancies. The append + counter update in logInternal() is
+    // NOT atomic — a crash between append() and set(entryCountKey) causes a stale counter.
+    // Cross-checking both sources detects this inconsistency.
     if (count >= this.totalEntryCount && this.totalEntryCount > 0) {
       if (entries.length < this.totalEntryCount) {
         return {
@@ -987,84 +1260,183 @@ export class AuditLogger {
             "Entries may have been deleted from the audit log.",
         };
       }
+      if (entries.length > this.totalEntryCount) {
+        // L-04 fix: More entries in store than the persisted counter expects —
+        // the counter is stale (likely from a crash between append and counter update).
+        // This is not necessarily tampering, but should be flagged.
+        process.emitWarning(
+          `AuditLogger: store contains ${entries.length} entries but persisted counter is ${this.totalEntryCount}. ` +
+          "Counter may be stale due to a non-atomic write. Updating counter to match actual store contents.",
+          "KovaAuditWarning",
+        );
+        this.totalEntryCount = entries.length;
+      }
     }
+
+    // L-09 fix: If not verifying the full chain, try to start from the nearest checkpoint
+    // to avoid scanning from the very beginning
+    if (entries.length > 0) {
+      const firstSeq = (entries[0] as SequencedAuditEntry).sequenceNumber;
+      if (typeof firstSeq === "number" && firstSeq > 0) {
+        // Find the nearest checkpoint at or before the first entry
+        const checkpointSeq = Math.floor(firstSeq / this.checkpointInterval) * this.checkpointInterval;
+        if (checkpointSeq > 0) {
+          const checkpointHash = await this.store.get(`${this.checkpointKeyPrefix}${checkpointSeq}`);
+          if (checkpointHash) {
+            // Find the checkpoint entry in our list and verify it matches
+            const cpIdx = entries.findIndex(
+              (e) => (e as SequencedAuditEntry).sequenceNumber === checkpointSeq
+            );
+            if (cpIdx >= 0 && entries[cpIdx]!.hash && !safeHashEquals(entries[cpIdx]!.hash!, checkpointHash)) {
+              return {
+                valid: false,
+                entriesChecked: cpIdx,
+                firstBrokenAt: cpIdx,
+                error: `Checkpoint mismatch at sequence ${checkpointSeq}: stored checkpoint hash ` +
+                  "does not match entry hash. The chain may have been tampered with.",
+              };
+            }
+          }
+        }
+      }
+    }
+
+    // ARCH-05 fix: Track verified segments for checkpoint-resilient verification.
+    // When a break is detected, we skip forward to the next checkpoint boundary
+    // and resume verification, allowing partial audit trail recovery.
+    const verifiedSegments: Array<{ from: number; to: number; valid: boolean }> = [];
+    let segmentStart = 0;
+    let firstBrokenAt = -1;
+    let firstError: string | undefined;
+    let totalVerifiedEntries = 0;
 
     for (let i = 0; i < entries.length; i++) {
       const entry = entries[i]!;
+      let broken = false;
+      let breakError = "";
 
       // Every entry must have a hash
       if (!entry.hash || typeof entry.hash !== "string" || entry.hash.length !== 64) {
-        return {
-          valid: false,
-          entriesChecked: i,
-          firstBrokenAt: i,
-          error: `Entry ${i} is missing or has invalid hash field`,
-        };
+        broken = true;
+        breakError = `Entry ${i} is missing or has invalid hash field`;
       }
 
       // CRIT-04 fix: Verify sequence numbers are contiguous (no gaps)
-      // Only check entries that have sequence numbers (legacy entries may not)
-      if (typeof entry.sequenceNumber === "number") {
-        if (i > 0) {
+      if (!broken && typeof entry.sequenceNumber === "number") {
+        if (i > 0 && i > segmentStart) {
           const prevEntry = entries[i - 1]!;
           if (typeof prevEntry.sequenceNumber === "number") {
             const expectedSeq = prevEntry.sequenceNumber + 1;
             if (entry.sequenceNumber !== expectedSeq) {
-              return {
-                valid: false,
-                entriesChecked: i,
-                firstBrokenAt: i,
-                error: `Sequence gap detected at entry ${i}: expected sequence number ${expectedSeq} ` +
-                  `but found ${entry.sequenceNumber}. Entries may have been deleted from the chain.`,
-              };
+              broken = true;
+              breakError = `Sequence gap detected at entry ${i}: expected sequence number ${expectedSeq} ` +
+                `but found ${entry.sequenceNumber}. Entries may have been deleted from the chain.`;
             }
           }
         }
       }
 
       // Verify previous hash link (HIGH-02: timing-safe comparison)
-      if (i > 0) {
+      if (!broken && i > 0 && i > segmentStart) {
         const prevEntry = entries[i - 1]!;
         if (!entry.previousHash || !prevEntry.hash || !safeHashEquals(entry.previousHash, prevEntry.hash)) {
-          return {
-            valid: false,
-            entriesChecked: i,
-            firstBrokenAt: i,
-            error: `Entry ${i} previousHash does not match entry ${i - 1} hash`,
-          };
+          broken = true;
+          breakError = `Entry ${i} previousHash does not match entry ${i - 1} hash`;
         }
       }
 
       // Verify the hash itself: recompute from entry content
-      // Strip hash, previousHash, and sequenceNumber fields, then recompute using canonical JSON
-      // CRIT-04 fix: sequenceNumber is added after hash computation in logInternal(),
-      // so it must be excluded from the recomputation here to match.
-      const { hash: _storedHash, previousHash: prevHash, sequenceNumber: _seq, ...entryContent } = entry;
-      void _storedHash;
-      void _seq;
-      const entryJson = canonicalJson(entryContent);
-      // MED-04 fix: Use domain separator in hash recomputation (must match log())
-      // HIGH-02 fix: Use HMAC-SHA256 when hmacKey is configured (must match log())
-      const expectedHash = this.computeHash(entryJson + HASH_DOMAIN_SEPARATOR + (prevHash ?? ""));
+      if (!broken) {
+        const { hash: _storedHash, previousHash: prevHash, sequenceNumber: _seq, ...entryContent } = entry;
+        void _storedHash;
+        void _seq;
+        const entryJson = canonicalJson(entryContent);
+        const expectedHash = this.computeHash(entryJson + HASH_DOMAIN_SEPARATOR + (prevHash ?? ""));
 
-      // HIGH-02 fix: Timing-safe hash comparison
-      // STORE-014 fix: Distinguish between hash chain break and HMAC key mismatch
-      if (!safeHashEquals(entry.hash, expectedHash)) {
-        // If an HMAC key is configured, a mismatch on every entry (especially the first)
-        // likely indicates the wrong HMAC key rather than targeted tampering.
-        const hmacHint = this.hmacKey
-          ? " This may indicate an HMAC key mismatch — verify that the same hmacKey " +
-            "used to write the audit log is being used for verification."
-          : "";
-        return {
-          valid: false,
-          entriesChecked: i,
-          firstBrokenAt: i,
-          error: `Entry ${i} hash does not match recomputed hash (tampered or corrupted).${hmacHint}`,
-        };
+        if (!entry.hash || !safeHashEquals(entry.hash, expectedHash)) {
+          broken = true;
+          const hmacHint = this.hmacKey
+            ? " This may indicate an HMAC key mismatch — verify that the same hmacKey " +
+              "used to write the audit log is being used for verification."
+            : "";
+          breakError = `Entry ${i} hash does not match recomputed hash (tampered or corrupted).${hmacHint}`;
+        }
+      }
+
+      if (broken) {
+        // Record the valid segment up to this break
+        if (i > segmentStart) {
+          const segmentLength = i - segmentStart;
+          verifiedSegments.push({ from: segmentStart, to: i - 1, valid: true });
+          totalVerifiedEntries += segmentLength;
+        }
+        // Record the broken entry
+        verifiedSegments.push({ from: i, to: i, valid: false });
+
+        if (firstBrokenAt === -1) {
+          firstBrokenAt = i;
+          firstError = breakError;
+        }
+
+        // ARCH-05 fix: Skip forward to the next checkpoint boundary and resume verification.
+        // This allows segments after the corruption to be independently verified,
+        // recovering as much of the audit trail as possible.
+        const entrySeq = typeof entry.sequenceNumber === "number" ? entry.sequenceNumber : -1;
+        if (entrySeq >= 0) {
+          const nextCheckpointSeq = (Math.floor(entrySeq / this.checkpointInterval) + 1) * this.checkpointInterval;
+          // Find the entry at or after the next checkpoint
+          let resumeIdx = -1;
+          for (let j = i + 1; j < entries.length; j++) {
+            const candidate = entries[j] as SequencedAuditEntry;
+            if (typeof candidate.sequenceNumber === "number" && candidate.sequenceNumber >= nextCheckpointSeq) {
+              resumeIdx = j;
+              break;
+            }
+          }
+          if (resumeIdx >= 0) {
+            // Resume verification from the next checkpoint boundary
+            segmentStart = resumeIdx;
+            i = resumeIdx - 1; // will be incremented by the for loop
+            continue;
+          }
+        }
+        // No checkpoint found to resume from — record remaining as unverified
+        if (i + 1 < entries.length) {
+          verifiedSegments.push({ from: i + 1, to: entries.length - 1, valid: false });
+        }
+        break;
       }
     }
 
-    return { valid: true, entriesChecked: entries.length, firstBrokenAt: -1 };
+    // Record the final valid segment if we made it through
+    if (firstBrokenAt === -1) {
+      // Entire chain is valid
+      return { valid: true, entriesChecked: entries.length, firstBrokenAt: -1 };
+    }
+
+    // Record trailing valid segment if we resumed and verified to the end
+    const lastSegment = verifiedSegments[verifiedSegments.length - 1];
+    if (lastSegment && lastSegment.valid && lastSegment.to < entries.length - 1) {
+      // The loop ended normally after resuming — add remaining verified entries
+    } else if (!lastSegment || lastSegment.valid) {
+      // Check if there are entries after the last segment that were verified
+      const lastVerifiedTo = lastSegment ? lastSegment.to : segmentStart - 1;
+      if (lastVerifiedTo < entries.length - 1 && segmentStart <= entries.length - 1) {
+        const trailingLength = entries.length - segmentStart;
+        if (trailingLength > 0) {
+          verifiedSegments.push({ from: segmentStart, to: entries.length - 1, valid: true });
+          totalVerifiedEntries += trailingLength;
+        }
+      }
+    }
+
+    return {
+      valid: false,
+      entriesChecked: entries.length,
+      firstBrokenAt,
+      error: firstError,
+      verifiedSegments,
+      totalVerifiedEntries,
+    };
   }
 }

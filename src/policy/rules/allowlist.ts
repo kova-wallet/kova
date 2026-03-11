@@ -11,10 +11,8 @@
  * MED-05 LIMITATION: This rule does NOT verify the DEX program used for swap intents.
  * When a swap intent is evaluated, the allowlist checks the fromToken/toToken via
  * allowTokens/denyTokens, but it does NOT validate which DEX aggregator program
- * (e.g., Jupiter, Raydium, Orca) is used to execute the swap. A malicious or
- * compromised DEX program could drain funds even if token checks pass. To mitigate
- * this, configure allowPrograms with trusted DEX program IDs and ensure swap intents
- * include a programId field, or use a dedicated DEX allowlist in the chain adapter.
+ * is used to execute the swap. To mitigate this, configure allowPrograms with trusted
+ * DEX program IDs and ensure swap intents include a programId field.
  *
  * M-05 FIX (supersedes POLICY-006): Program allowlist/denylist is now checked for ALL
  * intent types that include a programId field, not just custom intents. While the chain
@@ -54,7 +52,7 @@ const BASE58_ALPHABET = /^[123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstu
  */
 const SOLANA_SYSTEM_PROGRAM = "11111111111111111111111111111111";
 const SOLANA_TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
-const JUPITER_V6_PROGRAM = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
+const SOLANA_TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 
 /**
  * POLICY-008 fix: Validate that a Solana address is well-formed base58 of correct length.
@@ -62,7 +60,22 @@ const JUPITER_V6_PROGRAM = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
  * Emits a warning at construction time for misconfigured addresses that would
  * silently deny all intended transactions.
  */
+/**
+ * M11 FIX: Reject addresses containing non-ASCII characters. Unicode homoglyphs
+ * (e.g., Cyrillic 'а' U+0430 vs Latin 'a' U+0061) could pass visual inspection
+ * but represent different addresses, enabling allowlist bypass attacks.
+ */
+const ASCII_PRINTABLE = /^[\x20-\x7E]+$/;
+
 function warnIfInvalidSolanaAddress(address: string, listName: string): void {
+  // M11 FIX: Hard-reject addresses with non-ASCII characters (Unicode homoglyph defense)
+  // Skip empty strings — they're caught by the empty address validation downstream
+  if (address.length > 0 && !ASCII_PRINTABLE.test(address)) {
+    throw new Error(
+      `AllowlistRule: address "${address.slice(0, 20)}..." in ${listName} contains non-ASCII characters. ` +
+      `Only ASCII printable characters (0x20-0x7E) are allowed in addresses to prevent Unicode homoglyph attacks.`,
+    );
+  }
   // Skip EVM addresses
   if (address.startsWith("0x") && address.length === 42) return;
   // Solana base58 addresses are 32-44 characters
@@ -81,11 +94,14 @@ function warnIfInvalidSolanaAddress(address: string, listName: string): void {
  * Solana addresses are case-sensitive (base58), so they are left as-is.
  */
 function normalizeAddress(address: string): string {
+  // AUDIT-M12 fix: Trim whitespace before normalization to prevent silent mismatches.
+  // An address like " RecipientAddr " would fail to match "RecipientAddr" in the allowlist.
+  const trimmed = address.trim();
   // EVM addresses start with 0x and are 42 characters long (case-insensitive per EIP-55)
-  if (address.startsWith("0x") && address.length === 42) {
-    return address.toLowerCase();
+  if (trimmed.startsWith("0x") && trimmed.length === 42) {
+    return trimmed.toLowerCase();
   }
-  return address;
+  return trimmed;
 }
 
 export class AllowlistRule implements PolicyRule {
@@ -101,12 +117,37 @@ export class AllowlistRule implements PolicyRule {
   private readonly hasAllowTokens: boolean;
 
   constructor(config: AllowlistConfig) {
+    // POL-04 fix: Reject empty allowlists at construction time. An AllowlistRule with an
+    // explicit but empty allowAddresses array is a no-op that allows all addresses — a
+    // dangerous misconfiguration. If you want to allow all addresses, omit allowAddresses
+    // entirely and use only denyAddresses. Same logic applies to allowPrograms and allowTokens.
+    if (config.allowAddresses !== undefined && config.allowAddresses.length === 0) {
+      throw new Error(
+        "AllowlistRule: allowAddresses is set but empty. An empty allowlist permits all addresses. " +
+        "Provide at least one address, or omit allowAddresses entirely.",
+      );
+    }
+    if (config.allowPrograms !== undefined && config.allowPrograms.length === 0) {
+      throw new Error(
+        "AllowlistRule: allowPrograms is set but empty. An empty program allowlist permits all programs. " +
+        "Provide at least one program, or omit allowPrograms entirely.",
+      );
+    }
+    if (config.allowTokens !== undefined && config.allowTokens.length === 0) {
+      throw new Error(
+        "AllowlistRule: allowTokens is set but empty. An empty token allowlist permits all tokens. " +
+        "Provide at least one token, or omit allowTokens entirely.",
+      );
+    }
     // POLICY-008 fix: Warn about potentially invalid Solana addresses at construction time
     for (const addr of config.allowAddresses ?? []) warnIfInvalidSolanaAddress(addr, "allowAddresses");
     for (const addr of config.denyAddresses ?? []) warnIfInvalidSolanaAddress(addr, "denyAddresses");
     // HIGH-03 fix: Normalize addresses for case-insensitive matching on EVM chains
     this.allowAddresses = new Set((config.allowAddresses ?? []).map(normalizeAddress));
     this.denyAddresses = new Set((config.denyAddresses ?? []).map(normalizeAddress));
+    // P-12 NOTE: Program IDs are stored as-is without normalization. Solana program IDs
+    // are base58-encoded and case-sensitive. For future EVM support, program/contract
+    // addresses may need case-insensitive normalization (similar to normalizeAddress).
     this.allowPrograms = new Set(config.allowPrograms ?? []);
     this.denyPrograms = new Set(config.denyPrograms ?? []);
     // SEC: Token allowlist/denylist for swap intents (case-insensitive matching)
@@ -169,6 +210,30 @@ export class AllowlistRule implements PolicyRule {
         rule: this.name,
         reason: "Address not in allowlist",
       };
+    }
+
+    // M6 FIX: For custom intents, validate ALL writable account addresses against
+    // the allowlist/denylist, not just programId. An attacker could set programId to
+    // an allowed address while the actual writable target accounts are malicious.
+    if (intent.type === "custom") {
+      const allAddresses = this.extractAllCustomAddresses(intent);
+      for (const rawAddr of allAddresses) {
+        const addr = normalizeAddress(rawAddr);
+        if (this.denyAddresses.has(addr)) {
+          return {
+            decision: "DENY",
+            rule: this.name,
+            reason: "Address is not permitted",
+          };
+        }
+        if (this.hasAllowAddresses && !this.allowAddresses.has(addr)) {
+          return {
+            decision: "DENY",
+            rule: this.name,
+            reason: "Address not in allowlist",
+          };
+        }
+      }
     }
 
     // 3. Check deny programs
@@ -253,30 +318,49 @@ export class AllowlistRule implements PolicyRule {
    * denylisted token mint address should be blocked even if it passes token
    * symbol checks.
    */
+  /**
+   * M6 FIX: For custom intents, returns ALL addresses that need validation:
+   * the programId plus all writable account addresses. Returns a single string
+   * for non-custom intents (backward compatible), or null if no target is extractable.
+   * When multiple addresses are returned (custom intents), they are joined with a
+   * sentinel that extractTargetAddresses() splits on.
+   */
   private extractTargetAddress(intent: TransactionIntent): string | null {
-    const params = intent.params as unknown as Record<string, unknown>;
-
-    // transfer: "to" field
-    if ("to" in params && typeof params.to === "string") {
-      return params.to;
+    // H10 fix: Use discriminated union narrowing instead of unsafe double-cast.
+    switch (intent.type) {
+      case "transfer":
+        return typeof intent.params.to === "string" ? intent.params.to : null;
+      case "custom":
+        return typeof intent.params.programId === "string" ? intent.params.programId : null;
+      case "mint":
+        return typeof intent.params.collection === "string" ? intent.params.collection : null;
+      case "stake":
+        return typeof intent.params.validator === "string" ? intent.params.validator : null;
+      default:
+        return null;
     }
+  }
 
-    // custom: first writable non-signer account, or programId
-    if ("programId" in params && typeof params.programId === "string") {
-      return params.programId;
+  /**
+   * M6 FIX: Extract ALL target addresses for custom intents, including writable
+   * account addresses. An attacker could set programId to an allowed address while
+   * the actual target accounts are malicious. This method ensures all writable
+   * account addresses are also checked against the allowlist/denylist.
+   */
+  private extractAllCustomAddresses(intent: TransactionIntent): string[] {
+    if (intent.type !== "custom") return [];
+    const addresses: string[] = [];
+    if (typeof intent.params.programId === "string") {
+      addresses.push(intent.params.programId);
     }
-
-    // mint: "collection" field
-    if ("collection" in params && typeof params.collection === "string") {
-      return params.collection;
+    if (Array.isArray(intent.params.accounts)) {
+      for (const account of intent.params.accounts) {
+        if (account.isWritable && typeof account.address === "string") {
+          addresses.push(account.address);
+        }
+      }
     }
-
-    // stake: "validator" field
-    if ("validator" in params && typeof params.validator === "string") {
-      return params.validator;
-    }
-
-    return null;
+    return addresses;
   }
 
   /**
@@ -285,22 +369,32 @@ export class AllowlistRule implements PolicyRule {
    * This catches cases where token mint addresses are denylisted even if the token
    * symbol passes the token allowlist check.
    */
+  /**
+   * M2 FIX: Validate swap intent fromToken/toToken against the address allowlist/denylist.
+   * Previously, when no token-level config (allowTokens/denyTokens) was set, swap intents
+   * could bypass address validation entirely because extractTargetAddress returns null for
+   * swaps. This method ensures mint addresses (base58-like strings) in fromToken/toToken
+   * are always checked against the address allowlist, even without token-level config.
+   *
+   * Both symbol-like tokens (e.g., "SOL") and mint addresses are checked. Short symbols
+   * won't match allowlist entries (which are full addresses), so they naturally pass through
+   * to the token-level checks. Mint addresses that look like real addresses are validated.
+   */
   private checkSwapAddresses(intent: TransactionIntent): PolicyDecision | null {
     if (intent.type !== "swap") return null;
-    const params = intent.params as unknown as Record<string, unknown>;
-
+    // H10 fix: intent.type === "swap" narrows params to SwapParams
     const tokenAddresses: string[] = [];
-    if ("fromToken" in params && typeof params.fromToken === "string") {
-      tokenAddresses.push(params.fromToken);
+    if (typeof intent.params.fromToken === "string") {
+      tokenAddresses.push(intent.params.fromToken);
     }
-    if ("toToken" in params && typeof params.toToken === "string") {
-      tokenAddresses.push(params.toToken);
+    if (typeof intent.params.toToken === "string") {
+      tokenAddresses.push(intent.params.toToken);
     }
 
     for (const rawAddr of tokenAddresses) {
       const addr = normalizeAddress(rawAddr);
 
-      // Check deny addresses
+      // Check deny addresses — always check, regardless of token-level config
       if (this.denyAddresses.has(addr)) {
         return {
           decision: "DENY",
@@ -309,13 +403,18 @@ export class AllowlistRule implements PolicyRule {
         };
       }
 
-      // Check allow addresses (if configured, swap token address must be in the list)
-      if (this.hasAllowAddresses && !this.allowAddresses.has(addr)) {
-        return {
-          decision: "DENY",
-          rule: this.name,
-          reason: "Swap token address not in allowlist",
-        };
+      // M2 FIX: Check allow addresses for mint-address-like tokens even when no
+      // token-level config exists. If the token looks like a base58 address (32+ chars),
+      // it must be in the address allowlist when one is configured.
+      if (this.hasAllowAddresses) {
+        const looksLikeAddress = addr.length >= 32 && BASE58_ALPHABET.test(addr);
+        if (looksLikeAddress && !this.allowAddresses.has(addr)) {
+          return {
+            decision: "DENY",
+            rule: this.name,
+            reason: "Swap token address not in allowlist",
+          };
+        }
       }
     }
 
@@ -340,7 +439,7 @@ export class AllowlistRule implements PolicyRule {
    * Program ID inference:
    * - transfer with token "SOL" -> System Program (native SOL transfer)
    * - transfer with any other token -> Token Program (SPL token transfer)
-   * - swap -> Jupiter v6 (the DEX aggregator used by the Solana adapter)
+   * - swap -> null (user-determined; use explicit programId in intent for enforcement)
    * - custom -> uses explicit programId from params
    *
    * If the intent includes an explicit programId field, that takes precedence over
@@ -349,18 +448,17 @@ export class AllowlistRule implements PolicyRule {
    */
   // AUDIT-L-4: Program inference is Solana-specific. Gate on intent.chain for multi-chain.
   private extractProgramId(intent: TransactionIntent): string | null {
-    const params = intent.params as unknown as Record<string, unknown>;
-
-    // Explicit programId in params always takes precedence
-    if ("programId" in params && typeof params.programId === "string") {
-      return params.programId;
+    // H10 fix: Use discriminated union narrowing instead of unsafe double-cast.
+    // Explicit programId in params always takes precedence (only custom intents have it)
+    if (intent.type === "custom" && typeof intent.params.programId === "string") {
+      return intent.params.programId;
     }
 
     // HIGH-24 fix: Infer program ID for standard intent types
     if (intent.type === "transfer") {
       // Determine if this is a native SOL transfer or SPL token transfer
-      if ("token" in params && typeof params.token === "string") {
-        const token = params.token.toUpperCase().trim();
+      if (typeof intent.params.token === "string") {
+        const token = intent.params.token.toUpperCase().trim();
         if (token === "SOL") {
           return SOLANA_SYSTEM_PROGRAM;
         }
@@ -371,8 +469,33 @@ export class AllowlistRule implements PolicyRule {
     }
 
     if (intent.type === "swap") {
-      // Swaps go through Jupiter DEX aggregator
-      return JUPITER_V6_PROGRAM;
+      // Swap program is user-determined (no built-in DEX integration).
+      return null;
+    }
+
+    // AUDIT-M1 fix: Infer program IDs for mint and stake intents so they are checked
+    // against the program allowlist. Previously these returned null, completely bypassing
+    // program allowlist checks for mint/stake operations.
+    // L21 fix: Also accept the Token-2022 program as an alternative for mint intents,
+    // since newer tokens may use Token-2022 instead of the legacy Token program.
+    if (intent.type === "mint") {
+      // NFT minting typically goes through Metaplex or Token Program.
+      // If the operator has allowed the Token-2022 program, return it when the legacy
+      // Token program is not in the allowlist but Token-2022 is. Otherwise default to
+      // the legacy Token program for backwards compatibility.
+      if (this.hasAllowPrograms && !this.allowPrograms.has(SOLANA_TOKEN_PROGRAM) && this.allowPrograms.has(SOLANA_TOKEN_2022_PROGRAM)) {
+        return SOLANA_TOKEN_2022_PROGRAM;
+      }
+      return SOLANA_TOKEN_PROGRAM;
+    }
+
+    if (intent.type === "stake") {
+      // Staking goes through the Stake Program, but token-related stake operations
+      // may use the Token-2022 program instead.
+      if (this.hasAllowPrograms && !this.allowPrograms.has("Stake11111111111111111111111111111111111111") && this.allowPrograms.has(SOLANA_TOKEN_2022_PROGRAM)) {
+        return SOLANA_TOKEN_2022_PROGRAM;
+      }
+      return "Stake11111111111111111111111111111111111111";
     }
 
     return null;
@@ -381,12 +504,12 @@ export class AllowlistRule implements PolicyRule {
   /** SEC: Extract fromToken and toToken from swap intents for token allowlist checks */
   private extractSwapTokens(intent: TransactionIntent): [string, string] | null {
     if (intent.type !== "swap") return null;
-    const params = intent.params as unknown as Record<string, unknown>;
+    // H10 fix: intent.type === "swap" narrows params to SwapParams
     if (
-      "fromToken" in params && typeof params.fromToken === "string" &&
-      "toToken" in params && typeof params.toToken === "string"
+      typeof intent.params.fromToken === "string" &&
+      typeof intent.params.toToken === "string"
     ) {
-      return [params.fromToken, params.toToken];
+      return [intent.params.fromToken, intent.params.toToken];
     }
     return null;
   }

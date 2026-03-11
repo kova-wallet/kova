@@ -86,7 +86,9 @@ describe("SqliteStore", () => {
     });
 
     it("should preserve TTL on increment of key with TTL", async () => {
-      await store.set("counter", "5", 10);
+      // ST-01 fix: set() does not create an HMAC, so increment sees missing HMAC
+      // and resets to 0 + amount. Use increment() to seed the value with a valid HMAC.
+      await store.increment("counter", 5);
       const result = await store.increment("counter", 3);
       expect(result).toBe(8);
       expect(await store.get("counter")).toBe("8");

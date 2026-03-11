@@ -191,6 +191,15 @@ export class PolicyBuilder {
       }
     }
 
+    // P-13 fix: Validate keyPrefix values to prevent injection of store key delimiters
+    // or other unexpected characters that could cause cross-wallet counter collisions.
+    if (config.spendingLimit?.keyPrefix && !/^[a-zA-Z0-9_\-:]+$/.test(config.spendingLimit.keyPrefix)) {
+      throw new Error('Invalid spending limit keyPrefix');
+    }
+    if (config.rateLimit?.keyPrefix && !/^[a-zA-Z0-9_\-:]+$/.test(config.rateLimit.keyPrefix)) {
+      throw new Error('Invalid rate limit keyPrefix');
+    }
+
     if (config.spendingLimit) {
       PolicyBuilder.validateSpendingLimit(config.spendingLimit);
     }
@@ -208,7 +217,37 @@ export class PolicyBuilder {
     }
 
     if (config.cooldown) {
-      PolicyBuilder.validateCooldown(config.cooldown);
+      // LOW-19 FIX: Reject cooldown config since no CooldownRule implementation exists.
+      // Previously this emitted a warning, but a config that silently does nothing is
+      // dangerous — operators may believe they have cooldown protection when they don't.
+      throw new Error(
+        "PolicyBuilder: 'cooldown' is configured but no CooldownRule implementation exists. " +
+        "This setting would have no effect. Remove the cooldown config, or implement a " +
+        "custom CooldownRule and add it to your PolicyEngine directly.",
+      );
+    }
+
+    // M4 fix: Warn if the policy has only deny rules but no positive/constraining rules.
+    // A deny-only policy allows everything not explicitly denied, which is likely
+    // overly permissive. Positive rules include spending limits, rate limits,
+    // time windows, approval gates, and allowlists — these constrain what is allowed.
+    const hasDenyRule =
+      (config.denyAddresses !== undefined && config.denyAddresses.length > 0) ||
+      (config.denyPrograms !== undefined && config.denyPrograms.length > 0);
+    const hasPositiveRule =
+      config.spendingLimit !== undefined ||
+      config.rateLimit !== undefined ||
+      config.activeHours !== undefined ||
+      config.approvalGate !== undefined ||
+      (config.allowAddresses !== undefined && config.allowAddresses.length > 0) ||
+      (config.allowPrograms !== undefined && config.allowPrograms.length > 0);
+    if (hasDenyRule && !hasPositiveRule) {
+      process.emitWarning(
+        `Policy "${config.name}" has deny rules but no positive rules (spending limit, rate limit, ` +
+        `time window, approval gate, or allowlist). This policy allows all transactions that are ` +
+        `not explicitly denied, which may be overly permissive.`,
+        { code: "KOVA_POLICY_DENY_ONLY_WARNING" },
+      );
     }
 
     // Validate no overlap between allow and deny lists.
@@ -304,6 +343,13 @@ export class PolicyBuilder {
       if (!window.days || window.days.length === 0) {
         throw new Error("Active hours window must specify at least one day");
       }
+      // LOW-17 fix: Validate day strings at runtime to catch typos like "monday" or "Mo"
+      const VALID_DAYS = new Set(["mon", "tue", "wed", "thu", "fri", "sat", "sun"]);
+      for (const day of window.days) {
+        if (!VALID_DAYS.has(day)) {
+          throw new Error(`Invalid day "${day}" in time window. Must be one of: mon, tue, wed, thu, fri, sat, sun`);
+        }
+      }
       const timeRegex = /^([01]\d|2[0-3]):[0-5]\d$/;
       if (!timeRegex.test(window.start)) {
         throw new Error(`Invalid start time format: ${window.start} (expected HH:MM)`);
@@ -342,13 +388,6 @@ export class PolicyBuilder {
       (!Number.isInteger(config.maxTransactionsPerHour) || config.maxTransactionsPerHour <= 0)
     ) {
       throw new Error("Rate limit maxTransactionsPerHour must be a positive integer");
-    }
-  }
-
-  private static validateCooldown(config: CooldownConfig): void {
-    PolicyBuilder.validateTokenAmount(config.afterTransactionAbove, "Cooldown threshold");
-    if (config.waitMinutes <= 0) {
-      throw new Error("Cooldown waitMinutes must be positive");
     }
   }
 }

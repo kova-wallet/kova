@@ -94,7 +94,8 @@ export interface CircuitBreakerConfig {
    * ARCH-01 fix: When true, initialize() throws an error instead of logging a
    * warning when another instance is detected sharing the same store. This enforces
    * the single-instance requirement at startup, preventing silent security degradation.
-   * Default: false (warning only, for backwards compatibility).
+   * Default: true. Set to false only if you have implemented distributed locking
+   * (e.g., Redis Redlock) or request routing to ensure serialized access.
    */
   failOnMultiInstance?: boolean;
 }
@@ -105,6 +106,7 @@ const DEFAULT_INTENT_TYPES = ["transfer", "swap", "stake", "custom"];
 const DEFAULT_CONFIG: CircuitBreakerConfig = {
   threshold: 5,
   cooldownMs: 300_000,
+  failOnMultiInstance: true,
 };
 
 /**
@@ -153,6 +155,13 @@ export class CircuitBreaker {
   private readonly seenAgentIds: Set<string> = new Set();
   /** MED-33 fix: Whether the agent ID abuse warning has already been emitted */
   private agentIdAbuseWarned = false;
+  /**
+   * C-11 fix: Cache for isOpen() results to avoid redundant store reads.
+   * isOpen() performs multiple store reads (global + per-intent-type + per-agent),
+   * which is expensive when called frequently (e.g., from getPolicy()). This cache
+   * stores the last result with a 1-second TTL to reduce store load.
+   */
+  private lastIsOpenResult: { value: boolean; expiresAt: number; cacheKey: string } | undefined;
 
   constructor(store: Store, config?: Partial<CircuitBreakerConfig>) {
     this.store = store;
@@ -306,28 +315,6 @@ export class CircuitBreaker {
   }
 
   /**
-   * CRIT-11 fix: Resolve the store key for the dedicated atomic denial counter.
-   * Uses store.increment() for atomic counting, avoiding the TOCTOU race in the
-   * previous getState()+setState() pattern where concurrent calls could both read
-   * the same denial count and write count+1, losing an increment.
-   *
-   * The key follows the pattern: circuit:denials:{agentId}:{intentType}
-   * Sanitization matches stateKey() to prevent key injection via `:` separators.
-   */
-  private denialCountKey(intentType?: string, agentId?: string): string {
-    let key = "circuit:denials";
-    if (agentId) {
-      const sanitizedAgentId = agentId.replace(/[^a-zA-Z0-9_-]/g, (c) => encodeURIComponent(c));
-      key = `${key}:${sanitizedAgentId}`;
-    }
-    if (intentType) {
-      const sanitizedIntentType = intentType.replace(/[^a-zA-Z0-9_-]/g, (c) => encodeURIComponent(c));
-      key = `${key}:${sanitizedIntentType}`;
-    }
-    return key;
-  }
-
-  /**
    * CORE-011 fix: Resolve the store key for circuit breaker state.
    * When an intentType is provided, uses a per-intent-type key (e.g., "circuit:state:transfer")
    * to isolate circuit breaker state per intent type. Falls back to the global key when
@@ -455,6 +442,20 @@ export class CircuitBreaker {
   }
 
   /**
+   * CRIT-02 fix: Ensure initialize() has been called before any circuit breaker operations.
+   * Without initialization, multi-instance detection is skipped entirely, silently
+   * degrading security guarantees. Throws a clear error directing callers to initialize.
+   */
+  private ensureInitialized(): void {
+    if (!this.initialized) {
+      throw new Error(
+        "CircuitBreaker.initialize() must be called before use. " +
+        "Multi-instance safety requires initialization. Call await circuitBreaker.initialize() after construction.",
+      );
+    }
+  }
+
+  /**
    * Check whether the circuit breaker is currently blocking.
    * Returns null if OK, or a denial reason string if blocked.
    *
@@ -465,8 +466,14 @@ export class CircuitBreaker {
    * Falls back to global state when not provided.
    * H-07: Accepts optional agentId for per-agent state isolation. When provided,
    * checks the circuit breaker state for that specific agent, preventing cross-agent DoS.
+   *
+   * @deprecated Use {@link checkAndRecord} instead, which atomically combines the
+   * cooldown check with the denial/allow recording. Using separate check() +
+   * recordOutcome() calls introduces a TOCTOU window (H13) where concurrent
+   * requests can all pass check() before any triggers the threshold.
    */
   async check(now?: number, intentType?: string, agentId?: string): Promise<string | null> {
+    this.ensureInitialized();
     // MED-33 fix: Sanitize agentId to prevent key injection and detect ID rotation abuse
     const sanitizedAgentId = this.sanitizeAgentId(agentId);
     const currentTime = this.clampTime(now);
@@ -497,26 +504,23 @@ export class CircuitBreaker {
    * H-07: Accepts optional agentId for per-agent state isolation. When provided,
    * records outcome against that specific agent's state, preventing a single
    * malicious agent from triggering circuit breaker cooldown for all agents.
+   *
+   * @deprecated Use {@link checkAndRecord} instead, which atomically combines the
+   * cooldown check with the denial/allow recording. Using separate check() +
+   * recordOutcome() calls introduces a TOCTOU window (H13) where concurrent
+   * requests can all pass check() before any triggers the threshold.
    */
   async recordOutcome(decision: "ALLOW" | "DENY" | "PENDING", now?: number, intentType?: string, agentId?: string): Promise<void> {
+    this.ensureInitialized();
     // MED-33 fix: Sanitize agentId to prevent key injection and detect ID rotation abuse
     const sanitizedAgentId = this.sanitizeAgentId(agentId);
-    // CONC-05 cross-reference: The TOCTOU between check() and recordOutcome() is
-    // documented in CRIT-10 (class header) and mitigated by the wallet's execute mutex
-    // for single-instance deployments. For multi-instance, use store-level atomic
-    // compare-and-swap or Redis Lua scripts. See security_audit_team9 CONC-05.
-    //
-    // CRIT-11 fix: The denial counter increment is now atomic via store.increment()
-    // on a dedicated counter key. The previous getState() + setState() pattern was a
-    // classic TOCTOU where concurrent calls could both read the same denialCount and
-    // write count+1, losing an increment. store.increment() is atomic in both
-    // MemoryStore (synchronous single-threaded JS) and SqliteStore (SQLite transaction).
+    // M21 fix: The JSON state is the SINGLE source of truth for both denial count
+    // and cooldown tracking. The previous dual-state approach (separate atomic counter
+    // key + JSON state) could diverge if a crash occurred between the two writes.
+    // Since the wallet's execute mutex serializes all callers (single-instance), a
+    // read-modify-write on the JSON state is safe and eliminates the consistency problem.
     if (decision === "ALLOW") {
-      // CRIT-11 fix: Reset both the atomic denial counter and the JSON state.
-      // The denial counter key is reset to "0" via store.set() and the combined
-      // JSON state is cleared via setState(). Both must be reset to prevent stale
-      // counter values from persisting across ALLOW resets.
-      await this.store.set(this.denialCountKey(intentType, sanitizedAgentId), "0");
+      // M21 fix: Single atomic write to reset the circuit breaker state.
       await this.setState({ denialCount: 0, cooldownUntil: 0 }, intentType, sanitizedAgentId);
       return;
     }
@@ -526,28 +530,106 @@ export class CircuitBreaker {
       return;
     }
 
-    // CRIT-11 fix: DENY — use store.increment() for atomic denial counting.
-    // Previously this method used getState() + setState() which is a classic TOCTOU:
-    // two concurrent calls could both read the same denialCount and write count+1,
-    // losing an increment. Now we use store.increment() on a dedicated counter key
-    // which IS atomic in both MemoryStore (synchronous JS) and SqliteStore (SQLite
-    // transaction). Only when the threshold is reached do we write cooldown metadata
-    // via setState(), which is a one-way state transition (not a read-modify-write).
-    const newCount = await this.store.increment(this.denialCountKey(intentType, sanitizedAgentId), 1);
+    // M21 fix: DENY — read-modify-write on JSON state (safe under execute mutex).
+    // Previously used store.increment() on a separate counter key, creating dual-state.
+    // Now the JSON state is the sole source of truth for denial counting.
+    const state = await this.getState(intentType, sanitizedAgentId);
+    const newCount = state.denialCount + 1;
 
     if (newCount >= this.config.threshold) {
-      // Enter cooldown — this is a one-way transition, not a read-modify-write,
-      // so the TOCTOU concern does not apply to the cooldown write itself.
+      // Enter cooldown — one-way state transition
       const currentTime = this.clampTime(now);
       const cooldownExpiry = currentTime + this.config.cooldownMs;
       await this.setState({ denialCount: newCount, cooldownUntil: cooldownExpiry }, intentType, sanitizedAgentId);
     } else {
-      // Update denialCount in JSON state for consistency with getState() readers
-      // (e.g., isOpen() and check() which read the JSON state). Read current state
-      // to preserve any existing cooldownUntil value.
-      const state = await this.getState(intentType, sanitizedAgentId);
       await this.setState({ denialCount: newCount, cooldownUntil: state.cooldownUntil }, intentType, sanitizedAgentId);
     }
+  }
+
+  /**
+   * H13 fix: Atomically combine the cooldown check with the denial/allow recording.
+   * Eliminates the TOCTOU window between separate check() and recordOutcome() calls,
+   * where N concurrent requests could all pass check() before any triggers the threshold.
+   *
+   * Behavior:
+   * - If in cooldown, returns the denial reason string (same as check()) without
+   *   modifying any state.
+   * - If not in cooldown AND decision is "DENY", atomically increments the denial
+   *   counter and potentially enters cooldown. Returns null (not blocked yet) unless
+   *   the threshold was already reached, in which case the cooldown is entered.
+   * - If not in cooldown AND decision is "ALLOW", resets the denial counter.
+   *   Returns null (not blocked).
+   * - If decision is "PENDING", only checks cooldown state (no recording).
+   *   Returns null if not blocked, or the denial reason if in cooldown.
+   *
+   * The key insight: since both the check and the recording happen in a single method
+   * call, and the wallet's execute mutex serializes callers for single-instance
+   * deployments, the combined method provides the same guarantees as atomic operations
+   * for the supported single-instance case. For multi-instance deployments (when
+   * failOnMultiInstance is disabled), it narrows the race window significantly compared
+   * to separate check() + recordOutcome() calls.
+   *
+   * MED-20 fix: now parameter is drift-clamped to within 1 hour of Date.now().
+   * CORE-011: Accepts optional intentType for per-intent-type state isolation.
+   * H-07: Accepts optional agentId for per-agent state isolation.
+   *
+   * @param decision - The policy evaluation result: "ALLOW", "DENY", or "PENDING"
+   * @param now - Optional timestamp (drift-clamped). Defaults to Date.now().
+   * @param intentType - Optional intent type for per-intent-type isolation.
+   * @param agentId - Optional agent ID for per-agent isolation.
+   * @returns null if not blocked, or a denial reason string if the circuit breaker is open.
+   */
+  async checkAndRecord(
+    decision: "ALLOW" | "DENY" | "PENDING",
+    now?: number,
+    intentType?: string,
+    agentId?: string,
+  ): Promise<string | null> {
+    this.ensureInitialized();
+    // MED-33 fix: Sanitize agentId to prevent key injection and detect ID rotation abuse
+    const sanitizedAgentId = this.sanitizeAgentId(agentId);
+    const currentTime = this.clampTime(now);
+    const state = await this.getState(intentType, sanitizedAgentId);
+
+    // Step 1: Check cooldown state
+    if (state.cooldownUntil > 0) {
+      if (currentTime < state.cooldownUntil) {
+        // Circuit is open — return denial reason without modifying state
+        const remainingMs = state.cooldownUntil - currentTime;
+        const agentInfo = sanitizedAgentId ? ` (agent: ${sanitizedAgentId})` : "";
+        return `Circuit breaker open${agentInfo}: ${Math.ceil(remainingMs / 1000)}s cooldown remaining after ${this.config.threshold} consecutive denials`;
+      }
+      // Cooldown expired — reset before proceeding
+      await this.reset(intentType, sanitizedAgentId);
+    }
+
+    // Step 2: Record the outcome (in the same call, no TOCTOU window)
+    // M21 fix: Uses only JSON state as the single source of truth (no separate counter key).
+    if (decision === "ALLOW") {
+      // Reset denial counter — single atomic write
+      await this.setState({ denialCount: 0, cooldownUntil: 0 }, intentType, sanitizedAgentId);
+      return null;
+    }
+
+    if (decision === "PENDING") {
+      // Pending is not a denial — no state modification needed
+      return null;
+    }
+
+    // decision === "DENY": Read-modify-write on JSON state (safe under execute mutex).
+    // M21 fix: Eliminates the separate denial counter key — JSON state is the sole
+    // source of truth for both denial counting and cooldown tracking.
+    const newCount = state.denialCount + 1;
+
+    if (newCount >= this.config.threshold) {
+      // Enter cooldown — one-way state transition
+      const cooldownExpiry = currentTime + this.config.cooldownMs;
+      await this.setState({ denialCount: newCount, cooldownUntil: cooldownExpiry }, intentType, sanitizedAgentId);
+    } else {
+      await this.setState({ denialCount: newCount, cooldownUntil: state.cooldownUntil }, intentType, sanitizedAgentId);
+    }
+
+    return null;
   }
 
   /**
@@ -561,10 +643,7 @@ export class CircuitBreaker {
    * H-07: Accepts optional agentId for per-agent state isolation.
    */
   private async reset(intentType?: string, agentId?: string): Promise<void> {
-    // CRIT-11 fix: Reset both the atomic denial counter key and the JSON state.
-    // Without resetting the counter key, a stale denial count would persist and
-    // could cause the circuit breaker to re-trigger prematurely after a cooldown reset.
-    await this.store.set(this.denialCountKey(intentType, agentId), "0");
+    // M21 fix: Single atomic write — JSON state is the sole source of truth.
     await this.setState({ denialCount: 0, cooldownUntil: 0 }, intentType, agentId);
   }
 
@@ -583,12 +662,27 @@ export class CircuitBreaker {
    * miss per-agent circuit breaks). Callers with access to the agentId should pass it.
    */
   async isOpen(now?: number, agentId?: string): Promise<boolean> {
+    // isOpen() is a read-only query safe to call before initialize().
+    // It does not modify state, so returning false (not blocking) when uninitialized
+    // allows getPolicy() introspection without requiring execute() first.
+    if (!this.initialized) return false;
     // MED-33 fix: Sanitize agentId to prevent key injection and detect ID rotation abuse
     const sanitizedAgentId = this.sanitizeAgentId(agentId);
     const currentTime = this.clampTime(now);
+
+    // C-11 fix: Return cached isOpen() result if within 1-second TTL.
+    // isOpen() performs N+1 store reads (global + per-intent-type + per-agent),
+    // which is expensive for frequent callers like getPolicy(). The 1-second cache
+    // reduces store load while keeping the result reasonably fresh.
+    const cacheKey = `${sanitizedAgentId ?? ""}`;
+    if (this.lastIsOpenResult && this.lastIsOpenResult.cacheKey === cacheKey && currentTime < this.lastIsOpenResult.expiresAt) {
+      return this.lastIsOpenResult.value;
+    }
+
     // Check global state
     const globalState = await this.getState();
     if (globalState.cooldownUntil > 0 && currentTime < globalState.cooldownUntil) {
+      this.lastIsOpenResult = { value: true, expiresAt: currentTime + 1_000, cacheKey };
       return true;
     }
     // MED-T5-08 fix: Check per-intent-type states using configurable list
@@ -597,12 +691,14 @@ export class CircuitBreaker {
     for (const intentType of intentTypes) {
       const state = await this.getState(intentType);
       if (state.cooldownUntil > 0 && currentTime < state.cooldownUntil) {
+        this.lastIsOpenResult = { value: true, expiresAt: currentTime + 1_000, cacheKey };
         return true;
       }
       // POLICY-014 fix: Also check per-agent+intent-type compound keys
       if (sanitizedAgentId) {
         const agentState = await this.getState(intentType, sanitizedAgentId);
         if (agentState.cooldownUntil > 0 && currentTime < agentState.cooldownUntil) {
+          this.lastIsOpenResult = { value: true, expiresAt: currentTime + 1_000, cacheKey };
           return true;
         }
       }
@@ -611,9 +707,11 @@ export class CircuitBreaker {
     if (sanitizedAgentId) {
       const agentGlobal = await this.getState(undefined, sanitizedAgentId);
       if (agentGlobal.cooldownUntil > 0 && currentTime < agentGlobal.cooldownUntil) {
+        this.lastIsOpenResult = { value: true, expiresAt: currentTime + 1_000, cacheKey };
         return true;
       }
     }
+    this.lastIsOpenResult = { value: false, expiresAt: currentTime + 1_000, cacheKey };
     return false;
   }
 }

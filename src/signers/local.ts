@@ -33,7 +33,7 @@
  */
 
 import { Keypair, Transaction, VersionedTransaction } from "@solana/web3.js";
-import { createPublicKey } from "crypto";
+import { createPublicKey, timingSafeEqual, randomFillSync } from "crypto";
 import { ed25519 } from "@noble/curves/ed25519";
 import type { Signer, UnsignedTransaction, SignedTransaction } from "./interface.js";
 
@@ -68,11 +68,20 @@ export interface LocalSignerConfig {
    * For production deployments, use MpcSigner with a hardware-backed provider.
    */
   dangerouslyAllowInProduction?: boolean;
+
+  /**
+   * KEY-04 fix: Network identifier for automatic environment gating.
+   * When set to "devnet" or "testnet", the production guard is automatically
+   * bypassed without requiring dangerouslyAllowInProduction. This prevents
+   * examples and dev setups from unconditionally setting the dangerous flag.
+   * When set to "mainnet-beta" or omitted, the full production guard applies.
+   */
+  network?: "mainnet-beta" | "devnet" | "testnet";
 }
 
 export class LocalSigner implements Signer {
   /** HIGH-01 fix: Nullable so we can fully release the reference on destroy(). */
-  private keypair: Keypair | null;
+  #keypair: Keypair | null = null;
   private destroyed = false;
 
   constructor(keypair: Keypair, config?: LocalSignerConfig) {
@@ -94,11 +103,16 @@ export class LocalSigner implements Signer {
         "SecurityWarning",
       );
     }
-    if (typeof process !== "undefined" && !allowedByEnv) {
+    // KEY-04 fix: Auto-allow on devnet/testnet without requiring the dangerous flag.
+    // This prevents documentation and examples from normalizing dangerouslyAllowInProduction: true
+    // by providing a safer alternative for non-mainnet environments.
+    const isNonMainnet = config?.network === "devnet" || config?.network === "testnet";
+    if (typeof process !== "undefined" && !allowedByEnv && !isNonMainnet) {
       if (!config?.dangerouslyAllowInProduction) {
         throw new Error(
           "LocalSigner is not safe for production use (private key in plaintext memory). " +
           "Use MpcSigner with a hardware-backed provider instead, or pass " +
+          "{ network: \"devnet\" } for devnet/testnet use, or " +
           "{ dangerouslyAllowInProduction: true } to override.",
         );
       }
@@ -119,7 +133,7 @@ export class LocalSigner implements Signer {
       );
     }
     // Check for all-zero secret key (indicates uninitialized or wiped key material)
-    if (keypair.secretKey.every((b) => b === 0)) {
+    if (timingSafeEqual(Buffer.from(keypair.secretKey), Buffer.alloc(64))) {
       throw new Error("LocalSigner: key material has been securely disposed or is invalid");
     }
     // HIGH-01 fix: Clone the keypair so external callers cannot mutate our copy.
@@ -136,12 +150,12 @@ export class LocalSigner implements Signer {
     // cannot mutate our internal keypair. Note: Keypair.fromSecretKey does NOT deep-copy
     // the input — it stores the same underlying bytes. We must NOT zero the buffer
     // we pass in (CRYPTO-004 was zeroing it, which corrupted the keypair's secret key).
-    this.keypair = Keypair.fromSecretKey(new Uint8Array(keypair.secretKey));
+    this.#keypair = Keypair.fromSecretKey(new Uint8Array(keypair.secretKey));
 
     // CRYPTO-010 fix: Verify that the reconstructed keypair has the same public key.
     // Detects corruption in the clone/reconstruction process.
-    if (this.keypair.publicKey.toBase58() !== keypair.publicKey.toBase58()) {
-      this.keypair = null;
+    if (this.#keypair.publicKey.toBase58() !== keypair.publicKey.toBase58()) {
+      this.#keypair = null;
       this.destroyed = true;
       throw new Error("LocalSigner: reconstructed keypair has different public key (possible corruption)");
     }
@@ -157,12 +171,18 @@ export class LocalSigner implements Signer {
    */
   async destroy(): Promise<void> {
     if (!this.destroyed) {
-      // Zero out the secret key bytes
-      if (this.keypair) {
-        this.keypair.secretKey.fill(0);
+      // ARCH-14 fix: Multi-pass key erasure to reduce V8 GC exposure window.
+      // Pass 1: Overwrite with random data to make key material indistinguishable
+      // from random memory, even if V8 GC copied the original buffer.
+      // Pass 2: Zero-fill as a final wipe for defense-in-depth.
+      // Note: This cannot guarantee erasure of V8-internal copies (see class docs),
+      // but minimizes the window and makes forensic recovery harder.
+      if (this.#keypair) {
+        randomFillSync(this.#keypair.secretKey);
+        this.#keypair.secretKey.fill(0);
       }
       // HIGH-01 fix: Null out the keypair reference so no one can access the object.
-      this.keypair = null;
+      this.#keypair = null;
       this.destroyed = true;
     }
   }
@@ -172,10 +192,10 @@ export class LocalSigner implements Signer {
    * Returns only the public address, never the secret key.
    */
   toJSON(): Record<string, unknown> {
-    if (this.destroyed || !this.keypair) {
+    if (this.destroyed || !this.#keypair) {
       return { address: null, destroyed: true };
     }
-    return { address: this.keypair.publicKey.toBase58() };
+    return { address: this.#keypair.publicKey.toBase58() };
   }
 
   /**
@@ -183,9 +203,19 @@ export class LocalSigner implements Signer {
    * Without this, Node.js default inspection would display all object properties
    * including the keypair's secret key bytes.
    */
+  /**
+   * M76 fix: Prevent accidental key leakage via string coercion or template literals.
+   * Without this override, Object.prototype.toString would return "[object Object]"
+   * which is benign, but explicit toString() prevents any future prototype pollution
+   * from exposing internal state.
+   */
+  toString(): string {
+    return "[LocalSigner]";
+  }
+
   [Symbol.for("nodejs.util.inspect.custom")](): { address: string | null; destroyed: boolean } {
     return {
-      address: this.keypair ? this.keypair.publicKey.toBase58() : null,
+      address: this.#keypair ? this.#keypair.publicKey.toBase58() : null,
       destroyed: this.destroyed,
     };
   }
@@ -193,15 +223,15 @@ export class LocalSigner implements Signer {
   /** Get the wallet's public address (base58-encoded Solana public key). */
   async getAddress(): Promise<string> {
     // LOW-01 fix: Destroyed signers must not expose any address.
-    if (this.destroyed || !this.keypair) {
+    if (this.destroyed || !this.#keypair) {
       throw new Error("LocalSigner has been destroyed");
     }
-    return this.keypair.publicKey.toBase58();
+    return this.#keypair.publicKey.toBase58();
   }
 
   /** Sign a transaction using the local keypair. Supports both legacy and versioned Solana transactions. */
   async sign(transaction: UnsignedTransaction): Promise<SignedTransaction> {
-    if (this.destroyed || !this.keypair) {
+    if (this.destroyed || !this.#keypair) {
       throw new Error("LocalSigner has been destroyed and can no longer sign transactions");
     }
     if (transaction.chain !== "solana") {
@@ -221,17 +251,20 @@ export class LocalSigner implements Signer {
     // so we must check the message version explicitly to route correctly.
     // Legacy Transaction.sign() and VersionedTransaction.sign() use different
     // internal flows; using the wrong path can produce verify mismatches.
+    // S-11 fix: Reuse the probe deserialization result for versioned transactions
+    // to avoid double deserialization of the same transaction data.
+    let probeTx: VersionedTransaction | null = null;
     let isVersioned = false;
     try {
-      const probe = VersionedTransaction.deserialize(txData);
-      isVersioned = probe.version !== "legacy";
+      probeTx = VersionedTransaction.deserialize(txData);
+      isVersioned = probeTx.version !== "legacy";
     } catch {
       // Deserialization failed — treat as legacy
     }
 
     if (isVersioned) {
-      const versionedTx = VersionedTransaction.deserialize(txData);
-      versionedTx.sign([this.keypair]);
+      const versionedTx = probeTx!;
+      versionedTx.sign([this.#keypair]);
       signedData = versionedTx.serialize();
       const sig = versionedTx.signatures[0];
       if (!sig || sig.length !== ED25519_SIGNATURE_LENGTH) {
@@ -242,7 +275,7 @@ export class LocalSigner implements Signer {
       messageBytes = versionedTx.message.serialize();
     } else {
       const legacyTx = Transaction.from(txData);
-      legacyTx.sign(this.keypair);
+      legacyTx.sign(this.#keypair);
       signedData = legacyTx.serialize();
       const sig = legacyTx.signature;
       if (!sig || sig.length !== ED25519_SIGNATURE_LENGTH) {
@@ -256,7 +289,7 @@ export class LocalSigner implements Signer {
     // CRIT-01 fix: Post-sign signature verification.
     // Verify the produced signature against the public key and message bytes
     // to catch signing faults, corrupted keys, or tampered transactions.
-    const pubKeyBytes = this.keypair.publicKey.toBytes();
+    const pubKeyBytes = this.#keypair.publicKey.toBytes();
     const verified = await verifyEd25519Signature(signature, messageBytes, pubKeyBytes);
     if (!verified) {
       throw new Error(
@@ -276,12 +309,13 @@ export class LocalSigner implements Signer {
    *  LOW-T1-01 fix: Performs a cryptographic self-test to detect corrupted keypairs,
    *  not just destroyed state. */
   async healthCheck(): Promise<boolean> {
-    if (this.destroyed || !this.keypair) return false;
+    if (this.destroyed || !this.#keypair) return false;
     // LOW-T1-01 fix: Cryptographic self-test — validate the public key and, when the
     // private key seed is available, perform a full sign+verify round-trip.
     try {
-      const pubKeyBytes = this.keypair.publicKey.toBytes();
-      const { ed25519 } = await import("@noble/curves/ed25519");
+      const pubKeyBytes = this.#keypair.publicKey.toBytes();
+      // S-10 fix: Use the top-level ed25519 import instead of dynamic import to avoid
+      // redundant module re-resolution on every healthCheck call.
 
       // Step 1: Verify the stored public key is a valid point on the Ed25519 curve.
       // Throws if the bytes do not represent a valid curve point (detects corruption).
@@ -293,10 +327,12 @@ export class LocalSigner implements Signer {
       // creating an additional copy of the private key seed in memory. subarray()
       // returns a view over the same underlying ArrayBuffer, so no new key material
       // is allocated. The seed reference is released when this scope exits.
-      const seed = this.keypair.secretKey.subarray(0, 32);
+      const seed = this.#keypair.secretKey.subarray(0, 32);
       const seedAvailable = !seed.every((b: number) => b === 0);
       if (seedAvailable) {
-        const testMessage = new Uint8Array(Buffer.from("kova:healthcheck:selftest"));
+        // LOW-1 fix: Add a random component (timestamp) to the healthcheck message
+        // to prevent replay attacks and ensure each self-test uses a unique message.
+        const testMessage = new Uint8Array(Buffer.from(`kova:healthcheck:selftest:${Date.now()}`));
         const signature = ed25519.sign(testMessage, seed);
         if (!ed25519.verify(signature, testMessage, pubKeyBytes)) {
           return false;
@@ -332,6 +368,11 @@ export class LocalSigner implements Signer {
    * @returns A new LocalSigner instance with the new keypair
    */
   async rotateKey(newKeypair: Keypair, config?: LocalSignerConfig): Promise<LocalSigner> {
+    // S-08 fix: The new signer is created before the old one is destroyed, intentionally
+    // keeping both keys in memory during the brief rotation window. This create-then-destroy
+    // pattern ensures availability: if the new keypair is invalid (e.g., fails validation
+    // in the constructor), the old signer remains intact and operational. The window is
+    // minimal (synchronous constructor + async destroy) and acceptable for a dev/test signer.
     const newSigner = new LocalSigner(newKeypair, config);
     await this.destroy();
     return newSigner;
@@ -351,9 +392,11 @@ function verifyEd25519Signature(
   try {
     const result = ed25519.verify(signature, message, publicKey);
     return Promise.resolve(result);
-  } catch (err) {
+  } catch {
+    // MED-7 fix: Throw a generic error to avoid wrapping underlying crypto error
+    // details that could leak implementation information to callers.
     return Promise.reject(
-      new Error(`Ed25519 verification infrastructure error: ${err instanceof Error ? err.message : String(err)}`),
+      new Error("Ed25519 signature verification failed"),
     );
   }
 }

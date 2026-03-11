@@ -287,19 +287,24 @@ The timezone parameter uses the IANA timezone database format (e.g., `"America/N
 **Use case:** An agent that can handle small payments autonomously but requires human approval for anything above a threshold. Perfect for finance teams that want automation for routine payments with oversight for large ones.
 
 ```typescript
-import { TelegramApprovalBot } from "kova";
+import { CallbackApprovalChannel } from "kova";
 
-// Create a Telegram approval bot that sends approval requests to your chat.
-// When a high-value transaction is attempted, the bot sends a message with
-// Approve/Reject buttons and waits for a human response.
-const approvalBot = new TelegramApprovalBot({
-  token: process.env.TELEGRAM_BOT_TOKEN!,   // Bot token from @BotFather
-  chatId: process.env.TELEGRAM_CHAT_ID!,     // Chat ID where approval messages are sent
-  defaultTimeout: 300000,                     // 5 minutes to respond before auto-deny
+// Create a callback-based approval channel for human-in-the-loop approval.
+// When a high-value transaction is attempted, the channel notifies a human
+// and waits for their approve/reject decision.
+const approvalBot = new CallbackApprovalChannel({
+  name: "my-approval",
+  onApprovalRequest: async (request) => {
+    await notifyApprover(request); // Send notification via your preferred channel
+  },
+  waitForDecision: async (request) => {
+    return pollForResponse(request.id); // Wait for human's response
+  },
+  defaultTimeout: 300_000,               // 5 minutes to respond before auto-deny
 });
 
 // High-value approval policy: small transactions proceed automatically,
-// but anything >= 10 SOL requires explicit human approval via Telegram.
+// but anything >= 10 SOL requires explicit human approval.
 const highValuePolicy = Policy.create("high-value-approval")
   .spendingLimit({
     perTransaction: { amount: "50.0", token: "SOL" },  // Hard cap at 50 SOL even with approval

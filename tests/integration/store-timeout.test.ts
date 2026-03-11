@@ -97,7 +97,7 @@ export class StoreWithTimeout implements Store {
   }
 
   clearList(key: string): Promise<void> {
-    return this.withTimeout("clearList", this.inner.clearList!(key));
+    return this.withTimeout("clearList", this.inner.clearList(key));
   }
 }
 

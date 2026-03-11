@@ -144,7 +144,7 @@ For most use cases, "confirmed" is sufficient. Use "finalized" when irreversibil
 
 ## SolanaAdapter
 
-The `SolanaAdapter` is the production chain adapter for Solana. It uses `@solana/web3.js` for RPC communication and the Jupiter API for token swaps and USD price lookups.
+The `SolanaAdapter` is the production chain adapter for Solana. It uses `@solana/web3.js` for RPC communication, the Jupiter API for token swaps, and a pluggable `priceProvider` for USD price lookups (e.g., [Pyth oracle](/guide/oracles)).
 
 ```typescript
 // Import the SolanaAdapter, which is the built-in ChainAdapter implementation for Solana.
@@ -159,6 +159,11 @@ Solana is a high-performance blockchain known for fast transactions (sub-second 
 ### Configuration
 
 ```typescript
+import { SolanaAdapter, createPythPriceProvider } from "@kova/wallet";
+import { Connection } from "@solana/web3.js";
+
+const connection = new Connection("https://api.devnet.solana.com");
+
 // Create a SolanaAdapter with full configuration.
 const chain = new SolanaAdapter({
   // The Solana RPC endpoint URL. This is the JSON-RPC server the adapter
@@ -170,12 +175,11 @@ const chain = new SolanaAdapter({
   // "confirmed" = supermajority voted (good default),
   // "finalized" = rooted and irreversible (safest, slowest).
   commitment: "confirmed",
-  // The Jupiter Quote API endpoint for fetching swap quotes and routes.
-  // Jupiter is the leading DEX aggregator on Solana.
-  jupiterApiUrl: "https://quote-api.jup.ag/v6",
-  // The Jupiter Price API endpoint for fetching token USD prices.
-  // Used by getValueInUSD() which the PolicyEngine relies on for spending limits.
-  jupiterPriceApiUrl: "https://price.jup.ag/v6",
+  // Price provider for USD valuation. Used by getValueInUSD() which the
+  // PolicyEngine relies on for spending limits and approval gates.
+  // The Pyth oracle reads on-chain price feeds — no external API needed.
+  // See the Price Oracles guide for more options (consensus, custom providers).
+  priceProvider: createPythPriceProvider(connection, { network: "devnet" }),
 });
 ```
 
@@ -183,8 +187,9 @@ const chain = new SolanaAdapter({
 |-------|------|----------|---------|-------------|
 | `rpcUrl` | `string` | Yes | -- | Solana RPC endpoint URL |
 | `commitment` | `"processed" \| "confirmed" \| "finalized"` | No | `"confirmed"` | Transaction confirmation level |
-| `jupiterApiUrl` | `string` | No | Jupiter default | Jupiter Quote API endpoint for swaps |
-| `jupiterPriceApiUrl` | `string` | No | Jupiter default | Jupiter Price API endpoint for USD valuation |
+| `network` | `"mainnet-beta" \| "devnet" \| "testnet" \| "auto"` | No | `"mainnet-beta"` | Network selection for token registry (avoids URL sniffing) |
+| `dnsCache` | `Map<string, { resolvedIp, family, resolvedAt }>` | No | Module-level shared cache | Per-instance DNS cache for multi-tenant isolation |
+| `priceProvider` | `(token: string) => Promise<number \| null>` | No | -- | Price oracle for USD valuation (see [Price Oracles](/guide/oracles)) |
 
 ::: tip WHAT IS COMMITMENT LEVEL?
 Commitment level controls how "sure" you want to be that a transaction has succeeded before the SDK considers it done. Think of it like mail delivery confirmation:
@@ -444,14 +449,14 @@ new SolanaAdapter({ rpcUrl: "https://169.254.169.254" });      // AWS/GCP/Azure 
 // Error: "RPC cannot target private/internal network addresses"
 ```
 
-This validation applies to `rpcUrl`, `jupiterApiUrl`, and `jupiterPriceApiUrl`.
+This validation applies to `rpcUrl`.
 
 ## Devnet vs Mainnet
 
 The `SolanaAdapter` automatically detects devnet URLs and adjusts behavior:
 
-- Token mint addresses differ between devnet and mainnet
-- Jupiter pricing may return `null` on devnet (prices are not available for devnet tokens)
+- Token mint addresses differ between devnet and mainnet — use the `network` config field for explicit selection
+- Price oracles may return `null` on devnet (Pyth devnet feeds have limited token coverage)
 - Devnet has more lenient rate limits but transactions may be less reliable
 
 ::: tip WHAT IS DEVNET VS MAINNET?
@@ -488,6 +493,7 @@ The `SolanaAdapter` rejects HTTP URLs for security -- transaction data and walle
 
 ## See Also
 
+- [Price Oracles](/guide/oracles) -- configure Pyth, consensus, or custom price providers for USD valuation
 - [Signers](/guide/signers) -- the key-management layer that signs transactions built by the chain adapter
 - [Stores](/guide/stores) -- the persistence layer for SDK safety state
 - [SpendingLimitRule](/guide/rules/spending-limit) -- spending limits that use `getValueInUSD()` from the chain adapter for price conversion

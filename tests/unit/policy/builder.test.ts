@@ -150,7 +150,6 @@ describe("Policy Builder", () => {
       .rateLimit({ maxTransactionsPerMinute: 5 })
       .activeHours({ timezone: "UTC", windows: [{ days: ["mon"], start: "09:00", end: "17:00" }] })
       .requireApproval({ above: { amount: "2", token: "SOL" } })
-      .cooldown({ afterTransactionAbove: { amount: "1", token: "SOL" }, waitMinutes: 10 })
       .build();
 
     const config = policy.getConfig();
@@ -163,7 +162,6 @@ describe("Policy Builder", () => {
     expect(config.rateLimit).toBeDefined();
     expect(config.activeHours).toBeDefined();
     expect(config.approvalGate).toBeDefined();
-    expect(config.cooldown).toBeDefined();
   });
 
   it("should extend a base policy", () => {
@@ -456,13 +454,12 @@ describe("Policy Builder", () => {
   });
 
   describe("cooldown configuration", () => {
-    it("should configure cooldown", () => {
-      const policy = Policy.create("test")
-        .cooldown({ afterTransactionAbove: { amount: "10", token: "SOL" }, waitMinutes: 30 })
-        .build();
-      const config = policy.getConfig();
-      expect(config.cooldown?.afterTransactionAbove.amount).toBe("10");
-      expect(config.cooldown?.waitMinutes).toBe(30);
+    it("should throw when cooldown is configured (no CooldownRule implementation)", () => {
+      expect(() =>
+        Policy.create("test")
+          .cooldown({ afterTransactionAbove: { amount: "10", token: "SOL" }, waitMinutes: 30 })
+          .build(),
+      ).toThrow("no CooldownRule implementation exists");
     });
   });
 
@@ -522,7 +519,6 @@ describe("Policy Builder", () => {
           windows: [{ days: ["mon", "fri"], start: "09:00", end: "17:00" }],
         })
         .requireApproval({ above: { amount: "2", token: "SOL" }, timeout: 60_000 })
-        .cooldown({ afterTransactionAbove: { amount: "5", token: "SOL" }, waitMinutes: 15 })
         .build();
 
       const json = original.toJSON();

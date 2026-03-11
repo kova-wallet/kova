@@ -9,7 +9,7 @@ import { SolanaAdapter } from "../../../src/chains/solana/adapter.js";
  * that don't require a live RPC connection.
  *
  * Methods requiring RPC (getBalance for valid addresses, buildTransaction
- * for transfers/swaps, broadcast, getTransactionStatus) are tested via:
+ * for transfers, broadcast, getTransactionStatus) are tested via:
  * - Helper module unit tests (utils.test.ts)
  * - Devnet integration tests (tests/integration/)
  */
@@ -36,18 +36,10 @@ describe("SolanaAdapter", () => {
     expect(adapter).toBeDefined();
   });
 
-  it("should accept config with Jupiter API URL", () => {
+  it("should accept config with price provider", () => {
     const adapter = new SolanaAdapter({
       ...defaultConfig,
-      jupiterApiUrl: "https://quote-api.jup.ag/v6",
-    });
-    expect(adapter).toBeDefined();
-  });
-
-  it("should accept config with Jupiter price API URL", () => {
-    const adapter = new SolanaAdapter({
-      ...defaultConfig,
-      jupiterPriceApiUrl: "https://price.jup.ag/v2",
+      priceProvider: async () => 100,
     });
     expect(adapter).toBeDefined();
   });
@@ -56,8 +48,7 @@ describe("SolanaAdapter", () => {
     const adapter = new SolanaAdapter({
       rpcUrl: "https://api.devnet.solana.com",
       commitment: "confirmed",
-      jupiterApiUrl: "https://quote-api.jup.ag/v6",
-      jupiterPriceApiUrl: "https://price.jup.ag/v2",
+      priceProvider: async () => 100,
     });
     expect(adapter).toBeDefined();
     expect(adapter.chain).toBe("solana");
@@ -151,28 +142,28 @@ describe("SolanaAdapter", () => {
     it("should throw for USDC when price API is down (no stablecoin fallback)", async () => {
       const adapter = new SolanaAdapter(defaultConfig);
       await expect(adapter.getValueInUSD("USDC", "50.0")).rejects.toThrow(
-        "Price oracle unavailable",
+        "No price provider configured",
       );
     });
 
     it("should throw for USDT when price API is down (no stablecoin fallback)", async () => {
       const adapter = new SolanaAdapter(defaultConfig);
       await expect(adapter.getValueInUSD("USDT", "25.0")).rejects.toThrow(
-        "Price oracle unavailable",
+        "No price provider configured",
       );
     });
 
     it("should throw for case-insensitive stablecoin names when price API is down", async () => {
       const adapter = new SolanaAdapter(defaultConfig);
       await expect(adapter.getValueInUSD("usdc", "100.0")).rejects.toThrow(
-        "Price oracle unavailable",
+        "No price provider configured",
       );
     });
 
     it("should throw for non-stablecoin when price API is down", async () => {
       const adapter = new SolanaAdapter(defaultConfig);
       await expect(adapter.getValueInUSD("SOL", "1.0")).rejects.toThrow(
-        "Price oracle unavailable",
+        "No price provider configured",
       );
     });
 
@@ -184,35 +175,35 @@ describe("SolanaAdapter", () => {
     it("should throw for USDC with zero amount when price API is down", async () => {
       const adapter = new SolanaAdapter(defaultConfig);
       await expect(adapter.getValueInUSD("USDC", "0")).rejects.toThrow(
-        "Price oracle unavailable",
+        "No price provider configured",
       );
     });
 
     it("should throw for USDT with zero amount when price API is down", async () => {
       const adapter = new SolanaAdapter(defaultConfig);
       await expect(adapter.getValueInUSD("USDT", "0")).rejects.toThrow(
-        "Price oracle unavailable",
+        "No price provider configured",
       );
     });
 
     it("should throw for large USDC amount when price API is down", async () => {
       const adapter = new SolanaAdapter(defaultConfig);
       await expect(adapter.getValueInUSD("USDC", "999999999.99")).rejects.toThrow(
-        "Price oracle unavailable",
+        "No price provider configured",
       );
     });
 
     it("should throw for empty string amount with stablecoin when price API is down", async () => {
       const adapter = new SolanaAdapter(defaultConfig);
       await expect(adapter.getValueInUSD("USDC", "")).rejects.toThrow(
-        "Price oracle unavailable",
+        "No price provider configured",
       );
     });
 
     it("should throw for fractional stablecoin amounts when price API is down", async () => {
       const adapter = new SolanaAdapter(defaultConfig);
       await expect(adapter.getValueInUSD("USDC", "0.01")).rejects.toThrow(
-        "Price oracle unavailable",
+        "No price provider configured",
       );
     });
   });
@@ -230,7 +221,7 @@ describe("SolanaAdapter", () => {
       };
       await expect(
         adapter.buildTransaction(intent, Keypair.generate().publicKey.toBase58()),
-      ).rejects.toThrow("not yet supported");
+      ).rejects.toThrow("not supported");
     });
 
     it("should throw for stake intent type", async () => {
@@ -241,7 +232,7 @@ describe("SolanaAdapter", () => {
       };
       await expect(
         adapter.buildTransaction(intent, Keypair.generate().publicKey.toBase58()),
-      ).rejects.toThrow("not yet supported");
+      ).rejects.toThrow("not supported");
     });
 
     it("should throw for custom intent type", async () => {
@@ -252,7 +243,7 @@ describe("SolanaAdapter", () => {
       };
       await expect(
         adapter.buildTransaction(intent, Keypair.generate().publicKey.toBase58()),
-      ).rejects.toThrow("not yet supported");
+      ).rejects.toThrow("not supported");
     });
 
     it("should include supported types in error message", async () => {
@@ -263,7 +254,7 @@ describe("SolanaAdapter", () => {
       };
       await expect(
         adapter.buildTransaction(intent, Keypair.generate().publicKey.toBase58()),
-      ).rejects.toThrow("Supported: transfer, swap");
+      ).rejects.toThrow("Supported: transfer");
     });
   });
 

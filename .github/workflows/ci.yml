@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [dev, prod]
+    branches: [main, dev, prod]
   pull_request:
-    branches: [dev, prod]
+    branches: [main, dev, prod]
 
 permissions:
   contents: read
@@ -32,7 +32,7 @@ jobs:
       # The prebuild binaries bundled in the npm package may not match the CI
       # Node version, causing "Could not locate the bindings file" errors.
       - name: Rebuild better-sqlite3 from source
-        run: cd node_modules/better-sqlite3 && npx --yes node-gyp rebuild
+        run: cd node_modules/better-sqlite3 && npx node-gyp rebuild
 
       - name: Type check
         run: npm run typecheck
@@ -49,6 +49,17 @@ jobs:
 
       - name: Build
         run: npm run build
+
+  gitleaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Run gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   security:
     runs-on: ubuntu-latest
@@ -72,19 +83,35 @@ jobs:
       # HIGH-16: bigint-buffer (GHSA-3gc7-fjrx-p6mg) is a known transitive dependency
       # from @solana/spl-token with no upstream fix available. It is allowlisted here
       # so it does not block CI, but remains tracked in the security audit report.
+      #
+      # Allowlist approach: We use `npm audit --json` and filter by advisory ID so
+      # that only specific, reviewed advisories are suppressed. Any new high/critical
+      # advisory that is NOT in the allowlist will fail the build immediately.
+      # When adding a new allowlisted advisory, document the GHSA ID, affected
+      # package, reason for allowlisting, and a link to the upstream issue.
       - name: Audit production dependencies
         run: |
           set +e
-          npm audit --omit=dev --audit-level=high 2>&1 | tee /tmp/audit-prod.txt
+          npm audit --omit=dev --audit-level=high --json > /tmp/audit-prod.json 2>&1
           AUDIT_EXIT=$?
           set -e
           if [ $AUDIT_EXIT -ne 0 ]; then
-            # HIGH-16: bigint-buffer (GHSA-3gc7-fjrx-p6mg) has no upstream fix.
-            # Allow it through, but fail on any OTHER high/critical vulnerability.
-            OTHER=$(grep -c "Severity: high\|Severity: critical" /tmp/audit-prod.txt || true)
-            KNOWN=$(grep -c "bigint-buffer" /tmp/audit-prod.txt || true)
-            if [ "$OTHER" -gt "$KNOWN" ]; then
+            # Allowlisted advisory IDs (keep sorted, document reason for each):
+            #   GHSA-3gc7-fjrx-p6mg — bigint-buffer, transitive via @solana/spl-token, no upstream fix
+            ALLOWLIST="GHSA-3gc7-fjrx-p6mg"
+            NON_ALLOWLISTED=$(node -e "
+              const data = require('/tmp/audit-prod.json');
+              const allowlist = new Set(process.argv.slice(1));
+              const vulns = Object.values(data.vulnerabilities || {});
+              const blocked = vulns.filter(v =>
+                (v.severity === 'high' || v.severity === 'critical') &&
+                !v.via.some(a => typeof a === 'object' && allowlist.has(a.url?.split('/').pop()))
+              );
+              console.log(blocked.length);
+            " $ALLOWLIST)
+            if [ "$NON_ALLOWLISTED" -gt 0 ]; then
               echo "::error::npm audit found non-allowlisted high/critical vulnerabilities"
+              npm audit --omit=dev --audit-level=high
               exit 1
             fi
             echo "::warning::Skipping known bigint-buffer vulnerability (HIGH-16, no upstream fix)"
@@ -93,17 +120,29 @@ jobs:
       # SUPPLY-013 fix: Also audit devDependencies for high/critical vulnerabilities.
       # DevDependencies execute during build and test in CI, so vulnerable
       # devDependencies could be exploited during CI runs.
+      #
+      # Uses the same JSON-based allowlist approach as the production audit above.
       - name: Audit all dependencies (including dev)
         run: |
           set +e
-          npm audit --audit-level=high 2>&1 | tee /tmp/audit-all.txt
+          npm audit --audit-level=high --json > /tmp/audit-all.json 2>&1
           AUDIT_EXIT=$?
           set -e
           if [ $AUDIT_EXIT -ne 0 ]; then
-            OTHER=$(grep -c "Severity: high\|Severity: critical" /tmp/audit-all.txt || true)
-            KNOWN=$(grep -c "bigint-buffer" /tmp/audit-all.txt || true)
-            if [ "$OTHER" -gt "$KNOWN" ]; then
+            ALLOWLIST="GHSA-3gc7-fjrx-p6mg"
+            NON_ALLOWLISTED=$(node -e "
+              const data = require('/tmp/audit-all.json');
+              const allowlist = new Set(process.argv.slice(1));
+              const vulns = Object.values(data.vulnerabilities || {});
+              const blocked = vulns.filter(v =>
+                (v.severity === 'high' || v.severity === 'critical') &&
+                !v.via.some(a => typeof a === 'object' && allowlist.has(a.url?.split('/').pop()))
+              );
+              console.log(blocked.length);
+            " $ALLOWLIST)
+            if [ "$NON_ALLOWLISTED" -gt 0 ]; then
               echo "::error::npm audit found non-allowlisted high/critical vulnerabilities"
+              npm audit --audit-level=high
               exit 1
             fi
             echo "::warning::Skipping known bigint-buffer vulnerability (HIGH-16, no upstream fix)"

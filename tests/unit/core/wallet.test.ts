@@ -86,6 +86,9 @@ function createWallet(overrides?: Partial<AgentWalletConfig>) {
     chain: createMockChain(),
     policy: new PolicyEngine([allowAllRule], store),
     store,
+    // Tests create multiple wallets sharing stores; disable multi-instance detection
+    circuitBreaker: { failOnMultiInstance: false },
+    dangerouslyDisableAuth: true,
   };
   return new AgentWallet({ ...defaults, ...overrides });
 }
@@ -464,7 +467,7 @@ describe("AgentWallet", () => {
         chain: "solana",
         params: {
           programId: VALID_SOL_ADDRESS,
-          data: "base64data",
+          data: "YmFzZTY0ZGF0YQ==",
           accounts: [],
         },
       });
@@ -670,7 +673,12 @@ describe("AgentWallet", () => {
       const passedIntent = evaluateSpy.mock.calls[0]![0];
       expect(passedIntent.type).toBe("transfer");
       expect(passedIntent.chain).toBe("solana");
-      expect(passedIntent.params).toEqual(originalIntent.params);
+      // M3 fix: normalizeTokenId maps known symbols to canonical mint addresses
+      expect(passedIntent.params).toEqual({
+        to: VALID_SOL_ADDRESS,
+        amount: "5.5",
+        token: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+      });
       expect(passedIntent.metadata).toEqual(originalIntent.metadata);
     });
   });
@@ -1118,12 +1126,12 @@ describe("AgentWallet", () => {
 
       // First: a confirmed transaction
       const allowPolicy = new PolicyEngine([allowAllRule], store);
-      const wallet1 = createWallet({ store, policy: allowPolicy });
+      const wallet1 = createWallet({ store, policy: allowPolicy, strictAdvisoryLock: false });
       await wallet1.execute(createTransferIntent({ id: "confirmed-1" }));
 
       // Second: a denied transaction
       const denyPolicy = new PolicyEngine([denyRule], store);
-      const wallet2 = createWallet({ store, policy: denyPolicy });
+      const wallet2 = createWallet({ store, policy: denyPolicy, strictAdvisoryLock: false });
       await wallet2.execute(createTransferIntent({ id: "denied-1" }));
 
       const history = await wallet1.getTransactionHistory();
@@ -1673,7 +1681,7 @@ describe("AgentWallet", () => {
       const result = await wallet.execute({
         type: "custom",
         chain: "solana",
-        params: { programId: "", data: "abc", accounts: [] },
+        params: { programId: "", data: "YWJj", accounts: [] },
       });
 
       expect(result.status).toBe("failed");
@@ -1699,7 +1707,7 @@ describe("AgentWallet", () => {
       const result = await wallet.execute({
         type: "custom",
         chain: "solana",
-        params: { programId: VALID_SOL_ADDRESS_2, data: "abc", accounts: "not-an-array" as unknown as CustomParams["accounts"] },
+        params: { programId: VALID_SOL_ADDRESS_2, data: "YWJj", accounts: "not-an-array" as unknown as CustomParams["accounts"] },
       });
 
       expect(result.status).toBe("failed");
@@ -1712,7 +1720,7 @@ describe("AgentWallet", () => {
       const result = await wallet.execute({
         type: "custom",
         chain: "solana",
-        params: { programId: VALID_SOL_ADDRESS_2, data: "abc", accounts: [] },
+        params: { programId: VALID_SOL_ADDRESS_2, data: "YWJj", accounts: [] },
       });
 
       expect(result.status).toBe("confirmed");
@@ -1770,7 +1778,7 @@ describe("AgentWallet", () => {
 	      const customResult = await wallet.execute({
 	        type: "custom",
 	        chain: "solana",
-	        params: { programId: VALID_SOL_ADDRESS_2, data: "abc", accounts: [] },
+	        params: { programId: VALID_SOL_ADDRESS_2, data: "YWJj", accounts: [] },
 	      });
       expect(customResult.status).toBe("confirmed");
     });

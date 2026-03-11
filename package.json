@@ -1,6 +1,6 @@
 {
-  "name": "kova-wallet",
-  "version": "1.0.0",
+  "name": "@kova/wallet",
+  "version": "2.0.0",
   "description": "A policy-constrained crypto wallet SDK for autonomous AI agents",
   "type": "module",
   "main": "dist/index.js",
@@ -29,6 +29,10 @@
     "./adapters": {
       "import": "./dist/adapters/index.js",
       "types": "./dist/adapters/index.d.ts"
+    },
+    "./oracles": {
+      "import": "./dist/oracles/index.js",
+      "types": "./dist/oracles/index.d.ts"
     }
   },
   "files": [
@@ -47,7 +51,7 @@
     "format:check": "prettier --check \"src/**/*.ts\" \"tests/**/*.ts\"",
     "typecheck": "tsc --noEmit",
     "clean": "rm -rf dist",
-    "prepublishOnly": "npm run clean && npm run build",
+    "prepublishOnly": "npm run clean && npm run lint && npm run typecheck && npm run test && npm run build",
     "local:dev": "bash scripts/local-dev.sh",
     "local:stop": "bash scripts/local-dev.sh --stop",
     "local:status": "bash scripts/local-dev.sh --status",
@@ -75,6 +79,11 @@
     "url": "https://github.com/0xKeyserSoze/kova/issues"
   },
   "sideEffects": false,
+  "publishConfig": {
+    "access": "public",
+    "provenance": true,
+    "registry": "https://registry.npmjs.org/"
+  },
   "license": "MIT",
   "engines": {
     "node": ">=18.0.0"
@@ -88,6 +97,7 @@
     "@vitest/coverage-v8": "4.0.18",
     "dotenv": "17.3.1",
     "eslint": "9.39.2",
+    "eslint-plugin-security": "3.0.1",
     "ioredis": "5.10.0",
     "prettier": "3.8.1",
     "typescript": "5.9.3",
@@ -95,9 +105,9 @@
     "vitest": "4.0.18"
   },
   "peerDependencies": {
-    "@turnkey/sdk-server": ">=2.0.0",
-    "better-sqlite3": ">=11.0.0",
-    "ioredis": ">=5.0.0"
+    "@turnkey/sdk-server": ">=2.0.0 <4.0.0",
+    "better-sqlite3": ">=11.0.0 <14.0.0",
+    "ioredis": ">=5.0.0 <6.0.0"
   },
   "peerDependenciesMeta": {
     "@turnkey/sdk-server": {

@@ -25,7 +25,7 @@ assignees: ''
 ## Environment
 
 - Node.js version:
-- kova-wallet version:
+- @kova/wallet version:
 - OS:
 
 ## Additional context

@@ -11,6 +11,8 @@ export type PolicyDecision = PolicyAllow | PolicyDeny | PolicyPending;
 
 export interface PolicyAllow {
   decision: "ALLOW";
+  /** P-01 fix: Optional metadata for provisional allows (e.g., pendingApproval in dry-run) */
+  metadata?: Record<string, unknown>;
 }
 
 export interface PolicyDeny {
@@ -66,7 +68,7 @@ export interface PolicyContext {
  */
 export interface PolicyRule {
   /** Unique name for this rule (used in audit logs and error messages) */
-  name: string;
+  readonly name: string;
   /** Evaluate the intent against this rule */
   evaluate(intent: TransactionIntent, context: PolicyContext): Promise<PolicyDecision>;
 }
@@ -118,6 +120,15 @@ export interface RateLimitConfig {
    * Defaults to empty string for backwards compatibility.
    */
   keyPrefix?: string;
+  /**
+   * M47 fix: Rate limiting algorithm to use.
+   * - "fixed-window" (default): Uses fixed-window counters with TTL. Susceptible to
+   *   2x boundary bursts (see M43 documentation). Lower storage overhead.
+   * - "sliding-window": Uses a log-based approach that tracks individual transaction
+   *   timestamps. Eliminates boundary bursts by sliding the window with each check.
+   *   Higher storage overhead (one entry per transaction per window).
+   */
+  algorithm?: "fixed-window" | "sliding-window";
 }
 
 /** Time window for active hours */
@@ -152,7 +163,7 @@ export interface ApprovalGateConfig {
    * preventing bypass via token mismatch (e.g., using USDC when gate is configured for SOL).
    */
   aboveUSD?: UsdSpendingLimit;
-  channel?: "telegram" | "slack" | "custom";
+  channel?: string;
   /** Timeout in milliseconds. Defaults to 300_000 (5 min) */
   timeout?: number;
   /**

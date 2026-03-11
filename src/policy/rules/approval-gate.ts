@@ -15,7 +15,7 @@ import { createHash } from "node:crypto";
 import type { PolicyRule, PolicyDecision, PolicyContext, ApprovalGateConfig } from "../types.js";
 import type { TransactionIntent } from "../../core/intent.js";
 import type { ApprovalRequest } from "../../approval/interface.js";
-import { normalizeTokenId, parseAndValidateLimitAmount } from "../utils.js";
+import { normalizeTokenId, displayTokenId, parseAndValidateLimitAmount } from "../utils.js";
 
 const DEFAULT_TIMEOUT_MS = 300_000; // 5 minutes
 
@@ -145,9 +145,20 @@ export class ApprovalGateRule implements PolicyRule {
     if (amount === null) {
       // CRIT-10 fix: During dry-run (Phase 1), skip the actual approval request to
       // prevent duplicate approval messages. Phase 2 will send the real request.
-      // Return ALLOW to let Phase 1 proceed to subsequent rules for validation.
       if (context.dryRun) {
-        return { decision: "ALLOW" };
+        // M5 FIX: Before returning a provisional ALLOW, verify that an approval channel
+        // is actually configured. If no channel is available, approval will fail in Phase 2,
+        // so we should fail early with a clear message rather than returning a misleading ALLOW.
+        if (!context.approval) {
+          return {
+            decision: "DENY",
+            rule: this.name,
+            reason: "Approval required but no approval channel configured",
+          };
+        }
+        // P-01 fix: Signal that this is a provisional allow pending approval.
+        // Phase 2 will perform the actual approval check.
+        return { decision: "ALLOW", metadata: { pendingApproval: true } };
       }
 
       if (!context.approval) {
@@ -282,7 +293,17 @@ export class ApprovalGateRule implements PolicyRule {
     // to prevent duplicate messages. Return ALLOW so Phase 1 continues evaluating
     // subsequent rules; Phase 2 will send the real approval request.
     if (context.dryRun) {
-      return { decision: "ALLOW" };
+      // M5 FIX: Verify approval channel is configured before returning provisional ALLOW.
+      if (!context.approval) {
+        return {
+          decision: "DENY",
+          rule: this.name,
+          reason: "Approval required but no approval channel configured",
+        };
+      }
+      // P-01 fix: Signal that this is a provisional allow pending approval.
+      // Phase 2 will perform the actual approval check.
+      return { decision: "ALLOW", metadata: { pendingApproval: true } };
     }
 
     if (!context.approval) {
@@ -317,16 +338,15 @@ export class ApprovalGateRule implements PolicyRule {
         // CRIT-03 fix: Re-compute the intent hash from the current intent and compare
         // to the ORIGINAL hash that was sent. This detects TOCTOU attacks where the
         // intent object is mutated between approval request and execution.
-        if (originalIntentHash) {
-          const recomputedHash = computeIntentHash(intent);
-          if (recomputedHash !== originalIntentHash) {
-            return {
-              decision: "DENY",
-              rule: this.name,
-              reason: `Approval intent hash mismatch: the transaction was modified after approval was requested. ` +
-                `Original ${originalIntentHash.slice(0, 16)}..., re-computed ${recomputedHash.slice(0, 16)}...`,
-            };
-          }
+        // intentHash is now always present (required on ApprovalRequest).
+        const recomputedHash = computeIntentHash(intent);
+        if (recomputedHash !== originalIntentHash) {
+          return {
+            decision: "DENY",
+            rule: this.name,
+            reason: `Approval intent hash mismatch: the transaction was modified after approval was requested. ` +
+              `Original ${originalIntentHash.slice(0, 16)}..., re-computed ${recomputedHash.slice(0, 16)}...`,
+          };
         }
         // HIGH-08 fix: Record approved transaction in cumulative tracker
         if (this.config.cumulativeWindow) {
@@ -372,10 +392,10 @@ export class ApprovalGateRule implements PolicyRule {
     now?: number,
   ): ApprovalRequest {
     const timeoutMs = this.config.timeout ?? DEFAULT_TIMEOUT_MS;
-    const params = intent.params as unknown as Record<string, unknown>;
 
     // H-08 FIX: Sanitize agent-provided reason to prevent social engineering
-    const rawReason = typeof params.reason === "string" ? params.reason : intent.metadata?.reason as string | undefined;
+    // H10 fix: Access metadata.reason directly instead of casting params
+    const rawReason = intent.metadata?.reason as string | undefined;
 
     // MED-T4-06 fix: Use context.now for consistency with the policy engine's time source
     const effectiveNow = now ?? Date.now();
@@ -385,9 +405,9 @@ export class ApprovalGateRule implements PolicyRule {
       // At 1 billion approval requests, collision probability is < 1e-18 (birthday bound:
       // p ≈ n²/2^123 ≈ 10^18/10^37 ≈ 10^-19). No collision check is needed.
       id: crypto.randomUUID(),
-      summary: `${intent.type} ${amount} ${token}`,
+      summary: `${intent.type} ${amount} ${displayTokenId(token)}`,
       amount: String(amount),
-      token,
+      token: displayTokenId(token),
       target: this.extractTarget(intent),
       reason: sanitizeReason(rawReason),
       agentId: intent.metadata?.agentId as string | undefined,
@@ -403,10 +423,10 @@ export class ApprovalGateRule implements PolicyRule {
    */
   private buildApprovalRequestForUnknownAmount(intent: TransactionIntent, now?: number): ApprovalRequest {
     const timeoutMs = this.config.timeout ?? DEFAULT_TIMEOUT_MS;
-    const params = intent.params as unknown as Record<string, unknown>;
 
     // H-08 FIX: Sanitize agent-provided reason to prevent social engineering
-    const rawReason = typeof params.reason === "string" ? params.reason : intent.metadata?.reason as string | undefined;
+    // H10 fix: Access metadata.reason directly instead of casting params
+    const rawReason = intent.metadata?.reason as string | undefined;
 
     // MED-T4-06 fix: Use context.now for consistency with the policy engine's time source
     const effectiveNow = now ?? Date.now();
@@ -450,26 +470,38 @@ export class ApprovalGateRule implements PolicyRule {
     // Read recent cumulative entries from the store
     // Use a generous count to cover the window; old entries are filtered by timestamp
     const recentRaw = await context.store.getRecent(storeKey, 1000);
-    let cumulativeTotal = 0;
+
+    // P-02 fix: Use BigInt-scaled arithmetic to avoid floating-point drift when
+    // accumulating many small amounts. Same toBigIntScaled pattern as spending-limit.ts.
+    const PRECISION_DECIMALS = 10;
+    const PRECISION_FACTOR = 10n ** BigInt(PRECISION_DECIMALS);
+    function scaleToBigInt(value: number): bigint {
+      const str = value.toFixed(PRECISION_DECIMALS);
+      const dotIdx = str.indexOf(".");
+      const whole = BigInt(dotIdx === -1 ? str : str.slice(0, dotIdx));
+      const fracStr = dotIdx === -1 ? "" : str.slice(dotIdx + 1);
+      const frac = BigInt(fracStr.padEnd(PRECISION_DECIMALS, "0").slice(0, PRECISION_DECIMALS));
+      return value < 0 ? whole * PRECISION_FACTOR - frac : whole * PRECISION_FACTOR + frac;
+    }
+
+    let cumulativeTotalBi = 0n;
 
     for (const raw of recentRaw) {
-      try {
-        const entry = JSON.parse(raw) as { timestamp: number; amount: number };
-        if (
-          typeof entry.timestamp === "number" &&
-          typeof entry.amount === "number" &&
-          entry.timestamp >= windowStart
-        ) {
-          cumulativeTotal += entry.amount;
-        }
-      } catch {
-        // Skip corrupted entries
+      // P-03 fix: Parse "timestamp:amount" format (matching spending-limit.ts)
+      const colonIdx = raw.indexOf(":");
+      if (colonIdx === -1) continue; // Skip malformed entries
+      const ts = parseInt(raw.slice(0, colonIdx), 10);
+      const amt = parseFloat(raw.slice(colonIdx + 1));
+      if (Number.isFinite(ts) && ts >= windowStart && Number.isFinite(amt) && amt >= 0) {
+        cumulativeTotalBi += scaleToBigInt(amt);
       }
     }
 
     // Check if adding this transaction would exceed the threshold
-    const projectedTotal = cumulativeTotal + amount;
-    if (projectedTotal >= threshold) {
+    const projectedTotalBi = cumulativeTotalBi + scaleToBigInt(amount);
+    const thresholdBi = scaleToBigInt(threshold);
+    if (projectedTotalBi >= thresholdBi) {
+      const projectedTotal = Number(projectedTotalBi) / Number(PRECISION_FACTOR);
       const reason =
         `Cumulative spending of ${projectedTotal.toFixed(4)} ${token} ` +
         `(including this ${amount} ${token} transaction) exceeds approval threshold ` +
@@ -494,8 +526,9 @@ export class ApprovalGateRule implements PolicyRule {
     // Skip recording during dry-run to avoid double-counting in two-phase evaluation
     if (context.dryRun) return;
 
+    // P-03 fix: Use "timestamp:amount" format matching spending-limit.ts
     const storeKey = `${CUMULATIVE_STORE_KEY_PREFIX}${normalizeTokenId(token)}`;
-    const entry = JSON.stringify({ timestamp: context.now, amount });
+    const entry = `${context.now}:${amount}`;
     await context.store.append(storeKey, entry);
   }
 
@@ -512,57 +545,85 @@ export class ApprovalGateRule implements PolicyRule {
    * - Reject non-finite, NaN, zero, and negative values
    */
   private extractAmount(intent: TransactionIntent): number | null {
-    const params = intent.params as unknown as Record<string, unknown>;
-    if ("amount" in params && typeof params.amount === "string") {
-      // M-06 FIX: Reject amounts with more than 18 decimal places (aligned with SpendingLimit H-15)
-      const dotIndex = params.amount.indexOf(".");
-      if (dotIndex !== -1) {
-        const decimalPlaces = params.amount.length - dotIndex - 1;
-        if (decimalPlaces > 18) {
-          return null;
-        }
-      }
+    // H10 fix: Use discriminated union narrowing instead of unsafe double-cast.
+    let amountStr: string | undefined;
+    switch (intent.type) {
+      case "transfer":
+        amountStr = typeof intent.params.amount === "string" ? intent.params.amount : undefined;
+        break;
+      case "swap":
+        amountStr = typeof intent.params.amount === "string" ? intent.params.amount : undefined;
+        break;
+      case "stake":
+        amountStr = typeof intent.params.amount === "string" ? intent.params.amount : undefined;
+        break;
+      default:
+        return null;
+    }
+    if (amountStr === undefined) return null;
 
-      // M-06 FIX: BigInt-based extraction for integer amounts (aligned with SpendingLimit)
-      if (/^\d+$/.test(params.amount)) {
-        try {
-          const bigAmount = BigInt(params.amount);
-          if (bigAmount <= 0n) return null;
-          return Number(bigAmount);
-        } catch {
-          return null;
-        }
-      }
-
-      // M-06 FIX: Validate decimal format before parseFloat (aligned with SpendingLimit)
-      if (!/^\d+\.\d+$/.test(params.amount)) {
+    // M-06 FIX: Reject amounts with more than 18 decimal places (aligned with SpendingLimit H-15)
+    const dotIndex = amountStr.indexOf(".");
+    if (dotIndex !== -1) {
+      const decimalPlaces = amountStr.length - dotIndex - 1;
+      if (decimalPlaces > 18) {
         return null;
       }
-      const parsed = parseFloat(params.amount);
-      return (isNaN(parsed) || !Number.isFinite(parsed) || parsed <= 0) ? null : parsed;
     }
-    return null;
+
+    // P-16 fix: Reject amounts with leading zeros (e.g., "007", "00.5") matching
+    // spending-limit.ts POLICY-017. Leading zeros can cause ambiguity and may
+    // indicate malformed input intended to bypass limit comparisons.
+    if (/^0\d/.test(amountStr)) return null;
+
+    // M-06 FIX: BigInt-based extraction for integer amounts (aligned with SpendingLimit)
+    if (/^\d+$/.test(amountStr)) {
+      try {
+        const bigAmount = BigInt(amountStr);
+        if (bigAmount <= 0n) return null;
+        return Number(bigAmount);
+      } catch {
+        return null;
+      }
+    }
+
+    // M-06 FIX: Validate decimal format before parseFloat (aligned with SpendingLimit)
+    if (!/^\d+\.\d+$/.test(amountStr)) {
+      return null;
+    }
+    const parsed = parseFloat(amountStr);
+    return (isNaN(parsed) || !Number.isFinite(parsed) || parsed <= 0) ? null : parsed;
   }
 
   /** Extract the token symbol from an intent's params */
   private extractToken(intent: TransactionIntent): string {
-    const params = intent.params as unknown as Record<string, unknown>;
-    if ("token" in params && typeof params.token === "string") {
-      return params.token;
+    // H10 fix: Use discriminated union narrowing instead of unsafe double-cast.
+    switch (intent.type) {
+      case "transfer":
+        return typeof intent.params.token === "string" ? intent.params.token : "UNKNOWN";
+      case "swap":
+        return typeof intent.params.fromToken === "string" ? intent.params.fromToken : "UNKNOWN";
+      case "stake":
+        return typeof intent.params.token === "string" ? intent.params.token : "UNKNOWN";
+      default:
+        return "UNKNOWN";
     }
-    if ("fromToken" in params && typeof params.fromToken === "string") {
-      return params.fromToken;
-    }
-    return "UNKNOWN";
   }
 
   /** Extract the target address from an intent */
   private extractTarget(intent: TransactionIntent): string {
-    const params = intent.params as unknown as Record<string, unknown>;
-    if ("to" in params && typeof params.to === "string") return params.to;
-    if ("programId" in params && typeof params.programId === "string") return params.programId;
-    if ("collection" in params && typeof params.collection === "string") return params.collection;
-    if ("validator" in params && typeof params.validator === "string") return params.validator;
-    return "unknown";
+    // H10 fix: Use discriminated union narrowing instead of unsafe double-cast.
+    switch (intent.type) {
+      case "transfer":
+        return typeof intent.params.to === "string" ? intent.params.to : "unknown";
+      case "custom":
+        return typeof intent.params.programId === "string" ? intent.params.programId : "unknown";
+      case "mint":
+        return typeof intent.params.collection === "string" ? intent.params.collection : "unknown";
+      case "stake":
+        return typeof intent.params.validator === "string" ? intent.params.validator : "unknown";
+      default:
+        return "unknown";
+    }
   }
 }
