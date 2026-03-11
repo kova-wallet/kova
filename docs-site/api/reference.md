@@ -193,7 +193,8 @@ interface TransferParams {
 #### SwapParams
 
 ```typescript
-// Parameters for a token swap operation (e.g., via Jupiter on Solana).
+// Parameters for a token swap operation. Note: swaps are NOT built into SolanaAdapter;
+// you must implement a custom ChainAdapter to handle swap intents (e.g., via Jupiter).
 interface SwapParams {
   fromToken: string;       // Source token symbol or mint address (the token you're selling)
   toToken: string;         // Destination token symbol or mint address (the token you're buying)
@@ -402,8 +403,8 @@ const policy = Policy.create("my-policy")
     timezone: "America/New_York",
     windows: [{ days: ["mon", "tue", "wed", "thu", "fri"], start: "09:00", end: "17:00" }],
   })
-  // Require human approval for transfers above 10 SOL via Telegram.
-  .requireApproval({ above: { amount: "10", token: "SOL" }, channel: "telegram", timeout: 300_000 })
+  // Require human approval for transfers above 10 SOL.
+  .requireApproval({ above: { amount: "10", token: "SOL" }, timeout: 300_000 })
   // Finalize and return the Policy instance.
   .build();
 ```
@@ -737,7 +738,7 @@ new ApprovalGateRule(config: ApprovalGateConfig)
 // Configuration for the human approval gate.
 interface ApprovalGateConfig {
   above: TokenAmount;                          // Amount above which approval is required
-  channel?: "telegram" | "slack" | "custom";   // Approval channel identifier
+  channel?: string;                              // Approval channel identifier (for documentation only)
   timeout?: number;                            // Milliseconds to wait for approval (default: 300_000 = 5 min)
 }
 ```
@@ -1021,7 +1022,7 @@ interface TransactionStatusResult {
 
 ### SolanaAdapter
 
-Chain adapter for the Solana blockchain. Supports native SOL transfers, SPL token transfers, and token swaps.
+Chain adapter for the Solana blockchain. Supports native SOL transfers and SPL token transfers. Swap, mint, and stake operations require a custom `ChainAdapter` implementation.
 
 ```typescript
 // Create a SolanaAdapter connected to a Solana RPC endpoint.
@@ -1062,7 +1063,7 @@ Abstract interface for human-in-the-loop approval.
 ```typescript
 // The ApprovalChannel interface that all approval backends must implement.
 // Each implementation handles sending requests and collecting responses
-// through a specific platform (Telegram, Slack, email, etc.).
+// through a specific platform (Slack, email, webhook, etc.).
 interface ApprovalChannel {
   requestApproval(request: ApprovalRequest): Promise<ApprovalResult>;
 }
@@ -1087,7 +1088,7 @@ interface ApprovalRequest {
 // The human's response to an approval request.
 interface ApprovalResult {
   decision: ApprovalDecision;    // "approved", "rejected", or "timeout"
-  approvedBy?: string;           // Who made the decision (e.g., Telegram user ID)
+  approvedBy?: string;           // Who made the decision (e.g., Slack user ID, webhook caller)
   reason?: string;               // Optional reason for the decision
   timestamp: string;             // ISO 8601 timestamp of the decision
 }

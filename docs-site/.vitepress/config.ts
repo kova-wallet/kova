@@ -85,7 +85,7 @@ export default defineConfig({
             { text: 'Giving Claude a Wallet', link: '/tutorials/claude-agent-integration' },
             { text: 'Payment Agent with Claude', link: '/tutorials/payment-agent' },
             { text: 'Policy Cookbook', link: '/tutorials/policy-cookbook' },
-            { text: 'Telegram Approval', link: '/tutorials/telegram-approval' },
+            { text: 'Custom Approval Channels', link: '/tutorials/telegram-approval' },
             { text: 'Custom Store Adapter', link: '/tutorials/custom-store' },
             { text: 'Custom Policy Rule', link: '/tutorials/custom-policy-rule' },
             { text: 'Multi-Agent Architecture', link: '/tutorials/multi-agent' },

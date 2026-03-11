@@ -14,7 +14,7 @@ The human approval system provides a human-in-the-loop mechanism for high-value 
 
 ```typescript
 // Import the types needed for the human approval system.
-// - ApprovalChannel: the interface that approval backends (Telegram, Slack, etc.) must implement
+// - ApprovalChannel: the interface that approval backends (Slack, email, etc.) must implement
 // - ApprovalRequest: the data object describing what the agent wants to do
 // - ApprovalResult: the human's decision (approved, rejected, or timed out)
 // - ApprovalDecision: the union type of possible decisions
@@ -23,10 +23,10 @@ import type { ApprovalChannel, ApprovalRequest, ApprovalResult, ApprovalDecision
 
 ```typescript
 // The ApprovalChannel interface defines how the SDK communicates with a human
-// approver. Implementations can use any messaging platform (Telegram, Slack,
+// approver. Implementations can use any messaging platform (Slack, Discord,
 // email, SMS, etc.) as long as they can send a request and wait for a response.
 interface ApprovalChannel {
-  /** Name of this channel (e.g., "telegram", "slack") */
+  /** Name of this channel (e.g., "slack", "webhook") */
   // A human-readable identifier for this channel, used in audit logs
   // to record which approval channel was used for a given transaction.
   readonly name: string;
@@ -88,7 +88,7 @@ interface ApprovalRequest {
   /** User ID of the person who initiated this transaction */
   // Used for self-approval prevention — if set, this user cannot also
   // approve the request. The value must be in the same identity space as
-  // the approval channel (e.g., Telegram user ID, Slack user ID).
+  // the approval channel (e.g., Slack user ID, webhook user ID).
   requestedByUserId?: string;
   /** When this request expires */
   // Unix timestamp (milliseconds) after which the request automatically
@@ -133,8 +133,8 @@ interface ApprovalResult {
   requestId: string;
   // The human's decision -- determines whether the transaction proceeds.
   decision: ApprovalDecision;
-  // Optional identifier of who made the decision (e.g., a Telegram username
-  // or Slack user ID). Recorded in the audit log for accountability.
+  // Optional identifier of who made the decision (e.g., a Slack user ID
+  // or webhook caller). Recorded in the audit log for accountability.
   decidedBy?: string;
   // Unix timestamp (milliseconds) of when the decision was made.
   decidedAt: number;
@@ -156,7 +156,7 @@ The SDK ships two generic approval channels that cover the most common integrati
 
 ### CallbackApprovalChannel
 
-The most flexible option -- you provide two callbacks: one to notify a human, and one to wait for their decision. Works with any notification mechanism (Telegram, Slack, Discord, email, SMS, in-app UI, push notifications).
+The most flexible option -- you provide two callbacks: one to notify a human, and one to wait for their decision. Works with any notification mechanism (Slack, Discord, Telegram, email, SMS, in-app UI, push notifications).
 
 ```typescript
 import { CallbackApprovalChannel } from "kova";
@@ -164,19 +164,19 @@ import type { CallbackApprovalChannelConfig } from "kova";
 
 const approval = new CallbackApprovalChannel({
   // Optional channel name for audit logs. Defaults to "callback".
-  name: "telegram",
+  name: "my-approval",
 
   // Called when an approval request is created. Use this to notify a human.
   // If this throws, the transaction is DENIED (fail-closed).
   onApprovalRequest: async (request) => {
-    await sendTelegramMessage(chatId, formatApprovalMessage(request));
+    await notifyApprover(request); // e.g., send a Slack message, email, or push notification
   },
 
   // Called to wait for the human's decision. Must return a Promise that
   // resolves with an ApprovalResult when the human approves or rejects.
   // The channel races this against the timeout automatically.
   waitForDecision: async (request) => {
-    return pollForTelegramResponse(request.id);
+    return pollForResponse(request.id); // e.g., poll a database or listen on a webhook
   },
 
   // Default timeout in milliseconds. Defaults to 300_000 (5 minutes).

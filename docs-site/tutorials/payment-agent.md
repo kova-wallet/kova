@@ -894,5 +894,5 @@ Congratulations -- you have a fully functional AI payment agent. Here are three 
 ## Next Steps
 
 - [Policy Cookbook](/tutorials/policy-cookbook) -- Explore different policy configurations
-- [Telegram Approval](/tutorials/telegram-approval) -- Add human oversight for high-value payments
+- [Approval Gates](/guide/rules/approval-gate) -- Add human oversight for high-value payments with CallbackApprovalChannel or WebhookApprovalChannel
 - [API Reference](/api/reference) -- Full reference for all tool definitions

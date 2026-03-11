@@ -315,7 +315,6 @@ const highValuePolicy = Policy.create("high-value-approval")
   })
   .requireApproval({
     above: { amount: "10.0", token: "SOL" },  // Trigger approval for 10+ SOL transactions
-    channel: "telegram",                        // Delivery channel (Telegram in this case)
     timeout: 300000,                            // 5 minutes before auto-deny (fail-closed)
   })
   .build();
@@ -323,8 +322,8 @@ const highValuePolicy = Policy.create("high-value-approval")
 
 **Rationale:**
 - Transactions under 10 SOL proceed automatically
-- Transactions of 10 SOL or more trigger a Telegram notification requiring approval
-- The operator has 5 minutes to approve or reject
+- Transactions of 10 SOL or more trigger an approval notification via the configured `ApprovalChannel`
+- The approver has 5 minutes to approve or reject
 - Daily limit of 200 SOL provides an overall safety net
 
 **Creating the engine with approval:**
@@ -339,14 +338,14 @@ const rules = [
 ];
 const store = new MemoryStore(); // Dev-only; throws in production unless KOVA_ALLOW_MEMORY_STORE=1
 // Pass the approvalBot as the third argument so the ApprovalGateRule can
-// send Telegram messages when a transaction exceeds the approval threshold.
+// send approval requests when a transaction exceeds the approval threshold.
 const engine = new PolicyEngine(rules, store, approvalBot);
 ```
 
 **Allowed intent (below threshold):**
 
 ```typescript
-// This intent will PASS automatically without triggering Telegram approval:
+// This intent will PASS automatically without triggering an approval request:
 //   - 5 SOL is below the 10 SOL approval threshold
 //   - Also within the 50 SOL per-transaction spending limit
 //   - The ApprovalGateRule only activates for amounts >= the threshold
@@ -365,7 +364,7 @@ const allowed = {
 **Pending intent (above threshold):**
 
 ```typescript
-// This intent will trigger Telegram approval because 25 SOL >= 10 SOL threshold.
+// This intent will trigger an approval request because 25 SOL >= 10 SOL threshold.
 // The wallet.execute() call BLOCKS until the human responds or the timeout expires.
 // Three possible outcomes after approval is requested:
 const pendingApproval = {
@@ -388,7 +387,7 @@ The high-value approval policy introduces a human-in-the-loop pattern. The `Appr
 
 The "fail-closed" design means that if the human does not respond within the timeout, the transaction is automatically **denied** (not approved). This is a deliberate safety choice: silence is treated as rejection.
 
-To set up the Telegram approval channel referenced here, see the [Telegram Approval tutorial](/tutorials/telegram-approval).
+To set up an approval channel, see the [Custom Approval Channels tutorial](/tutorials/telegram-approval).
 :::
 
 ---
@@ -428,9 +427,11 @@ const defiTraderPolicy = Policy.create("defi-trader")
 
 ```typescript
 // This swap intent will PASS: 5 SOL is within the 10 SOL per-tx limit,
-// and Jupiter (used internally for routing) is on the allowed programs list.
+// and Jupiter is on the allowed programs list.
+// Note: swap intents require a custom ChainAdapter implementation -- they are
+// NOT built into SolanaAdapter (which only supports transfers).
 const allowed = {
-  type: "swap",        // Swap intent type (routed through Jupiter by the SolanaAdapter)
+  type: "swap",        // Swap intent type (requires a custom ChainAdapter; not built into SolanaAdapter)
   chain: "solana",
   params: {
     fromToken: "SOL",                                           // Source token (native SOL)
@@ -728,13 +729,13 @@ Make sure you are creating rule instances from the loaded config. `Policy.fromJS
 
 Now that you understand the six policy patterns, here are some concrete challenges to deepen your understanding:
 
-- **Combine business hours with approval gates.** Create a policy that only operates Monday-Friday 9-5 ET and also requires Telegram approval for transactions above 2 SOL. Which rule should be evaluated first?
+- **Combine business hours with approval gates.** Create a policy that only operates Monday-Friday 9-5 ET and also requires human approval for transactions above 2 SOL. Which rule should be evaluated first?
 - **Create environment-specific policies using `Policy.extend()`.** Start with a liberal base policy and derive three variants: `dev` (high limits, no allowlist), `staging` (moderate limits, allowlist), and `production` (tight limits, allowlist, approval gate, business hours).
 - **Serialize and diff policies.** Save two policies to JSON files and compare them with `diff` or a JSON comparison tool. This is how you would review policy changes in a pull request.
 
 ## Next Steps
 
 - [Your First Agent Wallet](/tutorials/first-wallet) -- Start from scratch
-- [Telegram Approval](/tutorials/telegram-approval) -- Set up the approval channel used in Policy 4
+- [Custom Approval Channels](/tutorials/telegram-approval) -- Set up the approval channel used in Policy 4
 - [Building a DeFi Agent](/tutorials/defi-agent) -- Put the DeFi Trader policy to work
 - [Production Deployment](/tutorials/production) -- Harden any of these policies for real use

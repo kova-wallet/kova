@@ -43,7 +43,7 @@ import type { AgentWalletConfig } from "kova";
 | `chain` | `ChainAdapter` | Yes | The chain adapter for blockchain interactions (the connection to the blockchain network -- similar to an API client for your bank) |
 | `policy` | `PolicyEngine` | Yes | The policy engine for evaluating transaction intents (your spending rules and approval workflows) |
 | `store` | `Store` | Yes | The store for persisting spending counters and tx logs (the database that remembers how much has been spent today) |
-| `approval` | `ApprovalChannel` | No | Optional approval channel for human-in-the-loop (e.g., a Telegram bot that messages a human for approval) |
+| `approval` | `ApprovalChannel` | No | Optional approval channel for human-in-the-loop (e.g., CallbackApprovalChannel or WebhookApprovalChannel) |
 | `logger` | `AuditLogger` | No | Optional audit logger. If not provided, one is created using the store |
 | `circuitBreaker` | `Partial<CircuitBreakerConfig> \| false` | No | Circuit breaker config. Set to `false` to disable. Default: `{ threshold: 5, cooldownMs: 300000 }` |
 | `onAuditFailure` | `AuditFailureCallback` | No | Callback invoked when an audit log write fails |
@@ -195,7 +195,7 @@ const engine = new PolicyEngine(
     // This reads and updates spending counters in the store.
     new SpendingLimitRule({ daily: { amount: "50", token: "SOL" } }),
 
-    // Rule 3: Approval gate — transactions above 10 SOL require human approval via Telegram.
+    // Rule 3: Approval gate — transactions above 10 SOL require human approval.
     // The timeout of 600,000ms (10 minutes) means the approval request expires after 10 minutes
     // if the human does not respond, resulting in an automatic DENY.
     new ApprovalGateRule({
@@ -307,7 +307,7 @@ if (result.status === "confirmed") {
   console.log("Denied:", result.error?.message);
 } else if (result.status === "pending") {
   // The transaction requires human approval (e.g., ApprovalGateRule triggered).
-  // An approval request has been sent (e.g., via Telegram) and is awaiting a human decision.
+  // An approval request has been sent via the configured ApprovalChannel and is awaiting a human decision.
   console.log("Awaiting approval:", result.summary);
 } else {
   // The transaction was attempted but failed during build, sign, or broadcast.

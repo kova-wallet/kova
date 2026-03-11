@@ -1,7 +1,7 @@
 # Building a DeFi Agent
 
 ::: info What you'll learn
-- How to build an AI agent that executes token swaps on Solana using Jupiter (the largest DEX aggregator on Solana)
+- How to build an AI agent that executes token swaps on Solana using Jupiter (the largest DEX aggregator on Solana) via custom implementation
 - How to create a `swap` TransactionIntent and configure policy rules for DeFi operations
 - How to check multiple token balances (SOL and SPL tokens like USDC)
 - How to handle swap errors gracefully (slippage, insufficient liquidity, failed routes)
@@ -24,7 +24,7 @@ This tutorial walks you through building an agent that can execute <Term id="tok
 
 ```bash
 # Install kova (agent wallet SDK) and @solana/web3.js (Solana client library).
-# kova includes the SolanaAdapter which handles Jupiter swap routing internally.
+# Note: Jupiter swap integration requires custom implementation — it is not built into SolanaAdapter.
 npm install kova @solana/web3.js
 ```
 
@@ -42,7 +42,7 @@ import {
   AgentWallet,        // Top-level wallet for the DeFi agent
   LocalSigner,        // Signs transactions using an in-memory Solana Keypair
   MemoryStore,        // In-memory state store (use SqliteStore in production)
-  SolanaAdapter,      // Chain adapter with built-in Jupiter swap support
+  SolanaAdapter,      // Chain adapter for Solana (Jupiter swap routing requires custom implementation)
   Policy,             // Fluent builder for policy configuration
   SpendingLimitRule,  // Enforces per-transaction and daily spending caps
   RateLimitRule,      // Enforces max transactions per time window
@@ -62,17 +62,16 @@ const keypair = Keypair.fromSecretKey(
 const signer = new LocalSigner(keypair);  // Dev-only; throws in production unless KOVA_ALLOW_LOCAL_SIGNER=1
 const store = new MemoryStore();           // Dev-only; throws in production unless KOVA_ALLOW_MEMORY_STORE=1
 
-// Configure SolanaAdapter with Jupiter API endpoints for token swaps.
-// For DeFi operations, Jupiter is the primary DEX aggregator on Solana.
-// It routes swaps through the best available liquidity pools automatically.
+// Configure SolanaAdapter for the Solana network.
+// Note: Jupiter swap routing is NOT built into SolanaAdapter. To execute swaps,
+// you need to implement Jupiter API calls yourself or use a custom ChainAdapter.
+// See the Jupiter API docs at https://station.jup.ag/docs for integration details.
 const chain = new SolanaAdapter({
   rpcUrl: process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com",
     // Use mainnet-beta for real Jupiter swaps (devnet has no liquidity).
     // A custom RPC URL (e.g., Helius, QuickNode) is recommended for production
     // to avoid rate limits on the public endpoint.
   commitment: "confirmed",           // Wait for supermajority confirmation
-  jupiterApiUrl: "https://quote-api.jup.ag/v6",       // Jupiter quote API for swap routing
-  jupiterPriceApiUrl: "https://price.jup.ag/v6",      // Jupiter price API for USD value lookups
 });
 
 // Build a DeFi-friendly policy with moderate limits and program allowlist.
@@ -193,8 +192,8 @@ Now execute a swap of 1 SOL to USDC via Jupiter. The swap intent uses the `"swap
   // The swap intent goes through the full pipeline:
   //   1. Policy engine checks spending limit (1 SOL <= 10 SOL per-tx cap)
   //   2. Policy engine checks rate limit
-  //   3. SolanaAdapter calls Jupiter quote API to find the best route
-  //   4. SolanaAdapter builds the swap transaction with the optimal route
+  //   3. Your custom implementation calls the Jupiter quote API to find the best route
+  //   4. The swap transaction is built with the optimal route
   //   5. LocalSigner signs the transaction
   //   6. SolanaAdapter broadcasts to Solana and waits for confirmation
   console.log("\n--- Swapping 1 SOL -> USDC ---");
@@ -239,8 +238,8 @@ Timestamp: 2025-01-15T14:30:00.000Z
 Here is the full pipeline that your swap went through:
 
 1. **Policy evaluation:** The `PolicyEngine` checked spending limits (1 SOL is under the 10 SOL cap) and rate limits (not exceeded). Both rules returned ALLOW.
-2. **Jupiter quote:** The `SolanaAdapter` called the Jupiter quote API (`https://quote-api.jup.ag/v6/quote`) to find the best swap route. Jupiter compared prices across all available liquidity pools (Raydium, Orca, etc.) and returned the route with the best price.
-3. **Transaction building:** The adapter used the Jupiter swap API to build a Solana transaction containing the swap instructions.
+2. **Jupiter quote:** Your custom implementation called the Jupiter quote API (`https://quote-api.jup.ag/v6/quote`) to find the best swap route. Jupiter compared prices across all available liquidity pools (Raydium, Orca, etc.) and returned the route with the best price.
+3. **Transaction building:** The Jupiter swap API was used to build a Solana transaction containing the swap instructions.
 4. **Signing:** The `LocalSigner` signed the transaction with your wallet's private key.
 5. **Broadcasting:** The adapter submitted the signed transaction to the Solana network via your RPC endpoint.
 6. **Confirmation:** The adapter waited for the transaction to reach "confirmed" status (supermajority of validators have seen it).
@@ -426,11 +425,11 @@ async function main() {
   );
   const signer = new LocalSigner(keypair);       // Dev-only; throws in production unless KOVA_ALLOW_LOCAL_SIGNER=1
   const store = new MemoryStore();                // Dev-only; throws in production unless KOVA_ALLOW_MEMORY_STORE=1
+  // Note: Jupiter swap routing requires custom implementation — it is not built into SolanaAdapter.
+  // See https://station.jup.ag/docs for Jupiter API integration details.
   const chain = new SolanaAdapter({
     rpcUrl: process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com",
     commitment: "confirmed",
-    jupiterApiUrl: "https://quote-api.jup.ag/v6",       // Jupiter quote API for swap routing
-    jupiterPriceApiUrl: "https://price.jup.ag/v6",      // Jupiter price API for USD values
   });
 
   // --- Policy: DeFi trader with spending limits and program allowlist ---
@@ -599,12 +598,12 @@ This is expected. Jupiter liquidity pools exist primarily on mainnet-beta. Most 
 ## What to Try Next
 
 - **Build a simple arbitrage detector.** Check the price of SOL/USDC on Jupiter, compare it to a different source, and execute a swap when the price difference exceeds a threshold.
-- **Add Telegram approval for large swaps.** Combine this tutorial with the [Telegram Approval tutorial](/tutorials/telegram-approval) so swaps above 5 SOL require your manual approval.
+- **Add approval gates for large swaps.** Add a `CallbackApprovalChannel` or `WebhookApprovalChannel` so swaps above 5 SOL require your manual approval. See the [Approval Gate guide](/guide/rules/approval-gate) for details.
 - **Track portfolio value over time.** Write a script that calls `wallet.getBalance("SOL")` and `wallet.getBalance("USDC")` every hour, logs the USD values, and plots a simple chart.
 
 ## Next Steps
 
 - [Policy Cookbook](/tutorials/policy-cookbook) -- More DeFi-specific policy configurations
-- [Telegram Approval](/tutorials/telegram-approval) -- Add human oversight for large swaps
+- [Approval Gate](/guide/rules/approval-gate) -- Add human oversight for large swaps with CallbackApprovalChannel or WebhookApprovalChannel
 - [Production Deployment](/tutorials/production) -- Persistent storage and monitoring for DeFi agents
 - [API Reference](/api/reference) -- Full SwapParams and TransactionResult documentation

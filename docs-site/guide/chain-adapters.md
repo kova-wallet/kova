@@ -4,7 +4,7 @@
 - How chain adapters abstract blockchain-specific complexity behind a common interface
 - The 7-method ChainAdapter interface for building, signing, and broadcasting transactions
 - How to configure the `SolanaAdapter` for devnet and mainnet
-- How Jupiter DEX integration enables token swaps
+- Which intent types are supported and which require a custom adapter
 - URL validation and SSRF protection for secure RPC connections
 :::
 
@@ -18,12 +18,12 @@ Currently, the SDK ships with one built-in adapter:
 
 | Blockchain | Adapter | Status |
 |---|---|---|
-| **Solana** | `SolanaAdapter` | Fully implemented (transfers, swaps) |
+| **Solana** | `SolanaAdapter` | Fully implemented (SOL + SPL token transfers) |
 | **Ethereum / EVM** | Not yet available | Planned for a future release |
 | **Other chains** | Implement `ChainAdapter` yourself | See the interface below |
 
 ::: tip
-If you are building on Solana, use `SolanaAdapter` -- it handles SOL transfers, SPL token transfers (USDC, USDT, etc.), and Jupiter-powered token swaps out of the box. For other blockchains, implement the `ChainAdapter` interface with your chain's specific SDK.
+If you are building on Solana, use `SolanaAdapter` -- it handles SOL transfers and SPL token transfers (USDC, USDT, etc.) with automatic Associated Token Account creation. For swaps, minting, staking, or other operations, implement a custom `ChainAdapter`. For other blockchains, implement the `ChainAdapter` interface with your chain's specific SDK.
 :::
 
 ## How Chain Adapters Work (Plain English)
@@ -69,7 +69,7 @@ interface ChainAdapter {
   getBalance(address: string, token: string): Promise<TokenBalance>;
 
   /** Get the current USD value of a token amount (for policy evaluation) */
-  // Converts a token amount to its USD equivalent using a price oracle (e.g., Jupiter).
+  // Converts a token amount to its USD equivalent using the configured price provider (e.g., Pyth).
   // The PolicyEngine calls this to evaluate spending limits denominated in USD.
   getValueInUSD(token: string, amount: string): Promise<number>;
 
@@ -144,7 +144,7 @@ For most use cases, "confirmed" is sufficient. Use "finalized" when irreversibil
 
 ## SolanaAdapter
 
-The `SolanaAdapter` is the production chain adapter for Solana. It uses `@solana/web3.js` for RPC communication, the Jupiter API for token swaps, and a pluggable `priceProvider` for USD price lookups (e.g., [Pyth oracle](/guide/oracles)).
+The `SolanaAdapter` is the production chain adapter for Solana. It uses `@solana/web3.js` for RPC communication and a pluggable `priceProvider` for USD price lookups (e.g., [Pyth oracle](/guide/oracles)). It supports `transfer` intents only -- for swaps, minting, staking, or other operations, implement a custom `ChainAdapter`.
 
 ```typescript
 // Import the SolanaAdapter, which is the built-in ChainAdapter implementation for Solana.
@@ -205,11 +205,11 @@ The default `"confirmed"` is appropriate for most use cases. Use `"finalized"` f
 | Operation | Intent Type | Status |
 |-----------|-------------|--------|
 | SOL transfers | `transfer` (token: `"SOL"`) | Fully implemented |
-| SPL token transfers | `transfer` (token: `"USDC"`, `"USDT"`, etc.) | Fully implemented |
-| Jupiter swaps | `swap` | Fully implemented |
-| NFT minting | `mint` | Not yet implemented |
-| Staking | `stake` | Not yet implemented |
-| Custom instructions | `custom` | Not yet implemented |
+| SPL token transfers | `transfer` (token: `"USDC"`, `"USDT"`, etc.) | Fully implemented (with automatic ATA creation) |
+| Token swaps | `swap` | Not supported -- throws `UNSUPPORTED_INTENT` (implement a custom `ChainAdapter`) |
+| NFT minting | `mint` | Not supported -- throws `UNSUPPORTED_INTENT` (implement a custom `ChainAdapter`) |
+| Staking | `stake` | Not supported -- throws `UNSUPPORTED_INTENT` (implement a custom `ChainAdapter`) |
+| Custom instructions | `custom` | Not supported -- throws `UNSUPPORTED_INTENT` (implement a custom `ChainAdapter`) |
 
 ### getBalance
 
@@ -226,7 +226,7 @@ const chain = new SolanaAdapter({ rpcUrl: "https://api.devnet.solana.com" });
 // Query native SOL balance for a specific wallet address.
 // Internally, this calls the Solana RPC's getBalance method and converts
 // lamports (1 SOL = 1,000,000,000 lamports) to a human-readable string.
-// The usdValue field is populated by querying the Jupiter Price API.
+// The usdValue field is populated by the configured priceProvider (e.g., Pyth oracle).
 const solBalance = await chain.getBalance(
   "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU", // Wallet address to query
   "SOL", // Token symbol -- "SOL" means native SOL
@@ -312,40 +312,14 @@ chain.isValidAddress("9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM"); // true
 chain.isValidAddress("not-a-valid-address");                              // false
 ```
 
-## Jupiter Swap Integration
+## Unsupported Intent Types
 
-The `SolanaAdapter` integrates with Jupiter for token swaps. When processing a `swap` intent:
+The `SolanaAdapter` only supports the `transfer` intent type. Any other intent type (`swap`, `mint`, `stake`, `custom`) throws an `UNSUPPORTED_INTENT` error. If your application needs swap, minting, staking, or other operations, you must implement a custom `ChainAdapter` that handles those intent types.
 
-1. **Quote**: Fetches a quote from the Jupiter Quote API with the specified input/output tokens and amount
-2. **Route**: Selects the best route based on output amount and slippage tolerance
-3. **Transaction**: Gets the swap transaction from Jupiter's swap endpoint
-4. **Build**: Returns the versioned transaction as an `UnsignedTransaction`
-
-::: tip WHAT IS JUPITER AND WHAT IS SLIPPAGE?
-**Jupiter** is a DEX (Decentralized Exchange) aggregator on Solana. Instead of trading on a single exchange, it searches across all Solana exchanges to find the best price for your swap. **Slippage** is the difference between the expected price and the actual price when the swap executes. Because prices change constantly, the `maxSlippage` parameter sets the maximum acceptable price change (e.g., 0.01 = 1%). If the price moves more than this amount between requesting and executing the swap, the transaction fails to protect you from bad pricing.
-:::
-
-The `maxSlippage` parameter in `SwapParams` controls the maximum acceptable price impact. If not specified, it defaults to 0.5% (0.005).
-
-```typescript
-// Execute a token swap through the AgentWallet.
-// This goes through the full pipeline: policy check -> build -> sign -> broadcast.
-const result = await wallet.execute({
-  type: "swap",        // Intent type -- triggers the Jupiter swap flow
-  chain: "solana",     // Chain identifier
-  params: {
-    fromToken: "SOL",  // The token to sell (input token)
-    toToken: "USDC",   // The token to buy (output token)
-    amount: "1.0",     // Amount of fromToken to swap (in human-readable units)
-    maxSlippage: 0.01, // 1% max slippage -- the transaction will fail if the price
-                       // moves more than 1% against you between quote and execution.
-                       // Lower values are safer but may cause more failed swaps.
-  },
-});
-```
+For example, to add Jupiter-based swap support, you would create a custom adapter that fetches quotes from the Jupiter API, builds the versioned swap transaction, and returns it as an `UnsignedTransaction`. The `ChainAdapter` interface section above describes the full contract your implementation must satisfy.
 
 ::: warning
-Jupiter swaps produce **versioned transactions** (v0), which require a signer that supports the versioned transaction format. `LocalSigner` handles both formats automatically.
+Passing a `swap`, `mint`, `stake`, or `custom` intent to `SolanaAdapter.buildTransaction()` will throw an error. This is by design -- the built-in adapter intentionally keeps a small, auditable surface area. Extend it via a custom `ChainAdapter` implementation.
 :::
 
 ## Manual Transaction Flow

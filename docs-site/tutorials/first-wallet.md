@@ -752,5 +752,5 @@ Now that you have a working wallet, you can:
 
 - [Build a Payment Agent with Claude](/tutorials/payment-agent) -- Connect your wallet to an AI assistant
 - [Explore the Policy Cookbook](/tutorials/policy-cookbook) -- Learn advanced policy configurations
-- [Add Telegram Approval](/tutorials/telegram-approval) -- Add human-in-the-loop oversight
+- [Add Approval Gates](/guide/rules/approval-gate) -- Add human-in-the-loop oversight with CallbackApprovalChannel or WebhookApprovalChannel
 - [Deploy to Production](/tutorials/production) -- Harden your setup for real use

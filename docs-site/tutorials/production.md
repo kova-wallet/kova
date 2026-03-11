@@ -175,7 +175,7 @@ interface WalletConfig {
   solanaSecretKey: string;       // Required: JSON-encoded byte array for the Solana keypair
   solanaRpcUrl: string;          // Required: Solana RPC endpoint URL
   dbPath: string;                // Required: file path for the SQLite database
-  approvalWebhookUrl?: string;    // Optional: Webhook URL for approval flows
+  approvalWebhookUrl?: string;   // Optional: Webhook URL for approval flows
   approvalHmacSecret?: string;   // Optional: HMAC secret for approval webhook signing
 }
 
@@ -201,8 +201,8 @@ function loadConfig(): WalletConfig {
     solanaSecretKey: required("SOLANA_SECRET_KEY"),   // Wallet keypair (never log this!)
     solanaRpcUrl: required("SOLANA_RPC_URL"),         // Private RPC recommended (Helius, QuickNode)
     dbPath: required("WALLET_DB_PATH"),               // SQLite database file path
-    telegramBotToken: optional("TELEGRAM_BOT_TOKEN"), // Only needed if using Telegram approval
-    telegramChatId: optional("TELEGRAM_CHAT_ID"),     // Only needed if using Telegram approval
+    approvalWebhookUrl: optional("APPROVAL_WEBHOOK_URL"),   // Only needed if using WebhookApprovalChannel
+    approvalHmacSecret: optional("APPROVAL_HMAC_SECRET"),   // Only needed if using WebhookApprovalChannel
   };
 }
 
@@ -470,8 +470,7 @@ const policy = Policy.create("production-policy")
     ],
   })
   .requireApproval({
-    above: { amount: "2.0", token: "SOL" },  // Approve via Telegram for >= 2 SOL
-    channel: "telegram",
+    above: { amount: "2.0", token: "SOL" },  // Require human approval for >= 2 SOL
     timeout: 300_000,                          // 5 minutes before auto-deny
   })
   .build();
@@ -488,7 +487,7 @@ const rules = [
   new TimeWindowRule(config.activeHours!),           // Check business hours
   new ApprovalGateRule(config.approvalGate!),        // Human approval for high-value txs
 ];
-// Pass the approval bot so the ApprovalGateRule can send Telegram messages.
+// Pass the approval channel so the ApprovalGateRule can request human approval.
 const engine = new PolicyEngine(rules, store, approvalBot);
 
 // --- Audit Logger ---
@@ -507,14 +506,14 @@ const logger = new AuditLogger({
 // Assemble the production wallet with ALL hardening features:
 //   - Persistent storage (SqliteStore)
 //   - Circuit breaker (auto-halt on consecutive denials)
-//   - Telegram approval (human-in-the-loop)
+//   - Callback-based approval (human-in-the-loop)
 //   - Audit failure alerting
 const wallet = new AgentWallet({
   signer,                    // Signs transactions with the local keypair
   chain,                     // Connects to Solana via private RPC
   policy: engine,            // Evaluates all 5 policy rules sequentially
   store,                     // Persistent SQLite store
-  approval: approvalBot,     // Telegram approval for high-value transactions
+  approval: approvalBot,     // Callback-based approval for high-value transactions
   logger,                    // SHA-256 hash chain audit log
   circuitBreaker: {
     threshold: 5,            // Open circuit after 5 consecutive denials
@@ -618,7 +617,7 @@ CMD ["node", "dist/index.js"]
     "restart_delay": 5000,
 
     // Environment variables passed to the process.
-    // Sensitive values (SOLANA_SECRET_KEY, TELEGRAM_BOT_TOKEN, etc.)
+    // Sensitive values (SOLANA_SECRET_KEY, APPROVAL_HMAC_SECRET, etc.)
     // should be loaded from a .env file or secrets manager, not hardcoded here.
     "env": {
       "NODE_ENV": "production",
@@ -638,7 +637,7 @@ Always run a single instance of the wallet agent. Running multiple instances aga
 
 2. **Running multiple instances of the wallet agent.** SQLite is designed for single-writer scenarios. If you run two instances of your wallet agent pointing at the same database file, you will get database locking errors and potentially corrupt data. Use `instances: 1` in PM2 and avoid horizontal scaling without a distributed database.
 
-3. **Hardcoding secrets in source code.** Never put your `SOLANA_SECRET_KEY`, `TELEGRAM_BOT_TOKEN`, or `ANTHROPIC_API_KEY` directly in your TypeScript files. Use environment variables, a `.env` file (excluded from version control), or a secrets manager like AWS Secrets Manager or HashiCorp Vault.
+3. **Hardcoding secrets in source code.** Never put your `SOLANA_SECRET_KEY`, `APPROVAL_HMAC_SECRET`, or `ANTHROPIC_API_KEY` directly in your TypeScript files. Use environment variables, a `.env` file (excluded from version control), or a secrets manager like AWS Secrets Manager or HashiCorp Vault.
 
 ## Troubleshooting
 
@@ -668,4 +667,4 @@ Always run a single instance of the wallet agent. Running multiple instances aga
 
 - [API Reference](/api/reference) -- Full configuration options for every component
 - [Policy Cookbook](/tutorials/policy-cookbook) -- Fine-tune your production policy
-- [Telegram Approval](/tutorials/telegram-approval) -- Detailed approval channel setup
+- [Custom Approval Channels](/tutorials/telegram-approval) -- Detailed approval channel setup

@@ -24,7 +24,7 @@ Think of `ApprovalGateRule` as an expense approval workflow. When your agent tri
 
 1. The rule checks the transaction amount against a threshold (e.g., 10 SOL).
 2. **If the amount is at or below the threshold**, the transaction is auto-approved -- no human needed.
-3. **If the amount is above the threshold**, the rule sends a notification (e.g., a Telegram message) to a human approver with details of the transaction.
+3. **If the amount is above the threshold**, the rule sends a notification (via the configured `ApprovalChannel`) to a human approver with details of the transaction.
 4. The system then **waits** for the human to respond with "approve" or "reject."
 5. If the human approves, the transaction proceeds. If they reject (or do not respond within the timeout), the transaction is denied.
 
@@ -49,7 +49,7 @@ Given a threshold of 10 SOL with a 5-minute timeout:
 
 ```typescript
 // Import the ApprovalGateRule class, which blocks high-value transactions
-// until a human approver grants permission (e.g., via Telegram).
+// until a human approver grants permission via the configured ApprovalChannel.
 import { ApprovalGateRule } from "kova";
 
 // Import the TypeScript types for configuring the approval gate.
@@ -70,7 +70,7 @@ interface ApprovalGateConfig {
   /** USD-denominated threshold (alternative to token-specific threshold) */
   aboveUSD?: UsdSpendingLimit;
   /** Channel type hint (optional, for documentation) */
-  channel?: "telegram" | "slack" | "custom";
+  channel?: string;
   /** Timeout in milliseconds. Defaults to 300,000 (5 minutes) */
   timeout?: number;
   /** Rolling window in seconds for cumulative amount tracking */
@@ -205,11 +205,11 @@ const store = new MemoryStore();
 
 // Create a callback-based approval channel.
 // You provide two callbacks: one to notify a human, one to wait for their decision.
-// This pattern works with any notification mechanism (Telegram, Slack, email, SMS, etc.).
+// This pattern works with any notification mechanism (Slack, email, SMS, etc.).
 const approval = new CallbackApprovalChannel({
   name: "my-approval",
   onApprovalRequest: async (request) => {
-    // Send a notification to a human (e.g., via Telegram, Slack, email).
+    // Send a notification to a human (e.g., via Slack, email, SMS).
     await notifyApprover(request);
   },
   waitForDecision: async (request) => {
@@ -327,7 +327,7 @@ const wallet = new AgentWallet({
 });
 
 // Example 1: Small transfer (5 SOL < 10 SOL threshold).
-// This bypasses the approval gate entirely — no Telegram message is sent.
+// This bypasses the approval gate entirely — no approval notification is sent.
 // The transaction is auto-approved by all rules and executed on-chain.
 const small = await wallet.execute({
   type: "transfer",
@@ -338,7 +338,7 @@ console.log("Small transfer:", small.status); // "confirmed" or "failed"
 
 // Example 2: Large transfer (15 SOL > 10 SOL threshold).
 // The rate limit and spending limit pass, but the ApprovalGateRule triggers.
-// A Telegram message is sent to the configured chat with approve/reject buttons.
+// An approval notification is sent through the configured ApprovalChannel.
 // The execute() call blocks until the human responds or the 5-minute timeout expires.
 const large = await wallet.execute({
   type: "transfer",

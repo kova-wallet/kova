@@ -4,9 +4,9 @@
 
 ## What You'll Build
 
-In this tutorial, you'll build a **Telegram tipping bot** that lets community members send SOL tips to each other (e.g., `/tip @user 0.05`). The bot is backed by a kova wallet with tight policy constraints. By the end you will have:
+In this tutorial, you'll build a **chat-based tipping bot** that lets community members send SOL tips to each other (e.g., `/tip @user 0.05`). The bot is backed by a kova wallet with tight policy constraints. The example below uses Telegram as the messaging platform, but the same pattern works with any chat service (Discord, Slack, etc.) -- the Telegram integration is your own code, not an SDK-provided component. By the end you will have:
 
-- A Telegram bot that parses tip commands and executes SOL transfers
+- A bot that parses tip commands and executes SOL transfers
 - Micro-payment policies (0.1 SOL max per tip, 2 SOL daily cap)
 - A custom **Per-Recipient Daily Cap** rule that prevents one user from draining the bot to a single address
 - Rate limiting to prevent abuse
@@ -22,7 +22,7 @@ This is a different pattern from the other tutorials: the agent is **user-trigge
 | **Node.js** | 18.0 or later | `node --version` |
 | **npm** | 9.0 or later | `npm --version` |
 | **TypeScript** | 5.0 or later | `npx tsc --version` |
-| **Telegram Bot Token** | — | Create via [@BotFather](https://t.me/BotFather) |
+| **Telegram Bot Token** (or other chat platform credentials) | — | Create via [@BotFather](https://t.me/BotFather) for Telegram |
 
 You should have completed the [Your First Agent Wallet](/tutorials/first-wallet) tutorial.
 
@@ -547,7 +547,7 @@ app.post("/telegram/webhook", async (req, res) => {
 ## See Also
 
 - [Your First Agent Wallet](/tutorials/first-wallet) -- basic wallet setup
-- [Telegram Approval](/tutorials/telegram-approval) -- human-in-the-loop approval via Telegram
+- [Approval Gates](/guide/rules/approval-gate) -- human-in-the-loop approval via CallbackApprovalChannel or WebhookApprovalChannel
 - [Custom Policy Rule](/tutorials/custom-policy-rule) -- building custom rules like `PerRecipientCapRule`
 - [Spending Limit](/guide/rules/spending-limit) -- per-transaction and daily spending caps
 - [Rate Limit](/guide/rules/rate-limit) -- transaction frequency limits

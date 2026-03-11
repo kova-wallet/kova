@@ -614,6 +614,6 @@ You now have a working Claude + kova integration. Here are three challenges to g
 ## Next Steps
 
 - [Policy Cookbook](/tutorials/policy-cookbook) -- Advanced policy configurations
-- [Telegram Approval](/tutorials/telegram-approval) -- Add human-in-the-loop for high-value transactions
+- [Approval Gates](/guide/rules/approval-gate) -- Add human-in-the-loop for high-value transactions with CallbackApprovalChannel or WebhookApprovalChannel
 - [OpenAI Integration](/guide/ai-integration/openai) -- Same pattern with GPT-4
 - [LangChain Integration](/guide/ai-integration/langchain) -- Use kova tools in LangChain agents

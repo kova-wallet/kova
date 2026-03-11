@@ -328,7 +328,7 @@ Optional metadata provides context for audit logging and approval requests. Thin
 ```typescript
 // IntentMetadata lets agents attach context to each transaction.
 // This metadata is NOT sent on-chain — it is stored in the local audit log
-// and included in approval requests (e.g., Telegram messages to the human approver).
+// and included in approval requests sent via the configured ApprovalChannel.
 interface IntentMetadata {
   /** Why the agent wants to perform this action */
   reason?: string;
@@ -342,7 +342,7 @@ interface IntentMetadata {
 Metadata is stored in the audit log and included in approval requests sent to humans. The `reason` field is particularly valuable -- it tells the human approver _why_ the agent wants to make the transaction.
 
 ::: tip Best practice: Always include a reason
-When a human approver receives a Telegram message asking "Approve 5 SOL transfer?", the `reason` field is what helps them decide. "Purchasing training data from vendor" is far more useful than no explanation at all. Make your agents explain themselves.
+When a human approver receives a notification asking "Approve 5 SOL transfer?", the `reason` field is what helps them decide. "Purchasing training data from vendor" is far more useful than no explanation at all. Make your agents explain themselves.
 :::
 
 ```typescript
@@ -357,7 +357,7 @@ const intent: TransactionIntent = {
     token: "SOL",
   },
   metadata: {
-    reason: "Purchasing training data from vendor",  // Human-readable justification shown in Telegram approval messages
+    reason: "Purchasing training data from vendor",  // Human-readable justification shown in approval request notifications
     agentId: "ml-pipeline-agent",                    // Identifies the specific agent (useful when multiple agents share a wallet)
     taskId: "task-2024-001",                         // Links this transaction to an external task/job ID for traceability
   },
