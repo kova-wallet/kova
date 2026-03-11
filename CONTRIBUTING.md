@@ -11,7 +11,7 @@ Thanks for your interest in contributing to kova! This guide covers everything y
 ## Setup
 
 ```bash
-git clone https://github.com/0xKeyserSoze/kova.git
+git clone https://github.com/kova-wallet/kova.git
 cd kova
 npm install
 ```
@@ -76,7 +76,7 @@ docs-site/        # VitePress documentation
 
 ## Security
 
-If you discover a security vulnerability, **do not** open a public issue. Instead, report it via [GitHub Security Advisory](https://github.com/0xKeyserSoze/kova/security/advisories/new).
+If you discover a security vulnerability, **do not** open a public issue. Instead, report it via [GitHub Security Advisory](https://github.com/kova-wallet/kova/security/advisories/new).
 
 ## License
 

@@ -72,11 +72,11 @@
   "author": "kova contributors",
   "repository": {
     "type": "git",
-    "url": "https://github.com/0xKeyserSoze/kova.git"
+    "url": "https://github.com/kova-wallet/kova.git"
   },
-  "homepage": "https://github.com/0xKeyserSoze/kova#readme",
+  "homepage": "https://github.com/kova-wallet/kova#readme",
   "bugs": {
-    "url": "https://github.com/0xKeyserSoze/kova/issues"
+    "url": "https://github.com/kova-wallet/kova/issues"
   },
   "sideEffects": false,
   "publishConfig": {
