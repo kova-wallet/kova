@@ -61,7 +61,7 @@ This tutorial shows you how to build a Claude-powered AI agent that can check wa
 #   kova              - The agent wallet SDK (policy engine, signers, chain adapters, tool definitions)
 #   @anthropic-ai/sdk - Official Anthropic SDK for calling the Claude Messages API
 #   @solana/web3.js   - Solana's JavaScript client for Keypair and address utilities
-npm install kova @anthropic-ai/sdk @solana/web3.js
+npm install @kova/wallet @anthropic-ai/sdk @solana/web3.js
 ```
 
 **Expected output:**
@@ -77,7 +77,7 @@ npm install -D typescript ts-node @types/node
 ```
 
 ::: details Troubleshooting: Installation issues
-**If you see `Cannot find module 'kova'`** -- Run `npm install kova` again from your project directory. Verify with `ls node_modules/kova`.
+**If you see `Cannot find module 'kova'`** -- Run `npm install @kova/wallet` again from your project directory. Verify with `ls node_modules/@kova/wallet`.
 
 **If you see `Cannot find module '@anthropic-ai/sdk'`** -- Run `npm install @anthropic-ai/sdk`. This is the official Anthropic SDK for calling the Claude Messages API.
 
@@ -98,12 +98,7 @@ import {
   MemoryStore,        // In-memory state store for dev/testing
   SolanaAdapter,      // Chain adapter for Solana (build tx, broadcast, query balance)
   Policy,             // Fluent builder for policy configuration
-  SpendingLimitRule,  // Enforces per-transaction and daily spending caps
-  AllowlistRule,      // Restricts which addresses can receive funds
-  RateLimitRule,      // Enforces max transactions per time window
-  PolicyEngine,       // Evaluates rules sequentially against each intent
-  AuditLogger,        // Records all transaction attempts in a tamper-evident hash chain
-} from "kova";
+} from "@kova/wallet";
 
 // ⚠️ SECURITY WARNING: Environment variables are NOT safe for private keys in production.
 // Keys in env vars are exposed via /proc/[pid]/environ, `ps e`, shell history, and logging systems.
@@ -116,9 +111,9 @@ const secretKey = Uint8Array.from(JSON.parse(process.env.SOLANA_SECRET_KEY!));
 const keypair = Keypair.fromSecretKey(secretKey);
 
 // Wrap the keypair in a LocalSigner so it implements the Signer interface.
-const signer = new LocalSigner(keypair); // Dev-only; throws in production unless KOVA_ALLOW_LOCAL_SIGNER=1
+const signer = new LocalSigner(keypair, { network: "devnet" });
 // Create an in-memory store for spending counters, rate limits, and audit logs.
-const store = new MemoryStore(); // Dev-only; throws in production unless KOVA_ALLOW_MEMORY_STORE=1
+const store = new MemoryStore({ dangerouslyAllowInProduction: true });
 // Connect to Solana devnet. The chain adapter handles all RPC communication.
 const chain = new SolanaAdapter({
   rpcUrl: "https://api.devnet.solana.com",  // Devnet RPC endpoint (free, rate-limited)
@@ -144,25 +139,14 @@ const policy = Policy.create("payment-agent-policy")
   })
   .build();
 
-// Extract the serialized policy config and create concrete rule instances.
-const config = policy.toJSON();
-const rules = [
-  new SpendingLimitRule(config.spendingLimit!),  // Checks per-tx and daily spending caps
-  new AllowlistRule(config.allowAddresses!),      // Checks recipient is on the approved list
-  new RateLimitRule(config.rateLimit!),            // Checks transaction frequency
-];
-// Create the policy engine that evaluates all rules for each transaction.
-const engine = new PolicyEngine(rules, store);
-// Create the audit logger for tamper-evident transaction recording.
-const logger = new AuditLogger(store);
-
 // Assemble the AgentWallet -- this is the single object Claude will interact with.
+// The Policy object handles rule evaluation internally.
 const wallet = new AgentWallet({
-  signer,         // Signs transactions before broadcast
-  chain,          // Builds and broadcasts Solana transactions
-  policy: engine, // Evaluates policy rules before allowing any transaction
-  store,          // Shared state for counters, audit log, and idempotency cache
-  logger,         // Records all transaction attempts in the hash chain
+  signer,                        // Signs transactions before broadcast
+  chain,                         // Builds and broadcasts Solana transactions
+  policy,                        // Evaluates policy rules before allowing any transaction
+  store,                         // Shared state for counters, audit log, and idempotency cache
+  dangerouslyDisableAuth: true,  // Skip auth for tutorial use
 });
 ```
 
@@ -182,7 +166,7 @@ Before moving on, verify:
 2. All packages are installed (`ls node_modules/kova node_modules/@anthropic-ai`)
 3. The code above compiles without errors in your editor
 
-If you see `Cannot find name 'AllowlistRule'`, update kova: `npm install kova@latest`.
+If you see `Cannot find name 'AllowlistRule'`, update kova: `npm install @kova/wallet@latest`.
 
 If you see `Error: Cannot read properties of undefined (reading 'fromSecretKey')`, your `SOLANA_SECRET_KEY` environment variable is not set or is not valid JSON.
 :::
@@ -233,7 +217,6 @@ The `toAnthropicTools()` method returns tool definitions in the exact format the
 // correctly call wallet operations without any additional prompt engineering.
 // Available tools include:
 //   wallet_get_balance           - Query token balance on-chain
-//   wallet_get_address           - Get the wallet's Solana public address
 //   wallet_get_policy            - Retrieve the active policy summary
 //   wallet_transfer              - Execute a SOL or SPL token transfer
 //   wallet_swap                  - Execute a token swap via Jupiter
@@ -575,23 +558,14 @@ async function viewAuditTrail() {
       console.log(`  Tx ID: ${entry.txId}`);
     }
     if (entry.error) {
-      // Error is present for denied and failed transactions.
-      // For denials: contains the policy violation (e.g., "ADDRESS_NOT_ALLOWED").
+      // Error is a TransactionError object with .code and .message properties.
+      // For denials: code contains the policy violation (e.g., "ADDRESS_NOT_ALLOWED").
       // For failures: contains the on-chain or network error.
-      console.log(`  Error: ${entry.error}`);
+      console.log(`  Error: ${entry.error.code} - ${entry.error.message}`);
     }
     console.log();
   }
 
-  // Verify the integrity of the audit log's SHA-256 hash chain.
-  // Each entry contains the hash of the previous entry. If any entry
-  // has been modified, inserted, or deleted, the chain will be broken.
-  // The parameter (20) specifies how many recent entries to verify.
-  const integrity = await logger.verifyIntegrity(20);
-  console.log("Audit integrity:", integrity.valid ? "VALID" : "BROKEN");
-  console.log("Entries checked:", integrity.entriesChecked);
-  // If integrity.valid is false, integrity.firstBrokenAt will indicate
-  // the index of the first corrupted entry.
 }
 
 // Call the audit trail function after the conversation completes.
@@ -641,12 +615,7 @@ import {
   MemoryStore,
   SolanaAdapter,
   Policy,
-  SpendingLimitRule,
-  AllowlistRule,
-  RateLimitRule,
-  PolicyEngine,
-  AuditLogger,
-} from "kova";
+} from "@kova/wallet";
 
 // --- Wallet Setup ---
 // ⚠️ SECURITY WARNING: Environment variables are NOT safe for private keys in production.
@@ -658,8 +627,8 @@ const secretKey = Uint8Array.from(JSON.parse(process.env.SOLANA_SECRET_KEY!));
 const keypair = Keypair.fromSecretKey(secretKey);
 
 // Create the signer, store, and chain adapter.
-const signer = new LocalSigner(keypair);          // Dev-only; throws in production unless KOVA_ALLOW_LOCAL_SIGNER=1
-const store = new MemoryStore();                   // Dev-only; throws in production unless KOVA_ALLOW_MEMORY_STORE=1
+const signer = new LocalSigner(keypair, { network: "devnet" });
+const store = new MemoryStore({ dangerouslyAllowInProduction: true });
 const chain = new SolanaAdapter({
   rpcUrl: "https://api.devnet.solana.com",         // Devnet RPC endpoint
   commitment: "confirmed",                          // Wait for supermajority confirmation
@@ -682,23 +651,14 @@ const policy = Policy.create("payment-agent-policy")
   })
   .build();
 
-// Create rule instances from the policy config and assemble the engine.
-const config = policy.toJSON();
-const rules = [
-  new SpendingLimitRule(config.spendingLimit!),  // Checks per-tx and daily caps
-  new AllowlistRule(config.allowAddresses!),      // Checks recipient is approved
-  new RateLimitRule(config.rateLimit!),            // Checks transaction frequency
-];
-const engine = new PolicyEngine(rules, store);     // Evaluates rules sequentially
-const logger = new AuditLogger(store);             // SHA-256 hash chain audit log
-
 // Assemble the wallet -- this is the object Claude interacts with via tools.
+// The Policy object handles rule evaluation internally.
 const wallet = new AgentWallet({
-  signer,         // Signs transactions
-  chain,          // Builds and broadcasts to Solana
-  policy: engine, // Enforces policy rules
-  store,          // Shared state
-  logger,         // Records all transaction attempts
+  signer,                        // Signs transactions
+  chain,                         // Builds and broadcasts to Solana
+  policy,                        // Enforces policy rules
+  store,                         // Shared state
+  dangerouslyDisableAuth: true,  // Skip auth for tutorial use
 });
 
 // --- Claude Integration ---
@@ -815,10 +775,6 @@ async function main() {
     console.log(`[${entry.timestamp}] ${entry.status.toUpperCase()} - ${entry.summary}`);
   }
 
-  // Verify the SHA-256 hash chain integrity of the audit log.
-  const integrity = await logger.verifyIntegrity(20);
-  console.log("\nAudit integrity:", integrity.valid ? "VALID" : "BROKEN");
-  console.log("Entries checked:", integrity.entriesChecked);
 }
 
 main().catch(console.error);

@@ -26,7 +26,7 @@ This guide covers hardening your agent wallet for production use. You will learn
 `MemoryStore` loses all data when your process restarts. For production, use `SqliteStore` which persists spending counters, rate limit windows, and audit logs to a SQLite database file.
 
 ```typescript
-import { SqliteStore } from "kova";
+import { SqliteStore } from "@kova/wallet";
 
 // SqliteStore is the production-ready Store implementation.
 // It persists all SDK state to a local SQLite database file using WAL
@@ -66,7 +66,7 @@ The single most important benefit: **your daily spending limit counter survives 
 The circuit breaker stops all transactions if too many consecutive failures occur. This protects against cascading failures, RPC outages, or unexpected errors.
 
 ```typescript
-import { AgentWallet, LocalSigner, SolanaAdapter, PolicyEngine, AuditLogger } from "kova";
+import { AgentWallet, LocalSigner, SolanaAdapter, Policy } from "@kova/wallet";
 
 // Configure the AgentWallet with a circuit breaker to protect against
 // cascading failures, RPC outages, or a runaway agent hammering the wallet
@@ -107,7 +107,7 @@ When the circuit breaker is open, ALL transactions are rejected, including small
 Configure a callback that fires when the audit logger detects integrity violations or consecutive write failures.
 
 ```typescript
-import { AuditLogger } from "kova";
+import { AuditLogger } from "@kova/wallet";
 
 // Configure the AuditLogger with failure alerting.
 // The audit logger is critical infrastructure: if it cannot write entries,
@@ -122,13 +122,13 @@ const logger = new AuditLogger({
   onAuditFailure: (error: unknown, consecutiveFailures: number) => {
     // This callback fires on each audit write failure.
     // Use it to alert your team via your preferred monitoring system.
-    console.error("[CRITICAL] Audit failure:", error.message);
+    console.error("[CRITICAL] Audit failure:", (error as Error).message);
 
     // Example: send a Slack alert to the #wallet-alerts channel.
     // Replace with your actual Slack webhook integration.
     sendSlackAlert({
       channel: "#wallet-alerts",
-      text: `Audit failure in kova: ${error.message}`,
+      text: `Audit failure in kova: ${(error as Error).message}`,
       severity: "critical",
     });
 
@@ -136,7 +136,7 @@ const logger = new AuditLogger({
     // Replace with your actual PagerDuty integration.
     triggerPagerDuty({
       summary: `kova audit integrity failure`,
-      details: error.message,
+      details: (error as Error).message,
     });
   },
 });
@@ -157,7 +157,7 @@ const wallet = new AgentWallet({
   onAuditFailure: (error: unknown, consecutiveFailures: number) => {
     // Called when the audit logger fails to write an entry.
     // consecutiveFailures tells you how many failures in a row have occurred.
-    console.error("[CRITICAL] Audit failure:", error.message);
+    console.error("[CRITICAL] Audit failure:", (error as Error).message);
     // Trigger alerts via Slack, PagerDuty, email, etc.
   },
 });
@@ -219,7 +219,7 @@ Never log secret keys. Never commit `.env` files. Use a secrets manager (AWS Sec
 Set up periodic integrity verification to detect any tampering with the audit log's <Term id="hash-chain" />.
 
 ```typescript
-import { AuditLogger } from "kova";
+import { AuditLogger } from "@kova/wallet";
 
 // monitorIntegrity() verifies the SHA-256 hash chain of the audit log.
 // Each entry includes the hash of the previous entry, forming a tamper-evident chain.
@@ -329,10 +329,11 @@ async function cleanupOldEntries(store: SqliteStore, maxAgeDays: number) {
   // Note: getRecent returns entries in reverse chronological order.
   const oldEntries = await store.getRecent("audit_log", 10000);
 
+  // getRecent returns string[] -- each entry must be parsed from JSON.
   // Filter for entries that are older than the cutoff date.
-  const toArchive = oldEntries.filter(
-    (entry) => new Date(entry.timestamp) < cutoffDate
-  );
+  const toArchive = oldEntries
+    .map((entry) => JSON.parse(entry))
+    .filter((parsed) => new Date(parsed.timestamp) < cutoffDate);
 
   if (toArchive.length > 0) {
     console.log(`Archiving ${toArchive.length} entries older than ${maxAgeDays} days`);
@@ -386,14 +387,8 @@ import {
   SqliteStore,           // Persistent storage (production-ready, unlike MemoryStore)
   SolanaAdapter,
   Policy,
-  SpendingLimitRule,
-  AllowlistRule,
-  RateLimitRule,
-  ApprovalGateRule,
-  PolicyEngine,
-  AuditLogger,
   CallbackApprovalChannel,
-} from "kova";
+} from "@kova/wallet";
 
 // --- Configuration ---
 // Helper to load required environment variables. Throws immediately if missing.
@@ -415,13 +410,14 @@ const store = new SqliteStore({
 const keypair = Keypair.fromSecretKey(
   Uint8Array.from(JSON.parse(required("SOLANA_SECRET_KEY")))
 );
-const signer = new LocalSigner(keypair);  // Dev-only; throws in production unless KOVA_ALLOW_LOCAL_SIGNER=1
+const signer = new LocalSigner(keypair, { network: "mainnet-beta" });  // Dev-only; throws in production unless KOVA_ALLOW_LOCAL_SIGNER=1
 
 // --- Chain ---
 // Use a private RPC endpoint in production (Helius, QuickNode, etc.)
 // to avoid public endpoint rate limits and improve reliability.
 const chain = new SolanaAdapter({
   rpcUrl: required("SOLANA_RPC_URL"),   // Private RPC endpoint URL
+  network: "mainnet-beta",              // Network identifier for address validation
   commitment: "confirmed",              // Wait for supermajority confirmation
 });
 
@@ -475,53 +471,27 @@ const policy = Policy.create("production-policy")
   })
   .build();
 
-// Create rule instances from the policy config in evaluation order.
-// Cheapest rules first for early short-circuit on denial.
-const config = policy.toJSON();
-const rules = [
-  new SpendingLimitRule(config.spendingLimit!),     // Check spending caps
-  new AllowlistRule({                                // Check recipient is approved
-    allowAddresses: config.allowAddresses,
-  }),
-  new RateLimitRule(config.rateLimit!),              // Check transaction frequency
-  new TimeWindowRule(config.activeHours!),           // Check business hours
-  new ApprovalGateRule(config.approvalGate!),        // Human approval for high-value txs
-];
-// Pass the approval channel so the ApprovalGateRule can request human approval.
-const engine = new PolicyEngine(rules, store, approvalBot);
-
-// --- Audit Logger ---
-// Tamper-evident hash chain logger with failure alerting.
-// If 3 consecutive writes fail, the logger blocks ALL transactions.
-const logger = new AuditLogger({
-  store,
-  maxConsecutiveFailures: 3,   // Lock down after 3 consecutive write failures
-  onAuditFailure: (error: unknown, consecutiveFailures: number) => {
-    console.error("[CRITICAL] Audit failure:", error.message);
-    // Send alert to your on-call team via Slack, PagerDuty, etc.
-  },
-});
-
 // --- Wallet ---
 // Assemble the production wallet with ALL hardening features:
 //   - Persistent storage (SqliteStore)
 //   - Circuit breaker (auto-halt on consecutive denials)
 //   - Callback-based approval (human-in-the-loop)
 //   - Audit failure alerting
+// The Policy object is passed directly -- AgentWallet creates rule instances internally.
 const wallet = new AgentWallet({
   signer,                    // Signs transactions with the local keypair
   chain,                     // Connects to Solana via private RPC
-  policy: engine,            // Evaluates all 5 policy rules sequentially
+  policy,                    // Policy object with all 5 rule types configured
   store,                     // Persistent SQLite store
   approval: approvalBot,     // Callback-based approval for high-value transactions
-  logger,                    // SHA-256 hash chain audit log
+  authToken: required("WALLET_AUTH_TOKEN"),  // Auth token for production use
   circuitBreaker: {
     threshold: 5,            // Open circuit after 5 consecutive denials
     cooldownMs: 60_000,      // 1 minute cooldown before auto-reset
   },
   onAuditFailure: (error: unknown, consecutiveFailures: number) => {
-    // Wallet-level audit failure handler (runs in addition to logger's handler).
-    console.error("[CRITICAL] Wallet audit failure:", error.message);
+    // Wallet-level audit failure handler.
+    console.error("[CRITICAL] Wallet audit failure:", (error as Error).message);
   },
 });
 
@@ -547,15 +517,6 @@ console.log("Address:", await wallet.getAddress());
 export { wallet };
 ```
 
-::: tip
-Add the missing `TimeWindowRule` import:
-```typescript
-// TimeWindowRule restricts when the agent can transact (e.g., business hours only).
-// Add this import alongside the others shown in the full example above.
-import { TimeWindowRule } from "kova";
-```
-The complete import list is shown in the full example above.
-:::
 
 ## Deployment Options
 

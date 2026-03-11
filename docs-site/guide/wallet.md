@@ -28,11 +28,11 @@ The `AgentWallet` class is the main entry point for the SDK. It wires together t
 // Import the main AgentWallet class from the kova SDK.
 // AgentWallet is the top-level object that orchestrates transaction execution,
 // policy enforcement, signing, and chain interaction.
-import { AgentWallet } from "kova";
+import { AgentWallet } from "@kova/wallet";
 
 // Import the TypeScript type for the wallet configuration object.
 // This type defines the shape of the options you pass when constructing an AgentWallet.
-import type { AgentWalletConfig } from "kova";
+import type { AgentWalletConfig } from "@kova/wallet";
 ```
 
 ### AgentWalletConfig
@@ -41,11 +41,11 @@ import type { AgentWalletConfig } from "kova";
 |-------|------|----------|-------------|
 | `signer` | `Signer` | Yes | The signer responsible for signing transactions (like the private key that authorizes payments from your bank account) |
 | `chain` | `ChainAdapter` | Yes | The chain adapter for blockchain interactions (the connection to the blockchain network -- similar to an API client for your bank) |
-| `policy` | `PolicyEngine` | Yes | The policy engine for evaluating transaction intents (your spending rules and approval workflows) |
+| `policy` | `Policy \| PolicyEngine` | Yes | The policy or policy engine for evaluating transaction intents (your spending rules and approval workflows) |
 | `store` | `Store` | Yes | The store for persisting spending counters and tx logs (the database that remembers how much has been spent today) |
 | `approval` | `ApprovalChannel` | No | Optional approval channel for human-in-the-loop (e.g., CallbackApprovalChannel or WebhookApprovalChannel) |
 | `logger` | `AuditLogger` | No | Optional audit logger. If not provided, one is created using the store |
-| `circuitBreaker` | `Partial<CircuitBreakerConfig> \| false` | No | Circuit breaker config. Set to `false` to disable. Default: `{ threshold: 5, cooldownMs: 300000 }` |
+| `circuitBreaker` | `Partial<CircuitBreakerConfig> \| { dangerouslyDisable: true } \| false` | No | Circuit breaker config. Use `{ dangerouslyDisable: true }` to disable (passing `false` is deprecated). Default: `{ threshold: 5, cooldownMs: 300000 }` |
 | `onAuditFailure` | `AuditFailureCallback` | No | Callback invoked when an audit log write fails |
 | `idempotencyTtl` | `number` | No | TTL for idempotency cache entries in seconds. Determines how long a duplicate intent ID returns a cached result instead of re-executing. Default: `86400` (24 hours) |
 | `idempotencyHmacKey` | `string \| Buffer` | No | HMAC-SHA256 key for verifying authenticity of cached idempotency entries. Prevents an attacker with store write access from forging cached "confirmed" results. Generate with `crypto.randomBytes(32).toString('hex')` and store securely -- not in the database |
@@ -56,6 +56,11 @@ import type { AgentWalletConfig } from "kova";
 | `authToken` | `string` | No | Capability token for caller authentication. When set, `execute()` and `handleToolCall()` require this token; calls without it are rejected with `AUTH_FAILED` |
 | `agentId` | `string` | No | Wallet-level agent identifier. Used for circuit breaker isolation and per-agent rate limiting instead of the self-reported `agentId` in intent metadata, which is untrusted |
 | `verboseErrors` | `boolean` | No | When `true`, policy denial messages include full details (amounts, limits, rule names) without sanitization. Useful for dashboards and development. **Do not enable for untrusted agent callers** -- detailed denials enable policy reconnaissance. Default: `false` |
+| `dangerouslyAllowVerboseErrorsInProduction` | `boolean` | No | When `true`, allows `verboseErrors` to be used in production environments. By default, `verboseErrors` is blocked in production to prevent policy reconnaissance |
+| `dangerouslyDisableAuth` | `boolean` | No | When `true`, disables authentication token checks on `execute()` and `handleToolCall()`. Only use for development or testing |
+| `storeTimeoutMs` | `number` | No | Timeout in milliseconds for individual store operations. Prevents the wallet from hanging on unresponsive store backends |
+| `strictAdvisoryLock` | `boolean` | No | When `true`, enforces strict advisory locking semantics on store operations |
+| `requireProgramAllowlistForCustom` | `boolean` | No | When `true`, requires a program allowlist to be configured when using `custom` intent types |
 
 ::: tip What is a circuit breaker?
 A circuit breaker is a safety mechanism borrowed from electrical engineering. If too many transactions are denied in a row (suggesting a bug or runaway loop), the circuit breaker "trips" and blocks ALL transactions for a cooldown period. This prevents a misbehaving agent from hammering the system with doomed requests.
@@ -66,19 +71,17 @@ A circuit breaker is a safety mechanism borrowed from electrical engineering. If
 ```typescript
 // Import all the core components needed to assemble a minimal AgentWallet.
 // AgentWallet: the main class that ties everything together.
-// PolicyEngine: evaluates rules against each transaction intent before allowing execution.
+// Policy: the fluent builder for declaring policy constraints.
 // MemoryStore: an in-memory implementation of the Store interface (good for development/testing; data is lost on restart).
 // LocalSigner: signs transactions using a local Solana keypair (NOT recommended for production with real funds).
 // SolanaAdapter: the chain adapter that knows how to build, send, and confirm Solana transactions.
-// SpendingLimitRule: a policy rule that enforces spending caps (per-transaction, daily, weekly, monthly).
 import {
   AgentWallet,
-  PolicyEngine,
+  Policy,
   MemoryStore,
   LocalSigner,
   SolanaAdapter,
-  SpendingLimitRule,
-} from "kova";
+} from "@kova/wallet";
 
 // Import the Keypair class from the Solana web3.js library.
 // Keypair represents a Solana public/private key pair used for signing transactions.
@@ -100,24 +103,21 @@ const signer = new LocalSigner(Keypair.generate());
 // broadcasting signed transactions, confirming them on-chain, and fetching balances.
 const chain = new SolanaAdapter({ rpcUrl: "https://api.devnet.solana.com" });
 
-// Create a PolicyEngine with a single SpendingLimitRule.
-// The policy engine holds an ordered list of rules and evaluates them sequentially
-// for every transaction intent. Here we set a per-transaction cap of 1 SOL.
-// The store is passed so the rule can persist and read spending counters.
-const engine = new PolicyEngine(
-  [new SpendingLimitRule({ perTransaction: { amount: "1", token: "SOL" } })],
-  store,
-);
+// Create a Policy using the fluent builder with a per-transaction cap of 1 SOL.
+// The Policy builder provides a declarative, chainable API for defining constraints.
+const policy = Policy.create("basic-policy")
+  .spendingLimit({ perTransaction: { amount: "1", token: "SOL" } })
+  .build();
 
 // Construct the AgentWallet by wiring together all the components.
 // - signer: signs transactions
 // - chain: builds and broadcasts transactions on Solana
-// - policy: the engine that enforces spending/rate/allowlist rules
+// - policy: the Policy that enforces spending/rate/allowlist rules
 // - store: shared persistence layer for counters and audit logs
 const wallet = new AgentWallet({
   signer,
   chain,
-  policy: engine,
+  policy,
   store,
 });
 ```
@@ -150,7 +150,7 @@ import {
   ApprovalGateRule,
   CallbackApprovalChannel,
   AuditLogger,
-} from "kova";
+} from "@kova/wallet";
 import { Keypair } from "@solana/web3.js";
 
 // Create a persistent SQLite-backed store.
@@ -423,7 +423,8 @@ Handle a tool call from an AI agent. This is the bridge between AI model tool ca
 // This is the bridge between AI agent tool calls and the wallet's internal methods.
 async handleToolCall(
   name: string,
-  input: Record<string, unknown>
+  input: Record<string, unknown>,
+  authToken?: string
 ): Promise<ToolCallResult>
 ```
 
@@ -478,7 +479,7 @@ To allow the AI agent to execute transactions, list the tools explicitly in `ena
 
 ```typescript
 // Import the main AgentWallet class.
-import { AgentWallet } from "kova";
+import { AgentWallet } from "@kova/wallet";
 
 const wallet = new AgentWallet({
   signer,
@@ -590,21 +591,42 @@ const response = await client.chat.completions.create({
 
 Every `execute()` call returns a `TransactionResult`. This object tells you exactly what happened -- whether the transaction succeeded, was blocked by policy, is waiting for approval, or failed for a technical reason.
 
+`TransactionResult` is a **discriminated union** on the `status` field. The available fields depend on the status:
+
 ```typescript
-interface TransactionResult {
-  /** "confirmed" | "denied" | "pending" | "failed" */
-  status: TransactionStatus;
-  /** Transaction ID / signature on the blockchain (if submitted) */
-  txId?: string;
-  /** Human-readable summary of what happened */
+// When status is "confirmed": has txId, NO error
+interface ConfirmedResult {
+  status: "confirmed";
+  txId: string;              // On-chain transaction ID / signature
   summary: string;
-  /** The intent ID this result corresponds to */
   intentId: string;
-  /** Timestamp when the result was produced */
   timestamp: number;
-  /** Error details if status is "failed" or "denied" */
-  error?: TransactionError;
+  chainData?: unknown;
+  warnings?: string[];
 }
+
+// When status is "denied" or "failed": may have error, NO txId
+interface DeniedOrFailedResult {
+  status: "denied" | "failed";
+  error?: TransactionError;  // Structured error details
+  summary: string;
+  intentId: string;
+  timestamp: number;
+  chainData?: unknown;
+  warnings?: string[];
+}
+
+// When status is "pending": NO txId, NO error
+interface PendingResult {
+  status: "pending";
+  summary: string;
+  intentId: string;
+  timestamp: number;
+  chainData?: unknown;
+  warnings?: string[];
+}
+
+type TransactionResult = ConfirmedResult | DeniedOrFailedResult | PendingResult;
 ```
 
 ### Status Values
@@ -632,15 +654,15 @@ The `error.code` field in `TransactionResult` uses one of the following `Transac
 | `APPROVAL_REJECTED` | Human approver rejected the transaction |
 | `APPROVAL_TIMEOUT` | Approval request timed out |
 | `INSUFFICIENT_BALANCE` | Wallet does not have enough funds |
-| `TRANSACTION_FAILED` | On-chain transaction failed (e.g., simulation error) |
+| `SIMULATION_FAILED` | Transaction simulation failed before broadcast |
+| `TRANSACTION_FAILED` | On-chain transaction failed |
 | `SIGNER_ERROR` | Signer failed to sign the transaction |
 | `CHAIN_ERROR` | Chain adapter encountered an error |
 | `STORE_ERROR` | Store operation failed (e.g., audit logging is broken) |
 | `CIRCUIT_BREAKER_OPEN` | Circuit breaker is blocking transactions after consecutive denials |
-| `UNKNOWN_ERROR` | Unexpected error |
-| `CHAIN_MISMATCH` | Transaction chain does not match the signer's configured chain |
 | `WALLET_DRAINING` | Wallet is shutting down via `drain()`; no new transactions accepted |
 | `AUTH_FAILED` | Invalid or missing authentication token |
+| `UNKNOWN_ERROR` | Unexpected error |
 
 ::: danger
 When `STORE_ERROR` is returned with "audit logging circuit breaker is open", **all transactions are blocked** until audit logging is restored. This is a safety feature -- the SDK refuses to process transactions without a functioning audit trail.
@@ -669,6 +691,6 @@ If multiple agents share the same `AgentWallet` instance and store, their spendi
 | `getAddress()` | `Promise<string>` | Get the wallet's public address (the address others send funds to) |
 | `getPolicy()` | `Promise<PolicySummary>` | Get a read-only summary of all policy constraints (limits, allowlists, rate limits) |
 | `getTransactionHistory(limit?)` | `Promise<TransactionResult[]>` | Fetch recent transactions from the audit log (default: 10, max: 1000) |
-| `handleToolCall(name, input)` | `Promise<ToolCallResult>` | Dispatch an AI model's tool call to the appropriate wallet method |
+| `handleToolCall(name, input, authToken?)` | `Promise<ToolCallResult>` | Dispatch an AI model's tool call to the appropriate wallet method |
 | `toAnthropicTools()` | `AnthropicTool[]` | Get tool definitions formatted for the Claude (Anthropic) API |
 | `toOpenAITools()` | `OpenAITool[]` | Get tool definitions formatted for the OpenAI API |

@@ -158,10 +158,7 @@ import {
   MemoryStore,        // In-memory persistence for counters and logs (development only -- lost on restart)
   SolanaAdapter,      // Connects to a Solana RPC endpoint and handles chain-specific operations
   Policy,             // Fluent builder for declaring policy constraints in a chainable API
-  PolicyEngine,       // Takes an ordered list of rules and evaluates them against each intent
-  SpendingLimitRule,  // Enforces per-transaction and periodic (daily/weekly/monthly) spending caps
-  RateLimitRule,      // Enforces max transactions per minute/hour using rolling time windows
-} from "kova";
+} from "@kova/wallet";
 
 // ── Step 1: Generate a keypair ──────────────────────────────────────────────
 // In production, you'd load an existing key from a secrets manager (AWS KMS,
@@ -193,18 +190,9 @@ const policy = Policy.create("my-agent")
   .rateLimit({ maxTransactionsPerMinute: 5 })
   .build();  // Finalize into an immutable Policy object
 
-// ── Step 4: Convert the policy config into rule instances ───────────────────
-// The builder creates a portable configuration; the rules are the runtime
-// enforcers. toJSON() extracts the config so we can instantiate each rule.
-const config = policy.toJSON();
-
-// Create the PolicyEngine with the rules in evaluation order.
-// Cheapest checks first (rateLimit is a simple counter) so expensive
-// checks (spendingLimit requires amount aggregation) are skipped on denial.
-const engine = new PolicyEngine([
-  new RateLimitRule(config.rateLimit!),          // Fast: counter check
-  new SpendingLimitRule(config.spendingLimit!),  // Slower: aggregates spending history
-], store);
+// ── Step 4: Wire everything into an AgentWallet ─────────────────────────────
+// The Policy builder can be passed directly to the AgentWallet constructor.
+// The wallet handles creating the PolicyEngine and rules internally.
 
 // ── Step 5: Wire everything into an AgentWallet ─────────────────────────────
 // AgentWallet is the single object that AI agents interact with.
@@ -215,7 +203,7 @@ const wallet = new AgentWallet({
   chain: new SolanaAdapter({
     rpcUrl: "https://api.devnet.solana.com",  // Solana devnet -- free test network
   }),
-  policy: engine,  // The policy engine that evaluates every transaction
+  policy,          // The Policy that enforces spending limits and rate limits
   store,           // Shared store for counters, audit logs, and idempotency
 });
 

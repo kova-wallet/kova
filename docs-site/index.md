@@ -36,7 +36,7 @@ features:
     details: "Every policy decision and transaction is recorded in a SHA-256 hash chain with HMAC integrity verification. Each entry references the previous hash, making it impossible to alter history undetected. A circuit breaker halts all transactions if audit logging fails."
     icon: "\U0001F50D"
   - title: "Solana with Pyth Oracles"
-    details: "Full Solana support: native SOL transfers, SPL token transfers, and token swaps. Built-in Pyth oracle integration for on-chain price feeds with configurable staleness and confidence thresholds. Chain-agnostic architecture means more chains can be added without changing your code."
+    details: "Full Solana support: native SOL transfers and SPL token transfers. Built-in Pyth oracle integration for on-chain price feeds with configurable staleness and confidence thresholds. Chain-agnostic architecture means more chains can be added without changing your code."
     icon: "\u26A1"
   - title: "TypeScript with Strict Mode"
     details: "Written entirely in TypeScript with strict mode enabled. Full type safety across intents, policies, results, and tool definitions. Every function parameter, return type, and configuration object is typed so your editor catches mistakes before your code runs."

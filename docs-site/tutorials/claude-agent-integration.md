@@ -89,7 +89,7 @@ sk-ant-...   (your key, partially shown)
 ## Step 1: Install Dependencies
 
 ```bash
-npm install kova @solana/web3.js @anthropic-ai/sdk
+npm install @kova/wallet @solana/web3.js @anthropic-ai/sdk
 ```
 
 **Expected output:**
@@ -99,7 +99,7 @@ added 15 packages in 4s
 ```
 
 ::: details Troubleshooting: Installation issues
-**If you see `Cannot find module 'kova'`** -- Run `npm install kova` again. Make sure you are in the correct project directory.
+**If you see `Cannot find module '@kova/wallet'`** -- Run `npm install @kova/wallet` again. Make sure you are in the correct project directory.
 
 **If you see `Cannot find module '@anthropic-ai/sdk'`** -- Run `npm install @anthropic-ai/sdk`. This is the official Anthropic SDK for Node.js.
 :::
@@ -116,18 +116,14 @@ import Anthropic from "@anthropic-ai/sdk";
 import {
   AgentWallet,
   Policy,
-  PolicyEngine,
-  SpendingLimitRule,
-  RateLimitRule,
-  AllowlistRule,
   LocalSigner,
   SolanaAdapter,
   MemoryStore,
-} from "kova";
+} from "@kova/wallet";
 
 // The private key stays on your server
 const keypair = Keypair.generate();
-const signer = new LocalSigner(keypair); // Dev-only; throws in production unless KOVA_ALLOW_LOCAL_SIGNER=1
+const signer = new LocalSigner(keypair, { network: "devnet" });
 
 // Define what the agent is allowed to do
 const policy = Policy.create("claude-agent")
@@ -139,26 +135,15 @@ const policy = Policy.create("claude-agent")
   .rateLimit({ maxTransactionsPerMinute: 5 })
   .build();
 
-// Build the engine from the policy config
-const store = new MemoryStore(); // Dev-only; throws in production unless KOVA_ALLOW_MEMORY_STORE=1
-const config = policy.toJSON();
-const rules = [];
-if (config.spendingLimit) rules.push(new SpendingLimitRule(config.spendingLimit));
-if (config.allowAddresses || config.denyAddresses) {
-  rules.push(new AllowlistRule({
-    allowAddresses: config.allowAddresses,
-    denyAddresses: config.denyAddresses,
-  }));
-}
-if (config.rateLimit) rules.push(new RateLimitRule(config.rateLimit));
-const engine = new PolicyEngine(rules, store);
+const store = new MemoryStore({ dangerouslyAllowInProduction: true });
 
 // Create the wallet — this is the single object that ties everything together
 const wallet = new AgentWallet({
   signer,
   chain: new SolanaAdapter({ rpcUrl: "https://api.devnet.solana.com" }),
-  policy: engine,
+  policy,
   store,
+  dangerouslyDisableAuth: true,
 });
 ```
 
@@ -176,11 +161,11 @@ None of this is exposed to Claude. The agent will only interact through tool sch
 
 ::: details Checkpoint -- Step 2
 Before moving on, verify that:
-1. You have `kova`, `@solana/web3.js`, and `@anthropic-ai/sdk` installed (`ls node_modules/kova`)
+1. You have `kova`, `@solana/web3.js`, and `@anthropic-ai/sdk` installed (`ls node_modules/@kova/wallet`)
 2. Your `ANTHROPIC_API_KEY` environment variable is set (`echo $ANTHROPIC_API_KEY`)
 3. The code above compiles without errors (no red squiggly lines in your editor)
 
-If you see `Cannot find name 'AllowlistRule'`, make sure you have the latest version of kova installed: `npm install kova@latest`.
+If you see `Cannot find name 'AllowlistRule'`, make sure you have the latest version of kova installed: `npm install @kova/wallet@latest`.
 :::
 
 ## Step 3: Export Tool Schemas for Claude
@@ -213,18 +198,28 @@ Here's what one tool schema looks like:
 }
 ```
 
-There are 8 tools total (6 safe by default, 2 dangerous opt-in):
+By default, only 2 read-only tools are enabled (`wallet_get_balance` and `wallet_get_transaction_history`). To enable write tools like `wallet_transfer`, you must explicitly opt in via `enabledTools`:
 
-| Tool | What it does |
-|------|-------------|
-| `wallet_transfer` | Send tokens to an address |
-| `wallet_swap` | Swap one token for another (e.g., SOL to USDC) |
-| `wallet_mint` | Mint an NFT |
-| `wallet_stake` | Stake tokens |
-| `wallet_execute_custom` | Execute arbitrary program instructions |
-| `wallet_get_balance` | Check token balance |
-| `wallet_get_policy` | View policy constraints |
-| `wallet_get_transaction_history` | View recent transactions |
+| Tool | What it does | Default |
+|------|-------------|---------|
+| `wallet_get_balance` | Check token balance | Enabled |
+| `wallet_get_transaction_history` | View recent transactions | Enabled |
+| `wallet_transfer` | Send tokens to an address | Opt-in |
+| `wallet_swap` | Swap one token for another (e.g., SOL to USDC) | Opt-in |
+| `wallet_get_policy` | View policy constraints | Opt-in |
+
+To enable write tools, pass `enabledTools` when generating tool schemas:
+
+```typescript
+const tools = wallet.toAnthropicTools({
+  enabledTools: [
+    "wallet_get_balance",
+    "wallet_get_transaction_history",
+    "wallet_get_policy",
+    "wallet_transfer",
+  ],
+});
+```
 
 ::: details What just happened?
 The `toAnthropicTools()` method generated a set of JSON descriptions that tell Claude: "Here are the things you can do, and here are the parameters each action needs." Claude uses these descriptions to understand what tools are available and how to call them correctly. Critically, these schemas contain zero sensitive information -- no private keys, no RPC URLs, no internal state. They are safe to send to the Claude API.
@@ -437,14 +432,10 @@ import Anthropic from "@anthropic-ai/sdk";
 import {
   AgentWallet,
   Policy,
-  PolicyEngine,
-  SpendingLimitRule,
-  RateLimitRule,
-  AllowlistRule,
   LocalSigner,
   SolanaAdapter,
   MemoryStore,
-} from "kova";
+} from "@kova/wallet";
 
 const TREASURY = "9aE4Uy6gzM..."; // your recipient address
 
@@ -452,7 +443,7 @@ const TREASURY = "9aE4Uy6gzM..."; // your recipient address
 
 function createWallet(): AgentWallet {
   const keypair = Keypair.generate();
-  const store = new MemoryStore(); // Dev-only; throws in production unless KOVA_ALLOW_MEMORY_STORE=1
+  const store = new MemoryStore({ dangerouslyAllowInProduction: true });
 
   const policy = Policy.create("claude-agent")
     .spendingLimit({
@@ -463,19 +454,12 @@ function createWallet(): AgentWallet {
     .rateLimit({ maxTransactionsPerMinute: 5 })
     .build();
 
-  const config = policy.toJSON();
-  const rules = [];
-  if (config.spendingLimit) rules.push(new SpendingLimitRule(config.spendingLimit));
-  if (config.allowAddresses) {
-    rules.push(new AllowlistRule({ allowAddresses: config.allowAddresses }));
-  }
-  if (config.rateLimit) rules.push(new RateLimitRule(config.rateLimit));
-
   return new AgentWallet({
-    signer: new LocalSigner(keypair), // Dev-only; throws in production unless KOVA_ALLOW_LOCAL_SIGNER=1
+    signer: new LocalSigner(keypair, { network: "devnet" }),
     chain: new SolanaAdapter({ rpcUrl: "https://api.devnet.solana.com" }),
-    policy: new PolicyEngine(rules, store),
+    policy,
     store,
+    dangerouslyDisableAuth: true,
   });
 }
 

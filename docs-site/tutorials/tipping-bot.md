@@ -72,7 +72,7 @@ import type {
   PolicyDecision,
   PolicyContext,
   TransactionIntent,
-} from "kova";
+} from "@kova/wallet";
 
 /**
  * PerRecipientCapRule — Limits how much can be sent to any single
@@ -166,11 +166,8 @@ import {
   LocalSigner,
   SqliteStore,
   SolanaAdapter,
-  PolicyEngine,
-  SpendingLimitRule,
-  RateLimitRule,
-  AuditLogger,
-} from "kova";
+  Policy,
+} from "@kova/wallet";
 import { Keypair } from "@solana/web3.js";
 
 // ── Bot wallet setup ────────────────────────────────────────────────────────
@@ -184,40 +181,39 @@ const chain = new SolanaAdapter({
 
 // In production, load this from an encrypted secrets store.
 const keypair = Keypair.generate();
-const signer = new LocalSigner(keypair); // Dev-only; throws in production unless KOVA_ALLOW_LOCAL_SIGNER=1
+const signer = new LocalSigner(keypair, { network: "devnet" });
 
 // ── Policy: tight limits for micro-payments ─────────────────────────────────
 
-const rules = [
-  // 1. Rate limit: prevent spam. 30 tips/min handles a busy chat.
-  new RateLimitRule({
+const policy = Policy.create("tipbot-policy")
+  .rateLimit({
+    // Prevent spam. 30 tips/min handles a busy chat.
     maxTransactionsPerMinute: 30,
     maxTransactionsPerHour: 200,
-  }),
-
-  // 2. Per-recipient cap: max 0.5 SOL to any single address per day.
-  // Prevents one user from draining the bot.
-  new PerRecipientCapRule({
-    maxPerRecipientDaily: "0.5",
-    token: "SOL",
-  }),
-
-  // 3. Spending limits: 0.1 SOL max per tip, 2 SOL daily total.
-  new SpendingLimitRule({
+  })
+  .spendingLimit({
+    // 0.1 SOL max per tip, 2 SOL daily total.
     perTransaction: { amount: "0.1", token: "SOL" },
     daily: { amount: "2", token: "SOL" },
-  }),
-];
+  })
+  .build();
 
-const engine = new PolicyEngine(rules, store);
-const logger = new AuditLogger(store);
-
+// The PerRecipientCapRule is a custom rule (see Step 1) that you can add
+// as additional middleware. Pass it via the customRules option.
 const wallet = new AgentWallet({
   signer,
   chain,
-  policy: engine,
+  policy,
   store,
-  logger,
+  dangerouslyDisableAuth: true,
+  customRules: [
+    // Per-recipient cap: max 0.5 SOL to any single address per day.
+    // Prevents one user from draining the bot.
+    new PerRecipientCapRule({
+      maxPerRecipientDaily: "0.5",
+      token: "SOL",
+    }),
+  ],
 });
 ```
 
@@ -442,8 +438,8 @@ async function main() {
 }
 
 // Graceful shutdown.
-process.on("SIGTERM", () => { store.close(); process.exit(0); });
-process.on("SIGINT", () => { store.close(); process.exit(0); });
+process.on("SIGTERM", () => { store.destroy(); process.exit(0); });
+process.on("SIGINT", () => { store.destroy(); process.exit(0); });
 
 main().catch(console.error);
 ```

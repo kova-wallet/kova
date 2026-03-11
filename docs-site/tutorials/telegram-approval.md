@@ -23,8 +23,8 @@ Both channels implement the `ApprovalChannel` interface. Security guarantees (TO
 ### Configuration
 
 ```typescript
-import { CallbackApprovalChannel } from "kova";
-import type { ApprovalRequest, ApprovalResult } from "kova";
+import { CallbackApprovalChannel } from "@kova/wallet";
+import type { ApprovalRequest, ApprovalResult } from "@kova/wallet";
 
 const channel = new CallbackApprovalChannel({
   // Optional name for audit logs (defaults to "callback").
@@ -108,7 +108,7 @@ The three decision values map to policy outcomes:
 ### Configuration
 
 ```typescript
-import { WebhookApprovalChannel } from "kova";
+import { WebhookApprovalChannel } from "@kova/wallet";
 
 const channel = new WebhookApprovalChannel({
   // URL to POST approval requests to. Must be HTTPS in production.
@@ -174,7 +174,7 @@ await channel.destroy();
 
 ## Wiring an Approval Channel into a Policy
 
-Both channel types are used the same way. Pass the channel to the `PolicyEngine` and configure an approval gate in your policy:
+Both channel types are used the same way. Pass the channel to `AgentWallet` and configure an approval gate in your policy:
 
 ```typescript
 import {
@@ -182,13 +182,8 @@ import {
   LocalSigner,
   MemoryStore,
   SolanaAdapter,
-  SpendingLimitRule,
-  RateLimitRule,
-  ApprovalGateRule,
-  PolicyEngine,
   Policy,
-  AuditLogger,
-} from "kova";
+} from "@kova/wallet";
 
 // Build a policy with an approval gate.
 const policy = Policy.create("approval-demo")
@@ -202,24 +197,15 @@ const policy = Policy.create("approval-demo")
   })
   .build();
 
-const store = new MemoryStore();
-const config = policy.toJSON();
-
-const rules = [
-  new SpendingLimitRule(config.spendingLimit!),
-  new ApprovalGateRule(config.approvalGate!),
-];
-
-// Pass the approval channel to the PolicyEngine.
-const engine = new PolicyEngine(rules, store, channel);
+const store = new MemoryStore({ dangerouslyAllowInProduction: true });
 
 const wallet = new AgentWallet({
-  signer: new LocalSigner(keypair),
-  chain: new SolanaAdapter({ rpcUrl: "https://api.devnet.solana.com" }),
-  policy: engine,
+  signer: new LocalSigner(keypair, { network: "devnet" }),
+  chain: new SolanaAdapter({ rpcUrl: "https://api.devnet.solana.com", network: "devnet" }),
+  policy,
   store,
   approval: channel,
-  logger: new AuditLogger(store),
+  dangerouslyDisableAuth: true,  // Dev-only; use authToken in production
 });
 ```
 
@@ -251,8 +237,8 @@ Never commit bot tokens or secrets to source control.
 ### Building the channel
 
 ```typescript
-import { CallbackApprovalChannel } from "kova";
-import type { ApprovalRequest, ApprovalResult } from "kova";
+import { CallbackApprovalChannel } from "@kova/wallet";
+import type { ApprovalRequest, ApprovalResult } from "@kova/wallet";
 
 const TELEGRAM_API = `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}`;
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID!;
@@ -377,7 +363,7 @@ async function pollTelegram(): Promise<void> {
 pollTelegram();
 ```
 
-Then pass `approvalChannel` to `PolicyEngine` and `AgentWallet` as shown in the wiring section above.
+Then pass `approvalChannel` to `AgentWallet` as shown in the wiring section above.
 
 ### Adapting for other platforms
 

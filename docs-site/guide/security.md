@@ -132,7 +132,7 @@ This is similar to how databases use write-ahead logs with commit/rollback. Phas
 
 When policy denials are returned to AI agents, the denial reasons are sanitized to prevent information leakage:
 
-- **Rule names** are replaced with generic labels (`"Rule 1"`, `"Rule 2"`) so agents cannot identify which specific rule blocked them
+- **Rule names** are replaced with the generic label `"policy rule"` so agents cannot identify which specific rule blocked them
 - **Threshold values** and counter details are stripped to prevent binary-search probing of limits
 - **Full details** are preserved in the audit log for human operators
 
@@ -214,7 +214,7 @@ This prevents secrets from appearing in logs, error reports, or audit entries.
 The SDK validates all inputs at the boundary before processing:
 
 - **Amount validation**: Rejects `NaN`, `Infinity`, `-Infinity`, negative values, and zero. Only finite positive numbers are accepted.
-- **Input length limits**: Addresses are limited to 128 characters, token symbols to 64, data fields to 1 MB, URIs to 2,048 characters, and reasons to 1,024 characters.
+- **Input length limits**: Addresses are limited to 128 characters, token symbols to 64, data fields to 64 KB (65,536 bytes), URIs to 2,048 characters, and reasons to 1,024 characters.
 - **Runtime type checks**: All tool handler inputs are validated with `typeof` checks before use. This prevents type confusion attacks from AI-generated inputs.
 
 ## SSRF Protection
@@ -258,7 +258,7 @@ Hash verification uses **timing-safe comparison** (`crypto.timingSafeEqual`) to 
 ```typescript
 // Import the AuditLogger and a store implementation.
 // AuditLogger manages the tamper-evident hash chain of audit entries.
-import { AuditLogger, MemoryStore } from "kova";
+import { AuditLogger, MemoryStore } from "@kova/wallet";
 
 // Create a store and an audit logger instance.
 // The audit logger writes entries to the store and maintains the hash chain.
@@ -313,7 +313,7 @@ The `CircuitBreaker` tracks consecutive policy denials and enters a cooldown per
 
 ```typescript
 // Import AgentWallet and configure it with a circuit breaker.
-import { AgentWallet } from "kova";
+import { AgentWallet } from "@kova/wallet";
 
 // Create a wallet with a circuit breaker that activates after 5 consecutive denials.
 // The circuit breaker is a safety mechanism that protects the system from runaway agents
@@ -352,7 +352,8 @@ Tx 7 → circuit resets, normal evaluation resumes
 ### Disabling the Circuit Breaker
 
 ```typescript
-// Explicitly disable the circuit breaker by passing `false`.
+// Explicitly disable the circuit breaker using { dangerouslyDisable: true }.
+// Passing `false` is deprecated — use the explicit form instead.
 // Without a circuit breaker, a runaway agent can submit unlimited denied requests.
 // This is NOT recommended for production — only use for testing or special cases.
 const wallet = new AgentWallet({
@@ -360,7 +361,7 @@ const wallet = new AgentWallet({
   chain,
   policy: engine,
   store,
-  circuitBreaker: false, // Explicitly disable — no cooldown after consecutive denials
+  circuitBreaker: { dangerouslyDisable: true }, // Explicitly disable — no cooldown after consecutive denials
 });
 ```
 

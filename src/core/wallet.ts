@@ -31,7 +31,9 @@ import { randomUUID, createHash, createHmac, timingSafeEqual, randomBytes } from
 import { isTransferIntent, isSwapIntent, isMintIntent, isStakeIntent, isCustomIntent } from "./intent.js";
 import type { TransactionIntent, IntentMetadata } from "./intent.js";
 import type { TokenBalance, TransactionResult, TransactionError, PolicySummary } from "./result.js";
-import type { PolicyEngine } from "../policy/engine.js";
+import { PolicyEngine } from "../policy/engine.js";
+import { Policy } from "../policy/builder.js";
+import type { PolicyRule } from "../policy/types.js";
 import type { Signer } from "../signers/interface.js";
 import type { Store } from "../stores/interface.js";
 import type { ChainAdapter } from "../chains/interface.js";
@@ -331,8 +333,13 @@ export interface AgentWalletConfig {
   signer: Signer;
   /** The chain adapter for blockchain interactions */
   chain: ChainAdapter;
-  /** The policy engine for evaluating transaction intents */
-  policy: PolicyEngine;
+  /**
+   * The policy for evaluating transaction intents.
+   * Accepts either a Policy object (from Policy.create().build()) or a PolicyEngine instance.
+   * When a Policy object is provided, the wallet automatically constructs the internal
+   * PolicyEngine from the policy configuration.
+   */
+  policy: Policy | PolicyEngine;
   /** The store for persisting spending counters and tx logs */
   store: Store;
   /** Optional approval channel for human-in-the-loop */
@@ -523,10 +530,47 @@ export class AgentWallet {
    */
   private readonly processId: string;
 
+  /**
+   * Build a PolicyEngine from a Policy object's configuration.
+   * Instantiates rule classes from the declarative config and wires up
+   * the store, approval channel, and price oracle.
+   */
+  private static buildEngineFromPolicy(
+    policy: Policy,
+    store: Store,
+    approval?: ApprovalChannel,
+    getValueInUSD?: (token: string, amount: string) => Promise<number>,
+  ): PolicyEngine {
+    const config = policy.getConfig();
+    const rules: PolicyRule[] = [];
+
+    if (config.spendingLimit) {
+      rules.push(new SpendingLimitRule(config.spendingLimit));
+    }
+    if (config.allowAddresses || config.denyAddresses || config.allowPrograms || config.denyPrograms) {
+      rules.push(new AllowlistRule({
+        allowAddresses: config.allowAddresses,
+        denyAddresses: config.denyAddresses,
+        allowPrograms: config.allowPrograms,
+        denyPrograms: config.denyPrograms,
+      }));
+    }
+    if (config.rateLimit) {
+      rules.push(new RateLimitRule(config.rateLimit));
+    }
+    if (config.activeHours) {
+      rules.push(new TimeWindowRule(config.activeHours));
+    }
+    if (config.approvalGate) {
+      rules.push(new ApprovalGateRule(config.approvalGate));
+    }
+
+    return new PolicyEngine(rules, store, approval, getValueInUSD);
+  }
+
   constructor(config: AgentWalletConfig) {
     this.signer = config.signer;
     this.chain = config.chain;
-    this.policy = config.policy;
     // STORE-005 fix: Auto-wrap store with PrefixedStore when storePrefix is configured.
     // This ensures per-wallet isolation of spending limits, rate counters, circuit breaker
     // state, audit logs, and idempotency keys when multiple wallets share a store backend.
@@ -548,6 +592,21 @@ export class AgentWallet {
       AgentWallet.unprefixedStores.add(config.store);
     }
     this.store = effectiveStore;
+    // Convert Policy to PolicyEngine if needed. Policy objects come from the
+    // public Policy.create().build() API. PolicyEngine instances come from
+    // advanced/internal usage.
+    if (config.policy instanceof Policy) {
+      // Extract getValueInUSD from chain adapter if available
+      const chainWithUsd = config.chain as { getValueInUSD?: (token: string, amount: string) => Promise<number> };
+      const getValueInUSD = typeof chainWithUsd.getValueInUSD === "function"
+        ? chainWithUsd.getValueInUSD.bind(chainWithUsd)
+        : undefined;
+      this.policy = AgentWallet.buildEngineFromPolicy(
+        config.policy, effectiveStore, config.approval, getValueInUSD,
+      );
+    } else {
+      this.policy = config.policy;
+    }
     // Create AuditLogger — use provided logger, or create one with config
     if (config.logger) {
       this.logger = config.logger;
@@ -710,8 +769,8 @@ export class AgentWallet {
     // spending limits can't assess true value, and allowlists can't evaluate recipients.
     // A compromised agent with this tool can bypass all semantic policy checks.
     if (this.enabledTools.has("wallet_execute_custom")) {
-      const rules = config.policy.getRules();
-      const hasAllowlistWithPrograms = rules.some((rule) => {
+      const rules = this.policy.getRules();
+      const hasAllowlistWithPrograms = rules.some((rule: PolicyRule) => {
         if (rule.name === "allowlist" && "getConfig" in rule) {
           const allowlistConfig = (rule as AllowlistRule).getConfig();
           return (allowlistConfig.allowPrograms && allowlistConfig.allowPrograms.length > 0) ||
@@ -744,7 +803,7 @@ export class AgentWallet {
       stake: "wallet_stake",
       custom: "wallet_execute_custom",
     };
-    const policyRules = config.policy.getRules();
+    const policyRules = this.policy.getRules();
     for (const rule of policyRules) {
       // SpendingLimitRule covers transfer, swap, stake intent types
       if (rule instanceof SpendingLimitRule) {

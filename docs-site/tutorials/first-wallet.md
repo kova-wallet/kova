@@ -44,10 +44,10 @@ cd my-agent-wallet
 npm init -y
 
 # Install runtime dependencies:
-#   kova           - The agent wallet SDK (policy engine, signers, chain adapters)
-#   @solana/web3.js - Solana's JavaScript client library (also bundled with kova,
+#   @kova/wallet    - The agent wallet SDK (policy engine, signers, chain adapters)
+#   @solana/web3.js - Solana's JavaScript client library (also bundled with @kova/wallet,
 #                     but listed explicitly here for direct Keypair usage)
-npm install kova @solana/web3.js
+npm install @kova/wallet @solana/web3.js
 
 # Install development dependencies:
 #   typescript     - The TypeScript compiler
@@ -73,7 +73,7 @@ Successfully created a tsconfig.json file.
 ::: details Troubleshooting: Installation issues
 **If you see `npm ERR! code EACCES`** -- You have a permissions issue. Try running with `sudo` or, better yet, [fix your npm permissions](https://docs.npmjs.com/resolving-eacces-permissions-errors-when-installing-packages-globally).
 
-**If you see `Cannot find module 'kova'` later** -- Make sure you ran `npm install kova` from inside the `my-agent-wallet` directory (not from your home directory). Run `ls node_modules/kova` to verify the package is installed.
+**If you see `Cannot find module '@kova/wallet'` later** -- Make sure you ran `npm install @kova/wallet` from inside the `my-agent-wallet` directory (not from your home directory). Run `ls node_modules/@kova/wallet` to verify the package is installed.
 
 **If `npx tsc --init` fails** -- Make sure TypeScript is installed as a dev dependency: `npm install -D typescript`.
 :::
@@ -105,11 +105,7 @@ import {
   MemoryStore,        // In-memory implementation of the Store interface (dev/testing only)
   SolanaAdapter,      // Chain adapter for Solana: builds, signs, and broadcasts transactions
   Policy,             // Fluent builder for creating policy configurations declaratively
-  SpendingLimitRule,  // Rule that enforces per-transaction and periodic spending caps
-  RateLimitRule,      // Rule that enforces maximum transactions per time window
-  PolicyEngine,       // Evaluates all policy rules sequentially against each transaction intent
-  AuditLogger,        // Records every policy decision in a tamper-evident SHA-256 hash chain
-} from "kova";
+} from "@kova/wallet";
 ```
 
 These imports cover:
@@ -119,11 +115,10 @@ These imports cover:
 - **LocalSigner** -- Signs transactions using a local <Term id="private-key">private key</Term>
 - **MemoryStore** -- In-memory state storage (good for development)
 - **SolanaAdapter** -- Connects to the Solana blockchain
-- **Policy, SpendingLimitRule, RateLimitRule, PolicyEngine** -- Policy enforcement components
-- **AuditLogger** -- Tamper-evident transaction logging
+- **Policy** -- Fluent builder for creating policy configurations declaratively
 
 ::: details What just happened?
-We imported ten building blocks from two packages. Think of these as Lego pieces: each one has a single job, and we are going to snap them together into a working wallet. You do not need to memorize every import right now -- each one will be explained when we use it.
+We imported six building blocks from two packages. Think of these as Lego pieces: each one has a single job, and we are going to snap them together into a working wallet. You do not need to memorize every import right now -- each one will be explained when we use it.
 :::
 
 ## Step 4: Generate a Solana Keypair
@@ -157,7 +152,7 @@ The <Term id="signer" /> is responsible for cryptographically signing transactio
 // The Signer interface exposes: getAddress(), sign(transaction), healthCheck(), destroy(), and toJSON().
 // LocalSigner holds the private key in memory -- suitable for development only.
 // In production, consider an MPC signer or hardware security module (HSM).
-const signer = new LocalSigner(keypair); // Dev-only; throws in production unless KOVA_ALLOW_LOCAL_SIGNER=1
+const signer = new LocalSigner(keypair, { network: "devnet" }); // Dev-only; throws in production unless KOVA_ALLOW_LOCAL_SIGNER=1
 ```
 
 ## Step 6: Create a MemoryStore
@@ -167,22 +162,22 @@ The <Term id="store" /> holds policy state such as spending counters, rate limit
 ```typescript
 // MemoryStore implements the Store interface with 7 methods:
 //   get(key), set(key, value), setIfNotExists(key, value), increment(key, amount),
-//   append(key, entry), getRecent(key, n), clearList(key) (optional)
+//   append(key, entry), getRecent(key, n), clearList(key)
 // It holds spending counters, rate limit windows, audit log entries, and idempotency
 // caches in JavaScript Maps. All data is lost when the process exits.
 // For production, switch to SqliteStore for persistence across restarts.
-const store = new MemoryStore(); // Dev-only; throws in production unless KOVA_ALLOW_MEMORY_STORE=1
+const store = new MemoryStore({ dangerouslyAllowInProduction: true }); // Dev-only; throws in production unless KOVA_ALLOW_MEMORY_STORE=1
 ```
 
 ::: details Checkpoint -- Steps 3 through 6
 At this point, your `first-wallet.ts` file should have:
-1. Two import statements at the top (one for `@solana/web3.js`, one for `kova`)
+1. Two import statements at the top (one for `@solana/web3.js`, one for `@kova/wallet`)
 2. A `keypair` variable created by `Keypair.generate()`
 3. A `console.log` printing the public key
 4. A `signer` variable wrapping the keypair
-5. A `store` variable created by `new MemoryStore()`
+5. A `store` variable created by `new MemoryStore({ dangerouslyAllowInProduction: true })`
 
-If you see red squiggly lines in your editor, make sure you ran `npm install kova @solana/web3.js` and that your `tsconfig.json` exists. A common fix is to set `"moduleResolution": "node"` in `tsconfig.json`.
+If you see red squiggly lines in your editor, make sure you ran `npm install @kova/wallet @solana/web3.js` and that your `tsconfig.json` exists. A common fix is to set `"moduleResolution": "node"` in `tsconfig.json`.
 :::
 
 ## Step 7: Create a SolanaAdapter
@@ -198,6 +193,7 @@ The <Term id="chain-adapter">chain adapter</Term> handles all blockchain-specifi
 const chain = new SolanaAdapter({
   rpcUrl: "https://api.devnet.solana.com",  // The Solana JSON-RPC endpoint to connect to.
                                              // Devnet is a free test network with no real funds.
+  network: "devnet",                         // Network identifier used for address validation and logging.
   commitment: "confirmed",                   // Confirmation level to wait for after broadcasting.
                                              // "confirmed" means 2/3+ of validators have confirmed
                                              // the transaction (~400ms). Other options: "finalized"
@@ -251,45 +247,11 @@ This policy enforces:
 You just defined the safety boundaries for your agent. The `Policy.create()` builder uses a "fluent" pattern -- you chain method calls together (`.spendingLimit(...)`, `.rateLimit(...)`, `.build()`), which reads almost like English. Once `.build()` is called, the policy is locked and cannot be changed. This immutability is a deliberate safety feature.
 :::
 
-## Step 9: Create Rule Instances and PolicyEngine
+## Step 9: Create the AgentWallet
 
-Extract the policy configuration and create concrete <Term id="policy-rule">rule instances</Term>. Then assemble them into a <Term id="policy-engine">`PolicyEngine`</Term> that evaluates every transaction against all rules.
-
-```typescript
-// Extract the raw configuration from the Policy object.
-// The "!" (non-null assertion) tells TypeScript these fields are defined
-// because we set them in the builder above.
-const config = policy.toJSON();
-
-// Instantiate concrete PolicyRule objects from the configuration.
-// Each rule implements evaluate(intent, store) -> ALLOW | DENY | PENDING.
-// Rules are evaluated in array order, so put the cheapest checks first.
-const rules = [
-  new SpendingLimitRule(config.spendingLimit!),  // Checks per-tx and daily spending caps
-  new RateLimitRule(config.rateLimit!),           // Checks per-minute transaction count
-];
-
-// PolicyEngine holds the rules and a reference to the store.
-// During wallet.execute(), the engine iterates through each rule.
-// If any rule returns DENY, the engine short-circuits and denies the intent.
-// If all rules return ALLOW, the intent proceeds to transaction building.
-const engine = new PolicyEngine(rules, store);
-```
-
-::: details What just happened?
-We took the policy configuration (a plain data object) and turned it into live rule objects that can actually evaluate transactions. The `PolicyEngine` runs these rules in order -- like a series of security checkpoints. A transaction must pass through every checkpoint to proceed.
-:::
-
-## Step 10: Create the AgentWallet
-
-Now combine all the pieces into an `AgentWallet`. This is the single object your AI agent interacts with.
+Now we have all the pieces ready. The `Policy` object built in Step 8 is passed directly to `AgentWallet` -- you do not need to manually create rule instances or a `PolicyEngine`. The wallet handles that internally.
 
 ```typescript
-// AuditLogger records every transaction attempt (allowed, denied, or failed)
-// in a tamper-evident SHA-256 hash chain. Each entry includes the hash of the
-// previous entry, making it impossible to modify or delete entries undetected.
-const logger = new AuditLogger(store);
-
 // AgentWallet is the single object your AI agent interacts with.
 // It wires together all the components and exposes a clean API:
 //   execute(intent)          - Run the full transaction pipeline
@@ -298,23 +260,21 @@ const logger = new AuditLogger(store);
 //   getPolicy()              - Get a summary of active policy rules
 //   getTransactionHistory(n) - Retrieve recent audit log entries
 const wallet = new AgentWallet({
-  signer,         // Signs transactions before they are broadcast to the network
-  chain,          // Builds and broadcasts Solana transactions via RPC
-  policy: engine, // Evaluates policy rules before allowing any transaction
-  store,          // Shared state store used by the engine, logger, and idempotency cache
-  logger,         // Records all transaction attempts for audit and compliance
+  signer,                          // Signs transactions before they are broadcast to the network
+  chain,                           // Builds and broadcasts Solana transactions via RPC
+  policy,                          // Policy object with spending limits and rate limits
+  store,                           // Shared state store used by the engine, logger, and idempotency cache
+  dangerouslyDisableAuth: true,    // Disable auth for this tutorial (do NOT use in production)
 });
 ```
 
-::: details Checkpoint -- Steps 7 through 10
+::: details Checkpoint -- Steps 7 through 9
 You now have all the core components created. Your file should contain:
 - `chain` -- a `SolanaAdapter` pointing at devnet
 - `policy` -- a built policy with spending and rate limits
-- `engine` -- a `PolicyEngine` with two rules (spending + rate limit)
-- `logger` -- an `AuditLogger` for tamper-evident logging
 - `wallet` -- an `AgentWallet` that ties everything together
 
-If TypeScript shows an error on `config.spendingLimit!` or `config.rateLimit!`, make sure your `.spendingLimit()` and `.rateLimit()` calls in Step 8 are present and that you called `.build()` at the end.
+If TypeScript shows an error, make sure your `.spendingLimit()` and `.rateLimit()` calls in Step 8 are present and that you called `.build()` at the end.
 :::
 
 ## Step 11: Check the Balance
@@ -433,9 +393,9 @@ An **intent** is a plain object that describes *what* you want to happen (send 0
     // the intent with an auto-generated UUID and timestamp.
   });
 
-  // The TransactionResult object has the following key fields:
+  // TransactionResult is a discriminated union on the status field:
   //   status   - "confirmed" | "denied" | "failed" | "pending"
-  //   txId     - Solana transaction signature (undefined if not submitted)
+  //   txId     - Solana transaction signature (only present when status is "confirmed")
   //   summary  - Human-readable description of what happened
   //   intentId - UUID that uniquely identifies this intent (for idempotency)
   console.log("Transfer status:", result.status);
@@ -510,19 +470,19 @@ The `TransactionResult` object contains everything you need.
   } else if (result.status === "denied") {
     // DENIED: One of the policy rules (spending limit, rate limit, allowlist,
     // time window, or approval gate) rejected the intent before it was signed.
-    // The error field contains the specific denial reason (e.g., "SPENDING_LIMIT_EXCEEDED").
-    console.log("Policy denied the transaction:", result.error);
+    // The error field is a TransactionError object with .code and .message properties.
+    console.log("Policy denied the transaction:", result.error.code, result.error.message);
   } else if (result.status === "failed") {
     // FAILED: The policy allowed the intent, but the on-chain transaction failed.
     // Common causes: insufficient balance, network error, or transaction timeout.
-    console.log("Transaction failed:", result.error);
+    console.log("Transaction failed:", result.error.code, result.error.message);
   }
 ```
 
 **Expected output (if confirmed):**
 
 ```
-Transaction confirmed at: 2025-01-15T10:30:00.000Z
+Transaction confirmed at: 1705312200000
 Intent ID: a1b2c3d4-e5f6-7890-abcd-ef1234567890
 ```
 
@@ -554,7 +514,7 @@ Retrieve recent transactions from the audit log.
   }
   // Expected output:
   //   Transaction history (1 entries):
-  //     [confirmed] Transferred 0.01 SOL to 1111...1111 (2025-01-15T10:30:00.000Z)
+  //     [confirmed] Transferred 0.01 SOL to 1111...1111 (1705312200000)
 }
 
 // Entry point: run the async main function and log any unhandled errors.
@@ -565,7 +525,7 @@ main().catch(console.error);
 
 ```
 Transaction history (1 entries):
-  [confirmed] Transferred 0.01 SOL to 1111...1111 (2025-01-15T10:30:00.000Z)
+  [confirmed] Transferred 0.01 SOL to 1111...1111 (1705312200000)
 ```
 
 If the transfer failed earlier due to insufficient funds, you will see `[failed]` instead of `[confirmed]`. Either way, the audit log recorded the attempt -- this is by design. Every transaction attempt is logged, whether it succeeded or not.
@@ -600,7 +560,7 @@ Transaction ID: undefined
 Summary: Transfer failed: Insufficient balance
 
 Transaction history (1 entries):
-  [failed] Transfer failed: Insufficient balance (2025-01-15T10:30:00.000Z)
+  [failed] Transfer failed: Insufficient balance (1705312200000)
 ```
 
 That is completely normal for a first run with no funding. To see a fully successful transfer, airdrop devnet SOL to the printed wallet address and run again.
@@ -627,11 +587,7 @@ import {
   MemoryStore,        // In-memory state store for dev/testing (not persistent)
   SolanaAdapter,      // Chain adapter that builds and broadcasts Solana transactions
   Policy,             // Fluent builder for creating policy configurations
-  SpendingLimitRule,  // Enforces per-transaction and daily spending caps
-  RateLimitRule,      // Enforces max transactions per time window
-  PolicyEngine,       // Evaluates all rules sequentially for each transaction intent
-  AuditLogger,        // Tamper-evident SHA-256 hash chain logger for all transaction attempts
-} from "kova";
+} from "@kova/wallet";
 
 async function main() {
   // 1. Generate a keypair (use a stored key in production)
@@ -641,12 +597,13 @@ async function main() {
 
   // 2. Create core components
   // LocalSigner wraps the keypair to implement the Signer interface.
-  const signer = new LocalSigner(keypair); // Dev-only; throws in production unless KOVA_ALLOW_LOCAL_SIGNER=1
+  const signer = new LocalSigner(keypair, { network: "devnet" }); // Dev-only; throws in production unless KOVA_ALLOW_LOCAL_SIGNER=1
   // MemoryStore holds spending counters, rate limits, and audit entries in memory.
-  const store = new MemoryStore(); // Dev-only; throws in production unless KOVA_ALLOW_MEMORY_STORE=1
+  const store = new MemoryStore({ dangerouslyAllowInProduction: true }); // Dev-only; throws in production unless KOVA_ALLOW_MEMORY_STORE=1
   // SolanaAdapter connects to devnet for building and broadcasting transactions.
   const chain = new SolanaAdapter({
     rpcUrl: "https://api.devnet.solana.com",  // Devnet RPC endpoint (free, rate-limited)
+    network: "devnet",                         // Network identifier used for address validation and logging
     commitment: "confirmed",                   // Wait for supermajority confirmation
   });
 
@@ -664,42 +621,31 @@ async function main() {
 
   console.log("Policy:", policy.getName());
 
-  // 4. Create rule instances and engine
-  // Extract config from the Policy, then create rule objects for the engine.
-  const config = policy.toJSON();
-  const rules = [
-    new SpendingLimitRule(config.spendingLimit!),  // Enforces per-tx and daily limits
-    new RateLimitRule(config.rateLimit!),           // Enforces per-minute transaction cap
-  ];
-  // PolicyEngine evaluates rules in order; first DENY stops the pipeline.
-  const engine = new PolicyEngine(rules, store);
-
-  // 5. Create the wallet
-  // AuditLogger records every transaction attempt in a hash chain.
-  const logger = new AuditLogger(store);
+  // 4. Create the wallet
   // AgentWallet is the single entry point for your AI agent.
+  // It wires together signer, chain, policy, and store internally.
   const wallet = new AgentWallet({
-    signer,         // Signs transactions with the local keypair
-    chain,          // Interacts with Solana via RPC
-    policy: engine, // Evaluates policy rules before any transaction
-    store,          // Shared state for counters, logs, and caches
-    logger,         // Records audit entries for every transaction attempt
+    signer,                          // Signs transactions with the local keypair
+    chain,                           // Interacts with Solana via RPC
+    policy,                          // Policy object with spending and rate limits
+    store,                           // Shared state for counters, logs, and caches
+    dangerouslyDisableAuth: true,    // Disable auth for this tutorial (do NOT use in production)
   });
 
-  // 6. Check balance (read-only, does not go through policy engine)
+  // 5. Check balance (read-only, does not go through policy engine)
   const balance = await wallet.getBalance("SOL");
   console.log("SOL balance:", balance.amount, balance.token);
   // Output: SOL balance: 0 SOL
 
-  // 7. View wallet address (read-only, delegates to signer.getAddress())
+  // 6. View wallet address (read-only, delegates to signer.getAddress())
   const address = await wallet.getAddress();
   console.log("Wallet address:", address);
 
-  // 8. View policy summary (read-only, aggregates info from all rules)
+  // 7. View policy summary (read-only, aggregates info from all rules)
   const policySummary = await wallet.getPolicy();
   console.log("Active policy:", JSON.stringify(policySummary, null, 2));
 
-  // 9. Execute a transfer through the full pipeline
+  // 8. Execute a transfer through the full pipeline
   // The intent describes "what" -- the SDK handles "how" (building the Solana tx).
   const result = await wallet.execute({
     type: "transfer",                                  // Operation type
@@ -715,16 +661,16 @@ async function main() {
   console.log("Transaction ID:", result.txId);
   console.log("Summary:", result.summary);
 
-  // 10. Handle result based on status
+  // 9. Handle result based on status
   if (result.status === "confirmed") {
-    console.log("Confirmed at:", result.timestamp);      // Transaction landed on-chain
+    console.log("Confirmed at:", result.timestamp);                   // Transaction landed on-chain (number)
   } else if (result.status === "denied") {
-    console.log("Denied:", result.error);                 // Policy rule rejected the intent
+    console.log("Denied:", result.error.code, result.error.message);  // Policy rule rejected the intent
   } else if (result.status === "failed") {
-    console.log("Failed:", result.error);                 // Allowed by policy but failed on-chain
+    console.log("Failed:", result.error.code, result.error.message);  // Allowed by policy but failed on-chain
   }
 
-  // 11. View transaction history from the audit log
+  // 10. View transaction history from the audit log
   const history = await wallet.getTransactionHistory(10);
   console.log(`\nTransaction history (${history.length} entries):`);
   for (const tx of history) {
@@ -744,7 +690,7 @@ Congratulations -- you have a working agent wallet. Here are three challenges to
 
 2. **Hit the rate limit.** Add a loop that calls `wallet.execute()` six times in rapid succession (more than the 5-per-minute limit). Watch the sixth transaction get denied with `RATE_LIMIT_EXCEEDED`. Try adding a 15-second delay between batches to see the limit reset.
 
-3. **Switch to persistent storage.** Replace `new MemoryStore()` with `new SqliteStore("./wallet.db")` (you will need to install the `better-sqlite3` package). Run the script twice and notice that the transaction history persists across runs. This is what you would use in production.
+3. **Switch to persistent storage.** Replace `new MemoryStore({ dangerouslyAllowInProduction: true })` with `new SqliteStore({ path: "./wallet.db" })` (you will need to install the `better-sqlite3` package). Run the script twice and notice that the transaction history persists across runs. This is what you would use in production.
 
 ## Next Steps
 

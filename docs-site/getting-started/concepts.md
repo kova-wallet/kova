@@ -59,8 +59,8 @@ import {
   LocalSigner,    // Signs transactions (dev: in-memory key; prod: use MpcSigner)
   MemoryStore,    // Persists counters and logs (dev: in-memory; prod: use SqliteStore)
   SolanaAdapter,  // Handles Solana-specific operations (build tx, broadcast, balance)
-  PolicyEngine,   // Evaluates policy rules against each transaction intent
-} from "kova";
+  Policy,         // Fluent builder for declaring policy constraints
+} from "@kova/wallet";
 
 // Create the wallet by wiring together all components.
 // Each component is a self-contained module with a clear interface.
@@ -279,7 +279,7 @@ interface Store {
   increment(key: string, amount: number): Promise<number>;  // Atomic counter increment
   append(key: string, value: string): Promise<void>;        // Append to a list (for sliding windows)
   getRecent(key: string, count: number): Promise<string[]>; // Read recent list entries
-  clearList?(key: string): Promise<void>;                   // Optional: clear a list
+  clearList(key: string): Promise<void>;                    // Clear a list (required)
 }
 ```
 

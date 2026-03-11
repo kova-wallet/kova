@@ -108,7 +108,7 @@ npm install @turnkey/sdk-server @turnkey/api-key-stamper
 Create a new file `turnkey-provider.ts`:
 
 ```typescript
-import type { MpcSigningProvider, MpcSignResult } from "kova";
+import type { MpcSigningProvider, MpcSignResult } from "@kova/wallet";
 import { Turnkey } from "@turnkey/sdk-server";
 import { ApiKeyStamper } from "@turnkey/api-key-stamper";
 
@@ -268,12 +268,8 @@ import {
   MpcSigner,
   SqliteStore,
   SolanaAdapter,
-  PolicyEngine,
   Policy,
-  SpendingLimitRule,
-  RateLimitRule,
-  AuditLogger,
-} from "kova";
+} from "@kova/wallet";
 import { TurnkeyProvider } from "./turnkey-provider";
 
 async function main() {
@@ -331,23 +327,13 @@ async function main() {
     .rateLimit({ maxTransactionsPerMinute: 10 })
     .build();
 
-  const config = policy.toJSON();
-  const engine = new PolicyEngine(
-    [
-      new RateLimitRule(config.rateLimit!),
-      new SpendingLimitRule(config.spendingLimit!),
-    ],
-    store,
-  );
-
-  const logger = new AuditLogger(store);
-
+  // The wallet creates the audit logger internally — no need to instantiate it yourself.
   const wallet = new AgentWallet({
     signer,          // MpcSigner backed by Turnkey -- no key in memory
     chain,
-    policy: engine,
+    policy,          // Policy built via Policy.create().build()
     store,
-    logger,
+    dangerouslyDisableAuth: true,  // Tutorial only — use authToken in production
   });
 
   // ── 6. Execute a transaction ───────────────────────────────────────────
@@ -368,8 +354,12 @@ async function main() {
   });
 
   console.log("Status:", result.status);
-  console.log("Transaction ID:", result.txId);
   console.log("Summary:", result.summary);
+  if (result.status === "confirmed") {
+    console.log("Transaction ID:", result.txId);
+  } else if (result.error) {
+    console.log("Error:", result.error.message);
+  }
 
   // ── 7. Verify in audit log ─────────────────────────────────────────────
   const history = await wallet.getTransactionHistory(5);
@@ -431,8 +421,8 @@ Here is a test suite for your `TurnkeyProvider` using mocks (no live API needed)
 
 ```typescript
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { MpcSigner, MpcSignerError } from "kova";
-import type { MpcSigningProvider, MpcSignResult } from "kova";
+import { MpcSigner, MpcSignerError } from "@kova/wallet";
+import type { MpcSigningProvider, MpcSignResult } from "@kova/wallet";
 
 // Mock provider that simulates Turnkey behavior without API calls.
 function createMockTurnkeyProvider(

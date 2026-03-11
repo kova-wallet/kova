@@ -13,7 +13,7 @@
 Before diving in, make sure you have:
 
 - **Node.js 18 or later** installed ([download here](https://nodejs.org/))
-- **kova installed** in your project (`npm install kova`)
+- **@kova/wallet installed** in your project (`npm install @kova/wallet`)
 - **A basic understanding of what an agent wallet is.** If you are new, start with [Your First Agent Wallet](/tutorials/first-wallet) first.
 - **Familiarity with TypeScript.** All examples use TypeScript, but the concepts apply to JavaScript too.
 
@@ -32,18 +32,12 @@ At the end, you will learn how to serialize policies to JSON and extend existing
 All examples use these imports:
 
 ```typescript
-// Import all policy-related components from kova.
+// Import all policy-related components from @kova/wallet.
 // These are used across every example in this cookbook.
 import {
   Policy,             // Fluent builder for creating policy configurations declaratively
-  SpendingLimitRule,  // Enforces per-transaction and periodic (daily/weekly/monthly) spending caps
-  AllowlistRule,      // Restricts which destination addresses or program IDs the agent can interact with
-  RateLimitRule,      // Enforces max transactions per minute/hour using rolling time windows
-  TimeWindowRule,     // Restricts when the agent can transact (e.g., business hours only)
-  ApprovalGateRule,   // Requires human approval for transactions above a configurable threshold
-  PolicyEngine,       // Evaluates an ordered list of rules against each transaction intent
   MemoryStore,        // In-memory Store implementation for dev/testing (state lost on restart)
-} from "kova";
+} from "@kova/wallet";
 ```
 
 ---
@@ -219,7 +213,7 @@ const businessHoursPolicy = Policy.create("business-hours-agent")
     timezone: "America/New_York",  // All times are interpreted in this timezone (IANA format)
     windows: [
       {
-        days: ["Mon", "Tue", "Wed", "Thu", "Fri"],  // Weekdays only -- no Sat/Sun
+        days: ["mon", "tue", "wed", "thu", "fri"],  // Weekdays only -- no Sat/Sun
         start: "09:00",  // 9:00 AM ET -- earliest the agent can transact
         end: "17:00",    // 5:00 PM ET -- latest the agent can transact
       },
@@ -259,7 +253,7 @@ const allowed = {
 
 ```typescript
 // This intent will be DENIED by the TimeWindowRule:
-//   - Saturday is not included in the ["Mon"..."Fri"] days list
+//   - Saturday is not included in the ["mon"..."fri"] days list
 //   - Even though the amount (0.5 SOL) and address are fine,
 //     the time window check runs before other rules and blocks it
 const denied = {
@@ -287,7 +281,7 @@ The timezone parameter uses the IANA timezone database format (e.g., `"America/N
 **Use case:** An agent that can handle small payments autonomously but requires human approval for anything above a threshold. Perfect for finance teams that want automation for routine payments with oversight for large ones.
 
 ```typescript
-import { CallbackApprovalChannel } from "kova";
+import { CallbackApprovalChannel } from "@kova/wallet";
 
 // Create a callback-based approval channel for human-in-the-loop approval.
 // When a high-value transaction is attempted, the channel notifies a human
@@ -329,17 +323,19 @@ const highValuePolicy = Policy.create("high-value-approval")
 **Creating the engine with approval:**
 
 ```typescript
-// Extract the policy config and create rule instances.
-const config = highValuePolicy.toJSON();
-const rules = [
-  new SpendingLimitRule(config.spendingLimit!),  // Check spending caps first (cheapest)
-  new RateLimitRule(config.rateLimit!),            // Check rate limits next
-  new ApprovalGateRule(config.approvalGate!),   // Approval gate runs last -- only for allowed intents
-];
-const store = new MemoryStore(); // Dev-only; throws in production unless KOVA_ALLOW_MEMORY_STORE=1
-// Pass the approvalBot as the third argument so the ApprovalGateRule can
-// send approval requests when a transaction exceeds the approval threshold.
-const engine = new PolicyEngine(rules, store, approvalBot);
+// Create a store for policy state (spending counters, rate limit windows, etc.).
+const store = new MemoryStore({ dangerouslyAllowInProduction: true }); // Dev-only
+
+// Pass the policy directly to AgentWallet along with the approval channel.
+// The wallet creates rule instances and the policy engine internally.
+const wallet = new AgentWallet({
+  signer,
+  chain,
+  policy: highValuePolicy,
+  store,
+  approval: approvalBot,
+  dangerouslyDisableAuth: true,  // Dev-only; use authToken in production
+});
 ```
 
 **Allowed intent (below threshold):**
@@ -550,7 +546,7 @@ Policies can be serialized to JSON for storage, version control, or sharing acro
 ```typescript
 // Node.js file system utilities for reading and writing policy files.
 import { writeFileSync, readFileSync } from "fs";
-import { Policy } from "kova";
+import { Policy } from "@kova/wallet";
 
 // Build a policy using the fluent builder.
 const policy = Policy.create("my-policy")
@@ -596,24 +592,14 @@ The serialized JSON looks like this:
 
 ```json
 {
-  // "name" identifies this policy in audit logs and UI. Must be unique per policy.
   "name": "my-policy",
-
-  // "spendingLimit" configures per-transaction and periodic spending caps.
-  // Amounts are strings to avoid floating-point precision issues.
   "spendingLimit": {
     "perTransaction": { "amount": "5.0", "token": "SOL" },
     "daily": { "amount": "50.0", "token": "SOL" }
   },
-
-  // "allowAddresses" restricts which Solana addresses can receive funds.
-  // Only base58-encoded public keys are accepted.
   "allowAddresses": [
     "9aE476sH92Vz7DMPyq5WLPkrKWivxeuTKEFKd2sZZcde"
   ],
-
-  // "rateLimit" configures transaction frequency caps.
-  // Uses rolling time windows (not fixed calendar windows).
   "rateLimit": {
     "maxTransactionsPerMinute": 10
   }
@@ -631,7 +617,7 @@ Store policy JSON files in version control alongside your application code. This
 Use `Policy.extend()` to derive a new policy from an existing one. The new policy inherits all settings from the base and lets you override or add rules.
 
 ```typescript
-import { Policy } from "kova";
+import { Policy } from "@kova/wallet";
 
 // Start with a liberal base policy that has high limits and no allowlist.
 // This serves as the "template" that we will derive stricter variants from.
@@ -706,7 +692,7 @@ This pattern is useful for:
 
 Here are three mistakes newcomers frequently make with policy configuration:
 
-1. **Forgetting to call `.build()`.** The `Policy.create()` method returns a builder, not a policy. If you pass the builder (instead of the built policy) to `PolicyEngine`, you will get a confusing runtime error. Always chain `.build()` at the end.
+1. **Forgetting to call `.build()`.** The `Policy.create()` method returns a builder, not a policy. If you pass the builder (instead of the built policy) to `AgentWallet`, you will get a confusing runtime error. Always chain `.build()` at the end.
 
 2. **Confusing `allowAddresses` with `allowPrograms`.** Address allowlists restrict *recipient wallets* (who receives the funds). Program allowlists restrict *which smart contracts* the agent can interact with (e.g., Jupiter for swaps). Using `allowAddresses` when you mean `allowPrograms` will cause all DeFi transactions to be denied, because the Jupiter program ID is not a wallet address.
 
@@ -723,7 +709,7 @@ Here are three mistakes newcomers frequently make with policy configuration:
 
 ### Policy loads from JSON but rules do not work
 
-Make sure you are creating rule instances from the loaded config. `Policy.fromJSON()` gives you a `Policy` object, but you still need to extract the config with `.toJSON()` and create `SpendingLimitRule`, `RateLimitRule`, etc. instances from it. The `Policy` object itself does not enforce rules -- the `PolicyEngine` with its rule instances does.
+Make sure you are passing the restored policy to `AgentWallet`. `Policy.fromJSON()` gives you a `Policy` object that can be passed directly to the wallet constructor. The wallet creates the necessary rule instances internally from the policy configuration.
 
 ## What to Try Next
 

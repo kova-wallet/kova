@@ -48,7 +48,7 @@ An RPC (Remote Procedure Call) endpoint is a URL that lets your application comm
 // - ChainAdapter: the interface all blockchain integrations must implement
 // - TransactionStatusResult: describes the on-chain status of a submitted transaction
 // - ChainTransactionStatus: a union type of possible transaction states
-import type { ChainAdapter, TransactionStatusResult, ChainTransactionStatus } from "kova";
+import type { ChainAdapter, TransactionStatusResult, ChainTransactionStatus } from "@kova/wallet";
 ```
 
 ```typescript
@@ -57,10 +57,10 @@ import type { ChainAdapter, TransactionStatusResult, ChainTransactionStatus } fr
 // is completely blockchain-agnostic -- you can swap Solana for Ethereum (or any
 // future chain) without changing the wallet or policy logic.
 interface ChainAdapter {
-  /** Chain identifier (e.g., "solana", "ethereum") */
-  // A readonly string that identifies which blockchain this adapter targets.
+  /** Chain identifier (e.g., "solana", "ethereum", "base", "system") */
+  // A readonly ChainId that identifies which blockchain this adapter targets.
   // Used in audit logs, policy rules, and transaction routing.
-  readonly chain: string;
+  readonly chain: ChainId;
 
   /** Get the wallet's balance for a specific token */
   // Queries the blockchain for the current balance of the given token at the
@@ -103,6 +103,25 @@ interface ChainAdapter {
   // For Solana, this verifies that the string is a valid base58-encoded public key.
   // Used by the SDK to catch invalid recipient addresses before building transactions.
   isValidAddress(address: string): boolean;
+
+  /** Verify that a built transaction matches the original intent */
+  // Required method. After building a transaction, the SDK calls this to verify
+  // that the transaction instructions match the intent (e.g., correct recipient,
+  // amount, and program). Prevents transaction substitution attacks.
+  verifyTransactionIntegrity(
+    intent: TransactionIntent,
+    transaction: UnsignedTransaction,
+    signerAddress: string,
+  ): Promise<void>;
+
+  /** Refresh the blockhash on a transaction (optional) */
+  // If a transaction's blockhash expires before broadcast, this method
+  // fetches a fresh blockhash and updates the transaction.
+  refreshBlockhash?(transaction: UnsignedTransaction): Promise<UnsignedTransaction>;
+
+  /** Clean up resources (optional) */
+  // Called during wallet shutdown to release RPC connections, timers, etc.
+  destroy?(): Promise<void>;
 }
 ```
 
@@ -149,7 +168,7 @@ The `SolanaAdapter` is the production chain adapter for Solana. It uses `@solana
 ```typescript
 // Import the SolanaAdapter, which is the built-in ChainAdapter implementation for Solana.
 // This is the only chain adapter currently shipped with kova.
-import { SolanaAdapter } from "kova";
+import { SolanaAdapter } from "@kova/wallet";
 ```
 
 ::: tip WHAT IS SOLANA?
@@ -328,7 +347,7 @@ While `AgentWallet.execute()` handles the full pipeline, you can use the chain a
 
 ```typescript
 // Import the chain adapter and signer for manual transaction construction.
-import { SolanaAdapter, LocalSigner } from "kova";
+import { SolanaAdapter, LocalSigner } from "@kova/wallet";
 import { Keypair } from "@solana/web3.js";
 
 // Step 0: Set up the chain adapter and signer.

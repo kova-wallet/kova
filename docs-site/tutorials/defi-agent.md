@@ -25,7 +25,7 @@ This tutorial walks you through building an agent that can execute <Term id="tok
 ```bash
 # Install kova (agent wallet SDK) and @solana/web3.js (Solana client library).
 # Note: Jupiter swap integration requires custom implementation — it is not built into SolanaAdapter.
-npm install kova @solana/web3.js
+npm install @kova/wallet @solana/web3.js
 ```
 
 ::: warning
@@ -44,11 +44,7 @@ import {
   MemoryStore,        // In-memory state store (use SqliteStore in production)
   SolanaAdapter,      // Chain adapter for Solana (Jupiter swap routing requires custom implementation)
   Policy,             // Fluent builder for policy configuration
-  SpendingLimitRule,  // Enforces per-transaction and daily spending caps
-  RateLimitRule,      // Enforces max transactions per time window
-  PolicyEngine,       // Evaluates all rules sequentially
-  AuditLogger,        // Tamper-evident audit log with SHA-256 hash chain
-} from "kova";
+} from "@kova/wallet";
 
 // ⚠️ SECURITY WARNING: Environment variables are NOT safe for private keys in production.
 // Keys in env vars are exposed via /proc/[pid]/environ, `ps e`, shell history, and logging systems.
@@ -59,8 +55,8 @@ const keypair = Keypair.fromSecretKey(
   Uint8Array.from(JSON.parse(process.env.SOLANA_SECRET_KEY!))
 );
 
-const signer = new LocalSigner(keypair);  // Dev-only; throws in production unless KOVA_ALLOW_LOCAL_SIGNER=1
-const store = new MemoryStore();           // Dev-only; throws in production unless KOVA_ALLOW_MEMORY_STORE=1
+const signer = new LocalSigner(keypair, { network: "devnet" });  // Dev-only; requires network option
+const store = new MemoryStore({ dangerouslyAllowInProduction: true });  // Dev-only; not for production use
 
 // Configure SolanaAdapter for the Solana network.
 // Note: Jupiter swap routing is NOT built into SolanaAdapter. To execute swaps,
@@ -90,22 +86,14 @@ const policy = Policy.create("defi-trader-policy")
   })
   .build();
 
-// Create rule instances and assemble the policy engine.
-const config = policy.toJSON();
-const rules = [
-  new SpendingLimitRule(config.spendingLimit!),  // Check spending caps first
-  new RateLimitRule(config.rateLimit!),            // Check rate limits second
-];
-const engine = new PolicyEngine(rules, store);
-const logger = new AuditLogger(store);  // Records all swap attempts in the hash chain
-
 // Assemble the DeFi agent wallet.
+// The wallet creates the audit logger internally — no need to instantiate it yourself.
 const wallet = new AgentWallet({
   signer,         // Signs swap transactions before broadcast
   chain,          // Builds Jupiter swap transactions and broadcasts to Solana
-  policy: engine, // Evaluates spending and rate limits before each swap
+  policy,         // Policy built via Policy.create().build() — evaluates spending and rate limits
   store,          // Shared state for counters and audit log
-  logger,         // Records every swap attempt (confirmed, denied, failed)
+  dangerouslyDisableAuth: true,  // Tutorial only — disable auth for local development
 });
 ```
 
@@ -121,12 +109,12 @@ async function main() {
 
   // Query the native SOL balance from the Solana blockchain.
   // getBalance("SOL") returns amount (human-readable), token name,
-  // decimals (9 for SOL), and optionally a USD value from Jupiter's price API.
+  // decimals (9 for SOL), and optionally a USD value if a priceProvider is configured in SolanaAdapterConfig.
   const solBalance = await wallet.getBalance("SOL");
   console.log(`SOL balance: ${solBalance.amount} ${solBalance.token}`);
   console.log(`  Decimals: ${solBalance.decimals}`);  // SOL has 9 decimal places (1 SOL = 1e9 lamports)
   if (solBalance.usdValue) {
-    // USD value is provided when the Jupiter price API is configured.
+    // USD value is provided when a priceProvider is configured in SolanaAdapterConfig.
     // This is useful for displaying portfolio value to users.
     console.log(`  USD value: $${solBalance.usdValue}`);
   }
@@ -146,10 +134,10 @@ SOL balance: 12.5 SOL
 ```
 
 ::: details What just happened?
-The `getBalance("SOL")` call made two requests behind the scenes:
+The `getBalance("SOL")` call queries behind the scenes:
 
 1. An RPC call to your Solana node to get the native SOL balance (returned in lamports -- the smallest unit of SOL, where 1 SOL = 1,000,000,000 lamports).
-2. A request to the Jupiter price API to look up the current SOL/USD price.
+2. If a `priceProvider` is configured in `SolanaAdapterConfig`, the SDK also fetches the current SOL/USD price to compute the USD value.
 
 The SDK converted the lamport balance to a human-readable decimal number and multiplied by the current price to give you the USD value. Read operations like `getBalance` bypass the policy engine entirely -- they go directly to the chain adapter.
 :::
@@ -214,12 +202,12 @@ Now execute a swap of 1 SOL to USDC via Jupiter. The swap intent uses the `"swap
   console.log("Transaction ID:", swapResult.txId);      // Solana transaction signature
   console.log("Summary:", swapResult.summary);           // Human-readable description of the swap
   console.log("Intent ID:", swapResult.intentId);        // UUID for idempotency and tracing
-  console.log("Timestamp:", swapResult.timestamp);       // ISO 8601 timestamp of completion
+  console.log("Timestamp:", new Date(swapResult.timestamp).toISOString());  // timestamp is ms since epoch
   // Output:
   //   Swap status: confirmed
   //   Transaction ID: 2nKz8...def
   //   Summary: Swapped 1.0 SOL for ~200.50 USDC via Jupiter
-  //   Intent ID: intent_abc123
+  //   Intent ID: a1b2c3d4-e5f6-7890-abcd-ef1234567890
   //   Timestamp: 2025-01-15T14:30:00.000Z
 ```
 
@@ -230,20 +218,20 @@ Now execute a swap of 1 SOL to USDC via Jupiter. The swap intent uses the `"swap
 Swap status: confirmed
 Transaction ID: 2nKz8...def
 Summary: Swapped 1.0 SOL for ~200.50 USDC via Jupiter
-Intent ID: intent_abc123
+Intent ID: a1b2c3d4-e5f6-7890-abcd-ef1234567890
 Timestamp: 2025-01-15T14:30:00.000Z
 ```
 
 ::: details What just happened?
 Here is the full pipeline that your swap went through:
 
-1. **Policy evaluation:** The `PolicyEngine` checked spending limits (1 SOL is under the 10 SOL cap) and rate limits (not exceeded). Both rules returned ALLOW.
-2. **Jupiter quote:** Your custom implementation called the Jupiter quote API (`https://quote-api.jup.ag/v6/quote`) to find the best swap route. Jupiter compared prices across all available liquidity pools (Raydium, Orca, etc.) and returned the route with the best price.
+1. **Policy evaluation:** The policy checked spending limits (1 SOL is under the 10 SOL cap) and rate limits (not exceeded). Both rules returned ALLOW.
+2. **Jupiter quote:** Your custom implementation called the Jupiter quote API to find the best swap route. Jupiter compared prices across all available liquidity pools (Raydium, Orca, etc.) and returned the route with the best price.
 3. **Transaction building:** The Jupiter swap API was used to build a Solana transaction containing the swap instructions.
 4. **Signing:** The `LocalSigner` signed the transaction with your wallet's private key.
 5. **Broadcasting:** The adapter submitted the signed transaction to the Solana network via your RPC endpoint.
 6. **Confirmation:** The adapter waited for the transaction to reach "confirmed" status (supermajority of validators have seen it).
-7. **Audit logging:** The `AuditLogger` recorded the entire operation in the tamper-evident hash chain.
+7. **Audit logging:** The wallet internally recorded the entire operation in the tamper-evident hash chain.
 
 The `~200.50 USDC` in the summary is approximate because the exact amount depends on the real-time price at the moment the swap executed.
 :::
@@ -315,7 +303,7 @@ Swap some USDC back to SOL. Note that when swapping from a token, the `amount` r
 
   // Check for policy denial -- useful for debugging when swaps are rejected.
   if (reverseSwapResult.status === "denied") {
-    console.log("Denied reason:", reverseSwapResult.error);
+    console.log("Denied reason:", reverseSwapResult.error?.message);
     // Possible denial reasons:
     //   SPENDING_LIMIT_EXCEEDED  - Amount exceeds per-tx or daily cap
     //   RATE_LIMIT_EXCEEDED      - Too many swaps in the time window
@@ -336,7 +324,7 @@ Retrieve and display all transactions the agent has executed.
   for (const tx of history) {
     console.log(`\n[${tx.status.toUpperCase()}] ${tx.summary}`);
     console.log(`  Intent ID:  ${tx.intentId}`);    // UUID for tracing and idempotency
-    console.log(`  Timestamp:  ${tx.timestamp}`);    // ISO 8601 timestamp
+    console.log(`  Timestamp:  ${new Date(tx.timestamp).toISOString()}`);  // timestamp is ms since epoch
     if (tx.txId) {
       // Provide the Solana transaction signature and a link to the block explorer.
       // Solscan is a popular Solana block explorer for viewing transaction details.
@@ -344,20 +332,20 @@ Retrieve and display all transactions the agent has executed.
       console.log(`  Explorer:   https://solscan.io/tx/${tx.txId}`);
     }
     if (tx.error) {
-      console.log(`  Error:      ${tx.error}`);      // Present for denied/failed transactions
+      console.log(`  Error:      ${tx.error?.message}`);  // TransactionError object with .code and .message
     }
   }
   // Output:
   //   === Transaction History (2 entries) ===
   //
   //   [CONFIRMED] Swapped 1.0 SOL for ~200.50 USDC via Jupiter
-  //     Intent ID:  intent_abc123
+  //     Intent ID:  a1b2c3d4-e5f6-7890-abcd-ef1234567890
   //     Timestamp:  2025-01-15T14:30:00.000Z
   //     Tx ID:      2nKz8...def
   //     Explorer:   https://solscan.io/tx/2nKz8...def
   //
   //   [CONFIRMED] Swapped 100.0 USDC for ~0.498 SOL via Jupiter
-  //     Intent ID:  intent_def456
+  //     Intent ID:  b2c3d4e5-f6a7-8901-bcde-f12345678901
   //     Timestamp:  2025-01-15T14:31:00.000Z
   //     Tx ID:      7pLm3...ghi
   //     Explorer:   https://solscan.io/tx/7pLm3...ghi
@@ -369,10 +357,9 @@ The audit logger maintains a tamper-evident chain of entries. Verify that no ent
 
 ```typescript
   // Verify the tamper-evident SHA-256 hash chain of the audit log.
-  // Each audit entry contains a hash of the previous entry. If any entry
-  // is modified, deleted, or inserted, the chain will be broken.
-  // This check verifies the last 20 entries for integrity.
-  const integrity = await logger.verifyIntegrity(20);
+  // The wallet manages the AuditLogger internally — use wallet.verifyAuditIntegrity()
+  // to check that no entries have been modified, deleted, or inserted.
+  const integrity = await wallet.verifyAuditIntegrity(20);
   console.log("\n=== Audit Integrity Report ===");
   console.log("Valid:", integrity.valid);              // true if entire chain is intact
   console.log("Entries checked:", integrity.entriesChecked);
@@ -407,11 +394,7 @@ import {
   MemoryStore,
   SolanaAdapter,
   Policy,
-  SpendingLimitRule,
-  RateLimitRule,
-  PolicyEngine,
-  AuditLogger,
-} from "kova";
+} from "@kova/wallet";
 
 // USDC SPL token mint address on Solana mainnet.
 const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
@@ -423,8 +406,8 @@ async function main() {
   const keypair = Keypair.fromSecretKey(
     Uint8Array.from(JSON.parse(process.env.SOLANA_SECRET_KEY!))
   );
-  const signer = new LocalSigner(keypair);       // Dev-only; throws in production unless KOVA_ALLOW_LOCAL_SIGNER=1
-  const store = new MemoryStore();                // Dev-only; throws in production unless KOVA_ALLOW_MEMORY_STORE=1
+  const signer = new LocalSigner(keypair, { network: "devnet" });  // Dev-only; requires network option
+  const store = new MemoryStore({ dangerouslyAllowInProduction: true });  // Dev-only; not for production use
   // Note: Jupiter swap routing requires custom implementation — it is not built into SolanaAdapter.
   // See https://station.jup.ag/docs for Jupiter API integration details.
   const chain = new SolanaAdapter({
@@ -446,17 +429,10 @@ async function main() {
   })
     .build();
 
-  // Create rule instances, engine, logger, and wallet.
-  const config = policy.toJSON();
-  const rules = [
-    new SpendingLimitRule(config.spendingLimit!),
-    new RateLimitRule(config.rateLimit!),
-  ];
-  const engine = new PolicyEngine(rules, store);
-  const logger = new AuditLogger(store);
-
+  // Create the wallet — audit logger is created internally by the wallet.
   const wallet = new AgentWallet({
-    signer, chain, policy: engine, store, logger,
+    signer, chain, policy, store,
+    dangerouslyDisableAuth: true,  // Tutorial only — disable auth for local development
   });
 
   // --- Check initial balances ---
@@ -475,8 +451,11 @@ async function main() {
     type: "swap", chain: "solana",
     params: { fromToken: "SOL", toToken: USDC_MINT, amount: "1.0", maxSlippage: 0.01 },
   });
-  console.log(`Status: ${swap1.status} | Tx: ${swap1.txId}`);
+  console.log(`Status: ${swap1.status}`);
   console.log(`Summary: ${swap1.summary}`);
+  if (swap1.status === "confirmed") {
+    console.log(`Tx: ${swap1.txId}`);
+  }
 
   // Verify balances changed after the swap.
   const updatedSol = await wallet.getBalance("SOL");
@@ -489,8 +468,11 @@ async function main() {
     type: "swap", chain: "solana",
     params: { fromToken: USDC_MINT, toToken: "SOL", amount: "100.0", maxSlippage: 0.01 },
   });
-  console.log(`Status: ${swap2.status} | Tx: ${swap2.txId}`);
+  console.log(`Status: ${swap2.status}`);
   console.log(`Summary: ${swap2.summary}`);
+  if (swap2.status === "confirmed") {
+    console.log(`Tx: ${swap2.txId}`);
+  }
 
   // --- Transaction history with explorer links ---
   const history = await wallet.getTransactionHistory(20);
@@ -501,7 +483,7 @@ async function main() {
   }
 
   // --- Verify audit log integrity ---
-  const integrity = await logger.verifyIntegrity(20);
+  const integrity = await wallet.verifyAuditIntegrity(20);
   console.log(`\nAudit integrity: ${integrity.valid ? "VALID" : "BROKEN"}`);
   console.log(`Entries checked: ${integrity.entriesChecked}`);
   if (!integrity.valid) {
@@ -543,8 +525,9 @@ switch (result.status) {
   case "denied":
     // DENIED: The policy engine rejected the swap BEFORE it was submitted.
     // No transaction was broadcast; no funds were spent.
-    console.log("Swap denied:", result.error);
-    // Possible denial reasons:
+    console.log("Swap denied:", result.error?.message);
+    console.log("Error code:", result.error?.code);
+    // Possible denial reasons (error.code):
     //   SPENDING_LIMIT_EXCEEDED - Swap amount exceeds per-tx or daily cap
     //   RATE_LIMIT_EXCEEDED     - Too many swaps in the rolling time window
     //   PROGRAM_NOT_ALLOWED     - Jupiter program ID not in allowPrograms list
@@ -553,7 +536,8 @@ switch (result.status) {
   case "failed":
     // FAILED: The policy allowed the swap, but it failed during execution.
     // The transaction may or may not have been broadcast.
-    console.log("Swap failed:", result.error);
+    console.log("Swap failed:", result.error?.message);
+    console.log("Error code:", result.error?.code);
     // Possible failure reasons:
     //   INSUFFICIENT_BALANCE   - Wallet does not have enough tokens to swap
     //   TRANSACTION_FAILED     - On-chain error (slippage exceeded, no liquidity)

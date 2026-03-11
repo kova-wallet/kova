@@ -77,6 +77,8 @@ export type {
 // These are exported for advanced use cases and testing, but most consumers
 // should use the Policy builder above instead of instantiating rules directly.
 // ---------------------------------------------------------------------------
+/** @internal — Use {@link Policy} builder and pass to AgentWallet instead. */
+export { PolicyEngine } from "./policy/engine.js";
 /** @internal — Use {@link Policy.spendingLimit} instead. */
 export { SpendingLimitRule } from "./policy/rules/spending-limit.js";
 /** @internal — Use {@link Policy.allowlist} instead. */

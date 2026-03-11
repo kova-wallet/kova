@@ -1,5 +1,9 @@
 # Kova Dashboard
 
+::: danger Dashboard Removed from Repository
+The Kova Dashboard has been **removed from the repository** (as of commit `487b875`). The `dashboard/` directory no longer exists in the `@kova/wallet` repo. This tutorial is preserved as a **reference implementation guide** -- you can use it to build your own dashboard from scratch, but there is no pre-built dashboard to install.
+:::
+
 ::: info What you'll learn
 - How to set up and run the Kova Dashboard for testing the SDK on Solana devnet
 - The five dashboard pages: Dashboard, Wallet, Policy Builder, Transactions, and Approvals
@@ -7,8 +11,8 @@
 - Important limitations and when NOT to use the dashboard
 :::
 
-::: warning Separate Project
-The Kova Dashboard is a separate project and is **not included** in the kova SDK npm package. It lives in the `dashboard/` directory of the @kova/wallet repository and must be set up independently.
+::: warning Reference Implementation Only
+The Kova Dashboard was a separate project that has been **removed** from the `@kova/wallet` repository. It is **not included** in the npm package. The code below describes a reference architecture you can build yourself.
 :::
 
 The Kova Dashboard is a **Next.js admin UI** for testing and exploring the SDK on Solana devnet. Think of it as a visual control panel for your agent wallet -- you can create wallets, configure policies, execute transactions, and approve requests, all from a browser instead of writing code.
@@ -61,7 +65,7 @@ The sidebar navigation provides access to five pages:
 |------|------|---------|
 | **Dashboard** | `/dashboard` | Overview: balance, policy summary, recent transaction history |
 | **Wallet** | `/wallet` | Create/import wallet, request devnet airdrop, destroy wallet |
-| **Policy** | `/policy` | Visual policy builder with 6 rule types and live JSON preview |
+| **Policy** | `/policy` | Visual policy builder with 5 rule types and live JSON preview |
 | **Transactions** | `/transactions` | Execute transfers and swaps via forms, view results |
 | **Approvals** | `/approvals` | Real-time approval queue with approve/reject actions |
 
@@ -90,7 +94,7 @@ Devnet SOL has no monetary value -- it is free test currency provided by Solana 
 
 ### Policy Builder
 
-The Policy Builder page provides a visual interface for configuring all six policy rule types:
+The Policy Builder page provides a visual interface for configuring all five policy rule types:
 
 | Rule Section | What It Configures |
 |-------------|-------------------|
@@ -99,7 +103,6 @@ The Policy Builder page provides a visual interface for configuring all six poli
 | **Rate Limits** | Max transactions per minute and per hour |
 | **Active Hours** | Timezone, day-of-week, and start/end time windows |
 | **Approval Gate** | Amount threshold above which human approval is required, with configurable timeout and cumulative window |
-| **Cooldown** | Mandatory wait period after high-value transactions |
 
 Each section has a **toggle switch** to enable/disable it. As you configure rules, the **live JSON preview panel** on the right shows the resulting `PolicyConfig` object -- the same JSON structure you would pass to `Policy.fromJSON()` in code.
 
@@ -215,7 +218,7 @@ Here is a typical testing workflow using the dashboard:
 ::: warning
 - **Devnet only** -- The dashboard is hardcoded to use Solana devnet. It cannot connect to mainnet.
 - **MemoryStore** -- All SDK state (spending counters, rate limits, audit logs) resets when the Next.js server restarts. Only the keypair is persisted to disk.
-- **LocalSigner** -- The private key is held in process memory with `dangerouslyAllowInProduction: true`. This is acceptable for devnet testing only.
+- **LocalSigner** -- The private key is held in process memory with `{ network: "devnet" }`. This is acceptable for devnet testing only.
 - **Not for production** -- The dashboard is a development tool. Do not expose it to untrusted networks or use it with real funds.
 - **Single instance** -- Only one browser tab should interact with the dashboard at a time to avoid race conditions in the in-memory state.
 :::

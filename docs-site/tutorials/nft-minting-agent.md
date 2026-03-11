@@ -66,14 +66,8 @@ import {
   LocalSigner,
   SqliteStore,
   SolanaAdapter,
-  PolicyEngine,
   Policy,
-  SpendingLimitRule,
-  RateLimitRule,
-  AllowlistRule,
-  TimeWindowRule,
-  AuditLogger,
-} from "kova";
+} from "@kova/wallet";
 import { Keypair } from "@solana/web3.js";
 
 // ── Configuration ───────────────────────────────────────────────────────────
@@ -99,9 +93,10 @@ const chain = new SolanaAdapter({
 });
 
 const keypair = Keypair.generate();
-const signer = new LocalSigner(keypair); // Dev-only; throws in production unless KOVA_ALLOW_LOCAL_SIGNER=1
+const signer = new LocalSigner(keypair, { network: "devnet" });
 
 // Build the policy using the fluent builder.
+// The Policy.create().build() pattern handles rule instantiation internally.
 const policy = Policy.create("nft-minting-agent")
   .spendingLimit({
     // Each mint costs ~0.01-0.03 SOL in rent + fees.
@@ -112,20 +107,12 @@ const policy = Policy.create("nft-minting-agent")
   })
   .rateLimit({
     // Prevent burst minting. 10/min is plenty for most use cases.
+    // Note: RateLimitRule is stateful — it tracks transaction counts in the store.
     maxTransactionsPerMinute: 10,
     maxTransactionsPerHour: 100,
   })
-  .build();
-
-const config = policy.toJSON();
-
-// Assemble the rules in evaluation order (cheapest first).
-const rules = [
-  // 1. Rate limit (stateless, instant)
-  new RateLimitRule(config.rateLimit!),
-
-  // 2. Time window: only mint during business hours
-  new TimeWindowRule({
+  .allowAddresses(ALLOWED_COLLECTIONS)
+  .activeHours({
     timezone: "America/New_York",
     windows: [
       {
@@ -134,27 +121,15 @@ const rules = [
         end: "18:00",
       },
     ],
-    outsideHoursPolicy: "deny",
-  }),
-
-  // 3. Collection allowlist: only mint into approved collections
-  new AllowlistRule({
-    allowAddresses: ALLOWED_COLLECTIONS,
-  }),
-
-  // 4. Spending limit (touches the store)
-  new SpendingLimitRule(config.spendingLimit!),
-];
-
-const engine = new PolicyEngine(rules, store);
-const logger = new AuditLogger(store);
+  })
+  .build();
 
 const wallet = new AgentWallet({
   signer,
   chain,
-  policy: engine,
+  policy,
   store,
-  logger,
+  dangerouslyDisableAuth: true,
 });
 ```
 
@@ -359,7 +334,7 @@ The metadata URI must be accessible at mint time. If the URI returns a 404, the 
 For the 1/1 drops scenario, add an `ApprovalGateRule` to require human approval for each mint:
 
 ```typescript
-import { ApprovalGateRule, CallbackApprovalChannel } from "kova";
+import { ApprovalGateRule, CallbackApprovalChannel } from "@kova/wallet";
 
 const approval = new CallbackApprovalChannel({
   name: "nft-approval",
@@ -371,15 +346,18 @@ const approval = new CallbackApprovalChannel({
   },
 });
 
-// Add to rules array after the spending limit.
-rules.push(
-  new ApprovalGateRule(
-    { above: { amount: "0", token: "SOL" }, timeout: 300_000 },
-    // amount: "0" means every transaction requires approval
-  ),
-);
-
-const engine = new PolicyEngine(rules, store, approval);
+// For 1/1 drops, add approval to the policy:
+const dropPolicy = Policy.create("1-of-1-drops")
+  .spendingLimit({
+    perTransaction: { amount: "0.5", token: "SOL" },
+    daily: { amount: "1", token: "SOL" },
+  })
+  .rateLimit({ maxTransactionsPerHour: 1 })
+  .requireApproval({
+    above: { amount: "0", token: "SOL" }, // every transaction requires approval
+    timeout: 300_000,
+  })
+  .build();
 ```
 
 ---

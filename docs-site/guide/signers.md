@@ -46,7 +46,7 @@ A private key is a secret number (usually 32-64 bytes) that proves ownership of 
 // - Signer: the interface that all signing backends must implement
 // - UnsignedTransaction: represents a transaction before it has been signed
 // - SignedTransaction: represents a transaction after signing, including the signature bytes
-import type { Signer, UnsignedTransaction, SignedTransaction } from "kova";
+import type { Signer, UnsignedTransaction, SignedTransaction } from "@kova/wallet";
 ```
 
 ```typescript
@@ -117,7 +117,7 @@ The output of a signer's `sign()` method. Contains the signed transaction data a
 
 ```typescript
 // Represents a fully signed transaction, ready to be submitted to the blockchain.
-// Produced by a Signer and consumed by a chain adapter's submitTransaction() method.
+// Produced by a Signer and consumed by a chain adapter's broadcast() method.
 interface SignedTransaction {
   /** Chain identifier */
   // Same chain identifier as the UnsignedTransaction; used by the chain
@@ -140,7 +140,7 @@ Holds a Solana `Keypair` in memory. Supports both legacy and versioned Solana tr
 
 ```typescript
 // Import LocalSigner from kova -- the simplest signer for development use.
-import { LocalSigner } from "kova";
+import { LocalSigner } from "@kova/wallet";
 // Import Keypair from the Solana web3.js library.
 // A Keypair contains both the 32-byte secret key and the 32-byte public key.
 import { Keypair } from "@solana/web3.js";
@@ -175,20 +175,26 @@ const signer = new LocalSigner(keypair);
 
 ### Production Guard
 
-`LocalSigner` throws an error at construction time unless the `KOVA_ALLOW_LOCAL_SIGNER=1` environment variable is set:
+`LocalSigner` throws an error at construction time in production environments unless explicitly opted in. There are two ways to allow it:
 
 ```typescript
 // Without opt-in:
 const signer = new LocalSigner(keypair);
 // Error: "LocalSigner is not safe for production use..."
 
-// Explicit opt-in via environment variable (devnet testing only -- NOT for real funds):
+// Option 1: Explicit opt-in via environment variable (devnet testing only -- NOT for real funds):
 // KOVA_ALLOW_LOCAL_SIGNER=1 node your-script.js
 const signer = new LocalSigner(keypair);
+
+// Option 2: Pass { network: "devnet" } to indicate devnet usage:
+const signer = new LocalSigner(keypair, { network: "devnet" });
+
+// Option 3: Pass { dangerouslyAllowInProduction: true } to force allow in production:
+const signer = new LocalSigner(keypair, { dangerouslyAllowInProduction: true });
 ```
 
 ::: danger
-The `dangerouslyAllowInProduction` flag exists for devnet testing in production Node.js environments. Do NOT use it with real funds. The private key is held in plaintext process memory.
+The `dangerouslyAllowInProduction` flag and `{ network: "devnet" }` options exist for devnet testing in production Node.js environments. Do NOT use them with real funds. The private key is held in plaintext process memory.
 :::
 
 ### Usage
@@ -225,7 +231,7 @@ Zero out the secret key from memory. After calling `destroy()`, the signer can n
 // When you are done with the signer, destroy the key material.
 // This overwrites the secret key bytes in memory with zeros, reducing
 // the window during which the key could be extracted via heap dumps.
-signer.destroy();
+await signer.destroy();
 
 // Subsequent sign() calls will throw because the key has been zeroed out.
 // This is a safety mechanism to prevent accidental use of a retired signer.
@@ -287,8 +293,8 @@ Provider-agnostic MPC signer for production use. You implement the `MpcSigningPr
 
 ```typescript
 // Import MpcSigner and the provider interface from kova.
-import { MpcSigner } from "kova";
-import type { MpcSigningProvider } from "kova";
+import { MpcSigner } from "@kova/wallet";
+import type { MpcSigningProvider } from "@kova/wallet";
 ```
 
 ::: tip WHAT IS MPC (MULTI-PARTY COMPUTATION)?
@@ -360,8 +366,8 @@ npm install @turnkey/sdk-server
 #### Configuration
 
 ```typescript
-import { TurnkeyProvider } from "kova";
-import type { TurnkeyProviderConfig } from "kova";
+import { TurnkeyProvider } from "@kova/wallet";
+import type { TurnkeyProviderConfig } from "@kova/wallet";
 ```
 
 ```typescript
@@ -388,7 +394,7 @@ interface TurnkeyProviderConfig {
 #### Usage
 
 ```typescript
-import { TurnkeyProvider, MpcSigner, AgentWallet, SolanaAdapter } from "kova";
+import { TurnkeyProvider, MpcSigner, AgentWallet, SolanaAdapter } from "@kova/wallet";
 
 // 1. Create the Turnkey provider with your API credentials
 const provider = new TurnkeyProvider({
@@ -439,7 +445,7 @@ If your MPC backend is not Turnkey, implement `MpcSigningProvider` directly:
 
 ```typescript
 // Example: A custom MPC provider adapter for Lit Protocol.
-import type { MpcSigningProvider, MpcSignResult } from "kova";
+import type { MpcSigningProvider, MpcSignResult } from "@kova/wallet";
 
 class LitProtocolProvider implements MpcSigningProvider {
   readonly name = "lit-protocol";
@@ -517,7 +523,7 @@ In error messages returned to callers, the MPC provider name is hashed and trunc
 `MpcSigner` throws `MpcSignerError` with typed error codes:
 
 ```typescript
-import { MpcSignerError } from "kova";
+import { MpcSignerError } from "@kova/wallet";
 
 try {
   await wallet.execute(intent);
@@ -542,7 +548,7 @@ For production use with services like Fireblocks, AWS KMS, or hardware wallets, 
 
 ```typescript
 // Import the Signer interface and transaction types from kova.
-import type { Signer, UnsignedTransaction, SignedTransaction } from "kova";
+import type { Signer, UnsignedTransaction, SignedTransaction } from "@kova/wallet";
 
 // Example: A production-grade signer that delegates signing to Fireblocks,
 // an institutional-grade key management and custody platform.
@@ -630,7 +636,7 @@ export class FireblocksSigner implements Signer {
 
   // Clean up resources. For Fireblocks, there is no local key material to zero out,
   // but we clear the cached address and mark the signer as destroyed.
-  destroy(): void {
+  async destroy(): Promise<void> {
     this.cachedAddress = null;
   }
 
@@ -651,7 +657,7 @@ Cache the address in `getAddress()` to avoid repeated API calls. The wallet addr
 
 ```typescript
 // Import the core Kova components for assembling a production wallet.
-import { AgentWallet, PolicyEngine, SqliteStore, SolanaAdapter } from "kova";
+import { AgentWallet, PolicyEngine, SqliteStore, SolanaAdapter } from "@kova/wallet";
 // Import the custom Fireblocks signer we defined above.
 import { FireblocksSigner } from "./fireblocks-signer";
 

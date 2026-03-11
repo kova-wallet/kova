@@ -25,17 +25,30 @@ new AgentWallet(config: AgentWalletConfig)
 |-----------|------|----------|-------------|
 | `signer` | `Signer` | Yes | Cryptographic signer for transactions |
 | `chain` | `ChainAdapter` | Yes | Blockchain adapter (e.g., SolanaAdapter) |
-| `policy` | `PolicyEngine` | Yes | Policy engine that evaluates every transaction |
+| `policy` | `Policy \| PolicyEngine` | Yes | Policy or policy engine that evaluates every transaction |
 | `store` | `Store` | Yes | State storage for counters, logs, and audit entries |
 | `approval` | `ApprovalChannel` | No | Approval channel for human-in-the-loop (e.g., CallbackApprovalChannel, WebhookApprovalChannel) |
 | `logger` | `AuditLogger` | No | Tamper-evident audit logger |
-| `circuitBreaker` | `CircuitBreakerConfig` | No | Circuit breaker configuration |
+| `circuitBreaker` | `Partial<CircuitBreakerConfig> \| { dangerouslyDisable: true } \| false` | No | Circuit breaker configuration. Use `{ dangerouslyDisable: true }` to disable. |
 | `onAuditFailure` | `AuditFailureCallback` | No | Callback fired on audit integrity failures |
-| `enabledTools` | `ReadonlySet<string>` | No | Set of tool names to enable (defaults to safe tools only) |
+| `enabledTools` | `ReadonlySet<string>` | No | Set of tool names to enable (defaults to `wallet_get_balance` and `wallet_get_transaction_history` only) |
+| `idempotencyTtl` | `number` | No | TTL for idempotency cache entries in seconds |
+| `idempotencyHmacKey` | `string \| Buffer` | No | HMAC-SHA256 key for verifying cached idempotency entries |
+| `storePrefix` | `string` | No | Key prefix for multi-wallet store isolation |
+| `mutexTimeoutMs` | `number` | No | Timeout for acquiring the execute mutex |
+| `authToken` | `string` | No | Capability token for caller authentication |
+| `dangerouslyDisableAuth` | `boolean` | No | Disable authentication token checks |
+| `agentId` | `string` | No | Wallet-level agent identifier for circuit breaker and rate limit isolation |
+| `verboseErrors` | `boolean` | No | Include full details in policy denial messages |
+| `dangerouslyAllowVerboseErrorsInProduction` | `boolean` | No | Allow verbose errors in production |
+| `dangerouslyAllowAutoHmacKey` | `boolean` | No | Allow auto-generation of idempotency HMAC key |
+| `storeTimeoutMs` | `number` | No | Timeout for individual store operations |
+| `strictAdvisoryLock` | `boolean` | No | Enforce strict advisory locking on store operations |
+| `requireProgramAllowlistForCustom` | `boolean` | No | Require program allowlist for custom intents |
 
 **Methods:**
 
-#### `execute(intent: TransactionIntent): Promise<TransactionResult>`
+#### `execute(intent: TransactionIntent, authToken?: string): Promise<TransactionResult>`
 
 Evaluate a transaction intent against the policy engine, sign it, and submit it to the blockchain.
 
@@ -61,7 +74,7 @@ Retrieve the balance for a specific token. Pass a token symbol (e.g., `"SOL"`) o
 ```typescript
 // Query the wallet's SOL balance. Internally delegates to chain.getBalance().
 const balance = await wallet.getBalance("SOL");
-// { token: "SOL", amount: "12.5", decimals: 9, usdValue: "2500.00" }
+// { token: "SOL", amount: "12.5", decimals: 9, usdValue: 2500.00 }
 ```
 
 #### `getAddress(): Promise<string>`
@@ -160,18 +173,20 @@ type IntentType = "transfer" | "swap" | "mint" | "stake" | "custom";
 #### ChainId
 
 ```typescript
-// Currently only Solana is supported. Additional chains planned for future releases.
-type ChainId = "solana";
+// Supported chain identifiers. "system" is used for internal/non-chain operations.
+type ChainId = "solana" | "ethereum" | "base" | "system";
 ```
 
 #### IntentMetadata
 
 ```typescript
-// Arbitrary key-value pairs attached to a transaction intent.
+// Named metadata fields attached to a transaction intent.
 // Recorded in the audit log and useful for tracking, filtering,
 // and correlating transactions with external systems.
 interface IntentMetadata {
-  [key: string]: string | number | boolean;
+  reason?: string;    // Human-readable justification for the transaction
+  agentId?: string;   // Identifies which AI agent initiated this transaction
+  taskId?: string;    // External task or job identifier for correlation
 }
 ```
 
@@ -301,11 +316,14 @@ type TransactionErrorCode =
   | "APPROVAL_REJECTED"       // Approval: human reviewer rejected the transaction
   | "APPROVAL_TIMEOUT"        // Approval: no response within the timeout period
   | "INSUFFICIENT_BALANCE"    // Chain: wallet does not have enough tokens
+  | "SIMULATION_FAILED"       // Chain: transaction simulation failed before broadcast
   | "TRANSACTION_FAILED"      // Chain: on-chain transaction execution failed
   | "SIGNER_ERROR"            // Signer: error during transaction signing
   | "CHAIN_ERROR"             // Chain: RPC or network error
   | "STORE_ERROR"             // Store: state storage read/write error
   | "CIRCUIT_BREAKER_OPEN"    // Circuit: circuit breaker is open, all transactions blocked
+  | "WALLET_DRAINING"         // System: wallet is shutting down, no new transactions accepted
+  | "AUTH_FAILED"             // Auth: invalid or missing authentication token
   | "UNKNOWN_ERROR";          // System: unexpected error
 ```
 
@@ -321,11 +339,14 @@ type TransactionErrorCode =
 | `APPROVAL_REJECTED` | Approval | Human reviewer rejected the transaction |
 | `APPROVAL_TIMEOUT` | Approval | No response within the timeout period |
 | `INSUFFICIENT_BALANCE` | Chain | Wallet does not have enough tokens |
+| `SIMULATION_FAILED` | Chain | Transaction simulation failed before broadcast |
 | `TRANSACTION_FAILED` | Chain | On-chain transaction execution failed |
 | `SIGNER_ERROR` | Signer | Error during transaction signing |
 | `CHAIN_ERROR` | Chain | RPC or network error |
 | `STORE_ERROR` | Store | State storage read/write error |
 | `CIRCUIT_BREAKER_OPEN` | Circuit | Circuit breaker is open, all transactions blocked |
+| `WALLET_DRAINING` | System | Wallet is shutting down, no new transactions accepted |
+| `AUTH_FAILED` | Auth | Invalid or missing authentication token |
 | `UNKNOWN_ERROR` | System | Unexpected error |
 
 ---
@@ -340,7 +361,7 @@ interface TokenBalance {
   token: string;         // Token symbol (e.g., "SOL") or mint address
   amount: string;        // Balance as a decimal string (e.g., "12.5")
   decimals: number;      // Token decimal places (9 for SOL, 6 for USDC)
-  usdValue?: string;     // Optional USD value estimate from the price oracle
+  usdValue?: number;     // Optional USD value estimate from the price oracle
 }
 ```
 
@@ -355,15 +376,18 @@ Returned by `wallet.getPolicy()`.
 // This is what the AI agent sees when it calls wallet_get_policy.
 interface PolicySummary {
   name: string;                             // Policy name (e.g., "my-policy")
-  rules: string[];                          // Names of all active rules
-  spendingLimit?: SpendingLimitConfig;      // Spending limit configuration (if any)
-  allowAddresses?: AllowlistConfig;         // Allowlisted recipient addresses (if any)
-  denyAddresses?: string[];                 // Denylisted addresses (if any)
-  allowPrograms?: string[];                 // Allowlisted program addresses (if any)
-  denyPrograms?: string[];                  // Denylisted program addresses (if any)
-  rateLimit?: RateLimitConfig;              // Rate limit configuration (if any)
+  spendingLimits: {                         // Spending limit configuration
+    perTransaction?: TokenAmount;
+    daily?: TokenAmount;
+    weekly?: TokenAmount;
+    monthly?: TokenAmount;
+  };
+  allowlistedAddresses: number;             // Count of allowlisted recipient addresses
+  allowlistedPrograms: number;              // Count of allowlisted program addresses
+  approvalRequired?: TokenAmount;           // Threshold above which human approval is needed
+  rateLimits?: RateLimitConfig;             // Rate limit configuration (if any)
   activeHours?: ActiveHoursConfig;          // Time window restrictions (if any)
-  requireApproval?: ApprovalGateConfig;     // Human approval configuration (if any)
+  circuitBreaker?: unknown;                 // Circuit breaker status and configuration
 }
 ```
 
@@ -492,8 +516,8 @@ Evaluates transaction intents against a set of policy rules.
 
 ```typescript
 // Create a PolicyEngine with an array of rules, a store for persisting state,
-// and an optional approval channel for human-in-the-loop rules.
-new PolicyEngine(rules: PolicyRule[], store: Store, approval?: ApprovalChannel)
+// and optional parameters for approval, price conversion, and timeouts.
+new PolicyEngine(rules: PolicyRule[], store: Store, approval?: ApprovalChannel, getValueInUSD?: Function, mutexTimeoutMs?: number, storeOpTimeoutMs?: number, minEvaluationTimeMs?: number)
 ```
 
 | Parameter | Type | Required | Description |
@@ -501,10 +525,14 @@ new PolicyEngine(rules: PolicyRule[], store: Store, approval?: ApprovalChannel)
 | `rules` | `PolicyRule[]` | Yes | Array of rule instances to evaluate |
 | `store` | `Store` | Yes | State store for rule counters and state |
 | `approval` | `ApprovalChannel` | No | Approval channel for `ApprovalGateRule` |
+| `getValueInUSD` | `(token: string, amount: string) => Promise<number>` | No | Function to convert token amounts to USD |
+| `mutexTimeoutMs` | `number` | No | Timeout for acquiring the evaluation mutex |
+| `storeOpTimeoutMs` | `number` | No | Timeout for individual store operations during evaluation |
+| `minEvaluationTimeMs` | `number` | No | Minimum evaluation time to prevent timing side-channel attacks |
 
 **Methods:**
 
-#### `evaluate(intent: TransactionIntent, context?: PolicyContext): Promise<PolicyEvaluationResult>`
+#### `evaluate(intent: TransactionIntent, now?: number): Promise<PolicyEvaluationResult>`
 
 Evaluate an intent against all rules.
 
@@ -758,9 +786,11 @@ Abstract interface for state storage. All stores implement this interface.
 interface Store {
   get(key: string): Promise<string | null>;                      // Get a value by key (null if not found or expired)
   set(key: string, value: string, ttlSeconds?: number): Promise<void>; // Set a value with optional TTL
+  setIfNotExists(key: string, value: string, ttlSeconds?: number): Promise<boolean>; // Atomic conditional write
   increment(key: string, amount?: number): Promise<number>;       // Atomically increment a numeric value
   append(key: string, value: string): Promise<void>;              // Append to an ordered list
   getRecent(key: string, count: number): Promise<string[]>;       // Get the N most recent list entries
+  clearList(key: string): Promise<void>;                          // Clear a list (required)
 }
 ```
 
@@ -768,9 +798,11 @@ interface Store {
 |--------|-------------|
 | `get(key)` | Retrieve a value by key. Returns `null` if not found. |
 | `set(key, value, ttl?)` | Store a value with optional TTL in seconds. |
+| `setIfNotExists(key, value, ttl?)` | Atomic conditional write. Returns `true` if set, `false` if key already exists. |
 | `increment(key, amount?)` | Atomically increment a numeric value. Returns the new value. |
 | `append(key, value)` | Append a value to a list stored at key. |
 | `getRecent(key, count)` | Get the most recent N entries from a list. |
+| `clearList(key)` | Clear all entries in a list. Required method. |
 
 ---
 
@@ -788,7 +820,7 @@ No configuration parameters. Ideal for development, testing, and ephemeral workl
 ```typescript
 // Import and create an in-memory store.
 // Fast and simple, but all data is lost on process restart.
-import { MemoryStore } from "kova";
+import { MemoryStore } from "@kova/wallet";
 
 const store = new MemoryStore();
 ```
@@ -814,7 +846,7 @@ new SqliteStore(config: SqliteStoreConfig)
 ```typescript
 // Import and create a file-backed SQLite store.
 // The database file is created automatically if it doesn't exist.
-import { SqliteStore } from "kova";
+import { SqliteStore } from "@kova/wallet";
 
 const store = new SqliteStore({
   path: "./data/kova.db",  // Path to the SQLite database file
@@ -847,7 +879,7 @@ new RedisStore(config?: RedisStoreConfig)
 
 ```typescript
 // Import and create a Redis-backed store.
-import { RedisStore } from "kova";
+import { RedisStore } from "@kova/wallet";
 
 // Simple: connect with a URL
 const store = new RedisStore({ url: "redis://localhost:6379" });
@@ -879,6 +911,8 @@ interface Signer {
   getAddress(): Promise<string>;                                  // Get the signer's public address
   sign(transaction: UnsignedTransaction): Promise<SignedTransaction>; // Sign a transaction
   healthCheck(): Promise<boolean>;                                 // Check if the signer is operational
+  destroy(): Promise<void>;                                        // Zero out key material (async)
+  toJSON(): Record<string, unknown>;                               // Safe JSON serialization (no secrets)
 }
 ```
 
@@ -887,6 +921,8 @@ interface Signer {
 | `getAddress()` | Returns the signer's public address |
 | `sign(tx)` | Signs a transaction and returns the signed version |
 | `healthCheck()` | Returns `true` if the signer is operational |
+| `destroy()` | Zero out key material and prevent further signing. Returns `Promise<void>`. |
+| `toJSON()` | Safe JSON serialization -- never includes the secret key |
 
 #### UnsignedTransaction
 
@@ -931,7 +967,7 @@ new LocalSigner(keypair: Keypair)
 ```typescript
 // Import Keypair from Solana's web3.js library and LocalSigner from kova.
 import { Keypair } from "@solana/web3.js";
-import { LocalSigner } from "kova";
+import { LocalSigner } from "@kova/wallet";
 
 // Generate a new random keypair for development/testing.
 const keypair = Keypair.generate();
@@ -967,7 +1003,7 @@ new MPCSigner(config: MPCSignerConfig)
 
 ```typescript
 // Import MPCSigner from kova.
-import { MPCSigner } from "kova";
+import { MPCSigner } from "@kova/wallet";
 
 // Create an MPCSigner instance pointing to your MPC service.
 // In production, the private key is split across multiple parties
@@ -992,19 +1028,33 @@ Abstract interface for blockchain interactions.
 // The ChainAdapter interface abstracts all blockchain-specific operations.
 // Each supported blockchain has its own adapter implementation.
 interface ChainAdapter {
+  readonly chain: ChainId;                                                      // Chain identifier
   getBalance(address: string, token: string): Promise<TokenBalance>;           // Query token balance
-  submitTransaction(signed: SignedTransaction): Promise<TransactionStatusResult>; // Submit a signed transaction
+  getValueInUSD(token: string, amount: string): Promise<number>;               // Price oracle
+  buildTransaction(intent: TransactionIntent, signerAddress: string): Promise<UnsignedTransaction>; // Build unsigned tx from intent
+  simulateTransaction(txData: Uint8Array): Promise<SimulationResult>;          // Pre-flight check
+  broadcast(signedTxData: Uint8Array): Promise<string>;                        // Submit and get tx ID
   getTransactionStatus(txId: string): Promise<TransactionStatusResult>;         // Check transaction status
-  buildTransaction(intent: TransactionIntent, address: string): Promise<UnsignedTransaction>; // Build unsigned tx from intent
+  isValidAddress(address: string): boolean;                                    // Address validation
+  verifyTransactionIntegrity(intent: TransactionIntent, transaction: UnsignedTransaction, signerAddress: string): Promise<void>; // Verify tx matches intent
+  refreshBlockhash?(transaction: UnsignedTransaction): Promise<UnsignedTransaction>; // Optional: refresh blockhash
+  destroy?(): Promise<void>;                                                   // Optional: clean up resources
 }
 ```
 
 | Method | Description |
 |--------|-------------|
+| `chain` | Read-only `ChainId` identifying which blockchain this adapter targets |
 | `getBalance(address, token)` | Get token balance for an address |
-| `submitTransaction(signed)` | Submit a signed transaction to the network |
-| `getTransactionStatus(txId)` | Check the status of a submitted transaction |
+| `getValueInUSD(token, amount)` | Convert a token amount to its USD equivalent |
 | `buildTransaction(intent, address)` | Build an unsigned transaction from an intent |
+| `simulateTransaction(txData)` | Simulate a transaction without broadcasting |
+| `broadcast(signedTxData)` | Submit a signed transaction to the network, returns tx ID |
+| `getTransactionStatus(txId)` | Check the status of a submitted transaction |
+| `isValidAddress(address)` | Validate an address for this chain |
+| `verifyTransactionIntegrity(intent, tx, address)` | Verify built transaction matches the original intent |
+| `refreshBlockhash?(tx)` | Optional: refresh an expired blockhash |
+| `destroy?()` | Optional: clean up resources |
 
 #### TransactionStatusResult
 
@@ -1041,7 +1091,7 @@ new SolanaAdapter(config: SolanaAdapterConfig)
 
 ```typescript
 // Import and configure the Solana adapter with a Pyth price oracle.
-import { SolanaAdapter, createPythPriceProvider } from "kova";
+import { SolanaAdapter, createPythPriceProvider } from "@kova/wallet";
 import { Connection } from "@solana/web3.js";
 
 const connection = new Connection("https://api.mainnet-beta.solana.com");
@@ -1121,7 +1171,7 @@ new CallbackApprovalChannel(config: CallbackApprovalChannelConfig)
 | `defaultTimeout` | `number` | No | Default timeout in ms (default: 300000 = 5 min) |
 
 ```typescript
-import { CallbackApprovalChannel } from "kova";
+import { CallbackApprovalChannel } from "@kova/wallet";
 
 const approval = new CallbackApprovalChannel({
   name: "my-approval",
@@ -1155,7 +1205,7 @@ new WebhookApprovalChannel(config: WebhookApprovalChannelConfig)
 | `defaultTimeout` | `number` | No | Default timeout in ms (default: 300000 = 5 min) |
 
 ```typescript
-import { WebhookApprovalChannel } from "kova";
+import { WebhookApprovalChannel } from "@kova/wallet";
 
 const approval = new WebhookApprovalChannel({
   webhookUrl: "https://your-approval-service.com/approve",
@@ -1231,7 +1281,7 @@ Array of all built-in wallet tool definitions.
 ```typescript
 // Import the complete array of all 8 wallet tool definitions.
 // Use these to build custom AI integrations for providers not natively supported.
-import { WALLET_TOOLS } from "kova";
+import { WALLET_TOOLS } from "@kova/wallet";
 // ToolDefinition[] (8 tools)
 ```
 
@@ -1241,7 +1291,7 @@ Array of the 2 dangerous tool definitions (`wallet_execute_custom` and `wallet_g
 
 ```typescript
 // Import the dangerous tool definitions separately.
-import { DANGEROUS_TOOLS } from "kova";
+import { DANGEROUS_TOOLS } from "@kova/wallet";
 // ToolDefinition[] (2 tools)
 ```
 
@@ -1251,7 +1301,7 @@ Combined array of all safe and dangerous tool definitions (same as `WALLET_TOOLS
 
 ```typescript
 // Import the combined array of all tool definitions.
-import { ALL_WALLET_TOOLS } from "kova";
+import { ALL_WALLET_TOOLS } from "@kova/wallet";
 // ToolDefinition[] (8 tools)
 ```
 
@@ -1262,7 +1312,7 @@ Array of tool name strings for write operations only.
 ```typescript
 // Import the array of write-only tool name strings.
 // Useful for filtering or restricting agents to read-only operations.
-import { WRITE_TOOL_NAMES } from "kova";
+import { WRITE_TOOL_NAMES } from "@kova/wallet";
 // ["wallet_transfer", "wallet_swap", "wallet_mint", "wallet_stake", "wallet_execute_custom"]
 ```
 
@@ -1273,7 +1323,7 @@ Array of all tool name strings.
 ```typescript
 // Import the array of all tool name strings.
 // Useful for validation or filtering.
-import { WALLET_TOOL_NAMES } from "kova";
+import { WALLET_TOOL_NAMES } from "@kova/wallet";
 // ["wallet_transfer", "wallet_swap", "wallet_mint", "wallet_stake",
 //  "wallet_execute_custom", "wallet_get_balance", "wallet_get_policy",
 //  "wallet_get_transaction_history"]
@@ -1309,7 +1359,7 @@ Retrieve a specific tool definition by name.
 
 ```typescript
 // Import the lookup function.
-import { getToolByName } from "kova";
+import { getToolByName } from "@kova/wallet";
 
 // Find the wallet_transfer tool definition by name.
 // Returns the full ToolDefinition with name, description, and parameters.
@@ -1389,7 +1439,7 @@ Standalone function that creates LangChain-compatible tool definitions.
 // Import the LangChain adapter function.
 // Unlike toAnthropicTools() and toOpenAITools(), this is a standalone function
 // (not an instance method) because LangChain tools need a reference to the wallet.
-import { createLangChainTools } from "kova";
+import { createLangChainTools } from "@kova/wallet";
 
 // Create LangChain-compatible tools from the wallet instance.
 // Each tool includes a call() method that delegates to wallet.handleToolCall().
@@ -1440,7 +1490,7 @@ new AuditLogger(config: AuditLoggerConfig)
 
 ```typescript
 // Import AuditLogger from kova.
-import { AuditLogger } from "kova";
+import { AuditLogger } from "@kova/wallet";
 
 // Create an audit logger with failure monitoring.
 // When audit writes fail 3 times in a row, the circuit breaker opens

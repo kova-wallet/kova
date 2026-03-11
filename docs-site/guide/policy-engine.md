@@ -16,6 +16,10 @@ Without a PolicyEngine, your AI agent would have unrestricted access to your wal
 
 The `PolicyEngine` is the core enforcement layer of `kova`. It holds an ordered list of policy rules and evaluates them sequentially against each transaction intent.
 
+::: warning Advanced API
+`PolicyEngine` is exported as `@internal` from `@kova/wallet`. For most use cases, prefer the `Policy` builder pattern (shown below) which provides a safer, declarative API. Direct `PolicyEngine` usage is available for advanced scenarios where you need fine-grained control over rule construction.
+:::
+
 ### When would I use this?
 
 - **You want to limit how much your agent can spend.** Set per-transaction, daily, weekly, or monthly spending caps.
@@ -29,13 +33,13 @@ The `PolicyEngine` is the core enforcement layer of `kova`. It holds an ordered 
 ```typescript
 // Import the PolicyEngine class from the kova SDK.
 // The PolicyEngine is responsible for evaluating transaction intents against a set of rules.
-import { PolicyEngine } from "kova";
+import { PolicyEngine } from "@kova/wallet";
 
 // Create a new PolicyEngine instance.
 // - rules: an ordered array of PolicyRule objects (evaluated sequentially; order matters!).
 // - store: the persistence layer for rule state (spending counters, rate-limit counters, etc.).
 // - approval (optional): the approval channel used by rules that require human-in-the-loop (e.g., ApprovalGateRule).
-const engine = new PolicyEngine(rules, store, approval?, getValueInUSD?, mutexTimeoutMs?);
+const engine = new PolicyEngine(rules, store, approval?, getValueInUSD?, mutexTimeoutMs?, storeOpTimeoutMs?, minEvaluationTimeMs?);
 ```
 
 | Parameter | Type | Required | Description |
@@ -45,6 +49,8 @@ const engine = new PolicyEngine(rules, store, approval?, getValueInUSD?, mutexTi
 | `approval` | `ApprovalChannel` | No | Approval channel for rules that require human-in-the-loop (e.g., `CallbackApprovalChannel`) |
 | `getValueInUSD` | `(token: string, amount: string) => Promise<number>` | No | Function to convert token amounts to USD for spending limit evaluation |
 | `mutexTimeoutMs` | `number` | No | Timeout in milliseconds for acquiring the evaluation mutex |
+| `storeOpTimeoutMs` | `number` | No | Timeout in milliseconds for individual store operations during evaluation |
+| `minEvaluationTimeMs` | `number` | No | Minimum evaluation time in milliseconds to prevent timing side-channel attacks |
 
 ::: danger
 The `PolicyEngine` constructor throws an error if `rules` is empty. An engine with zero rules would allow all transactions unconditionally, violating the deny-by-default principle. You must always have at least one rule.
@@ -61,7 +67,7 @@ import {
   MemoryStore,
   SpendingLimitRule,
   RateLimitRule,
-} from "kova";
+} from "@kova/wallet";
 
 // Create an in-memory store for rule state persistence.
 // In production, use SqliteStore or a custom Store implementation for durability.
@@ -88,7 +94,7 @@ const engine = new PolicyEngine(
 // Method signature: takes a TransactionIntent and returns a PolicyEvaluationResult.
 // The result contains the final decision (ALLOW/DENY/PENDING), per-rule audit data,
 // and the total evaluation time. This method is called internally by AgentWallet.execute().
-async evaluate(intent: TransactionIntent): Promise<PolicyEvaluationResult>
+async evaluate(intent: TransactionIntent, now?: number): Promise<PolicyEvaluationResult>
 ```
 
 The `evaluate()` method processes rules **sequentially** in the order they were provided to the constructor. Think of it as a pipeline of security checkpoints -- the transaction must pass through each one, and any single checkpoint can reject it.
@@ -213,7 +219,7 @@ const wallet = new AgentWallet({
 
 With `verboseErrors: false` (default):
 ```
-Denied by policy: Per-transaction policy rule exceeded
+Denied by policy: Per-transaction policy rule limit exceeded
 ```
 
 With `verboseErrors: true`:
@@ -292,7 +298,7 @@ interface PolicyRuleAudit {
 
 When a policy denial is returned to an AI agent via `handleToolCall()`, the denial reason is sanitized:
 
-- Rule names are replaced with generic labels (e.g., `"Rule 1"`, `"Rule 2"`) so the agent cannot learn which specific rule blocked it
+- Rule names are replaced with the generic label `"policy rule"` so the agent cannot learn which specific rule blocked it
 - Counter values and threshold details are stripped
 - The full, unsanitized reason is preserved in the audit log for human operators
 
@@ -345,7 +351,7 @@ import {
   TimeWindowRule,      // Restricts when transactions can occur
   ApprovalGateRule,    // Requires human approval above a threshold
   CallbackApprovalChannel, // Sends approval requests via callbacks
-} from "kova";
+} from "@kova/wallet";
 
 // Step 1: Build the policy config using the fluent builder API.
 // The builder provides a chainable interface for defining all constraints.
@@ -510,7 +516,7 @@ const name: string = policy.getName();
 Policies can be serialized to JSON for storage, transmission, or configuration files. This makes it easy to store your policy in a database, load it from a config file, or send it over an API -- and reconstruct the exact same policy later.
 
 ```typescript
-import { Policy } from "kova";
+import { Policy } from "@kova/wallet";
 
 // Create a policy with spending limits, rate limits, and an address allowlist.
 const original = Policy.create("agent-policy")
@@ -571,7 +577,7 @@ If you include an `ApprovalGateRule` in your rules but do not pass an `ApprovalC
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `evaluate(intent)` | `Promise<PolicyEvaluationResult>` | Evaluate an intent against all rules (called internally by `wallet.execute()`) |
+| `evaluate(intent, now?)` | `Promise<PolicyEvaluationResult>` | Evaluate an intent against all rules (called internally by `wallet.execute()`). Optional `now` parameter overrides the current timestamp. |
 | `getRuleNames()` | `string[]` | Get the names of all configured rules |
 | `getRules()` | `readonly PolicyRule[]` | Get a frozen copy of the rules array |
 
