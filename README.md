@@ -32,7 +32,7 @@ Agent → Intent → Policy Engine → Build Tx → Sign → Broadcast → Audit
 - Your agent says "send 100 SOL" but your policy caps it at 5 SOL per transaction — **denied**.
 - Your agent tries to send funds to an unknown address — **denied** by allowlist.
 - A prompt injection tricks your agent into rapid-fire transfers — **denied** by rate limit, then **circuit breaker** kicks in.
-- A high-value transaction needs human sign-off — **held** until approved via Telegram.
+- A high-value transaction needs human sign-off — **held** until approved via webhook or custom callback.
 - Every transaction, approved or denied, is recorded in a **tamper-evident audit log**.
 
 ## Features
@@ -40,18 +40,19 @@ Agent → Intent → Policy Engine → Build Tx → Sign → Broadcast → Audit
 | Category | Details |
 |----------|---------|
 | **Policy Engine** | 5 composable rules, deny-by-default, fail-closed, two-phase evaluation |
-| **Spending Limits** | Per-transaction, daily, weekly, monthly caps (per-token and USD) |
-| **Address Allowlist** | Restrict transfers to approved addresses; denylist support |
+| **Spending Limits** | Per-transaction, daily, weekly, monthly caps (per-token and USD via Pyth oracle) |
+| **Address Allowlist** | Restrict transfers to approved addresses/programs; denylist support |
 | **Rate Limiting** | Max transactions per minute/hour with store-backed counters |
 | **Time Windows** | Restrict to business hours (timezone-aware, multiple windows) |
-| **Approval Gates** | Human-in-the-loop via Telegram for high-value transactions |
+| **Approval Gates** | Human-in-the-loop via webhook or custom callback for high-value transactions |
 | **AI Adapters** | First-class tool definitions for Claude, OpenAI, and LangChain |
 | **Signers** | LocalSigner (dev), MpcSigner with Turnkey provider (production) |
-| **Stores** | MemoryStore (dev), SqliteStore with encryption (production) |
-| **Solana** | SOL transfers, SPL tokens, Jupiter swaps, transaction simulation |
-| **Audit Log** | SHA-256 hash-chained, optional AES-256-GCM encryption |
-| **Circuit Breaker** | Auto-cooldown after consecutive denials |
-| **Security** | 196 audit findings remediated across 14 CRIT, 27 HIGH, 38 MED, 31 LOW |
+| **Stores** | MemoryStore (dev), SqliteStore (single server), RedisStore (multi-server) |
+| **Solana** | SOL transfers, SPL tokens with ATA creation, transaction simulation |
+| **Oracles** | Pyth on-chain price feeds, multi-oracle consensus provider |
+| **Audit Log** | SHA-256 hash-chained with HMAC per-entry integrity, checkpoint hashing |
+| **Circuit Breaker** | Auto-cooldown after consecutive denials, single-process lock enforcement |
+| **Security** | Store operation timeouts, timing side-channel resistance, error sanitization |
 
 ## Important
 
@@ -118,8 +119,8 @@ console.log(result.status);  // "confirmed" | "denied" | "pending" | "failed"
 │  │          │  │              │  │         │  │  Adapter   │  │
 │  │ Local    │  │ SpendingLimit│  │ Memory  │  │            │  │
 │  │ MPC      │  │ Allowlist    │  │ SQLite  │  │  Solana    │  │
-│  │ Turnkey  │  │ RateLimit    │  │ Prefixed│  │  (more     │  │
-│  │          │  │ TimeWindow   │  │         │  │   coming)  │  │
+│  │ Turnkey  │  │ RateLimit    │  │ Redis   │  │  (more     │  │
+│  │          │  │ TimeWindow   │  │ Prefixed│  │   coming)  │  │
 │  │          │  │ ApprovalGate │  │         │  │            │  │
 │  └──────────┘  └──────────────┘  └─────────┘  └────────────┘  │
 │                                                                 │
@@ -128,6 +129,10 @@ console.log(result.status);  // "confirmed" | "denied" | "pending" | "failed"
 │  │  (hash-chain)│  │   Breaker    │  │  Claude · OpenAI ·   │  │
 │  │              │  │              │  │  LangChain           │  │
 │  └──────────────┘  └──────────────┘  └──────────────────────┘  │
+│                                                                 │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │  Oracles: Pyth price feeds · Multi-oracle consensus     │  │
+│  └──────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -164,11 +169,11 @@ const policy = Policy.create("production")
 
 | Rule | What it does |
 |------|-------------|
-| **SpendingLimit** | Per-transaction, daily, weekly, monthly caps. Rolling TTL windows with BigInt precision. |
-| **Allowlist** | Restrict to approved addresses/programs. Separate denylist support. |
+| **SpendingLimit** | Per-transaction, daily, weekly, monthly caps. Rolling TTL windows with BigInt precision. USD limits via Pyth oracle. |
+| **Allowlist** | Restrict to approved addresses/programs/tokens. Separate denylist support. |
 | **RateLimit** | Max transactions per minute/hour. Store-backed counters. |
 | **TimeWindow** | Restrict to business hours. Timezone-aware, multiple windows per day. |
-| **ApprovalGate** | Require human approval above a threshold. Telegram bot with inline buttons. |
+| **ApprovalGate** | Require human approval above a threshold. Webhook or custom callback with intent hash binding. |
 
 Policies use **two-phase evaluation**: a dry-run phase prevents counter inflation on denied transactions, so a denied spend doesn't eat into your rate limit or spending budget.
 
@@ -232,13 +237,15 @@ const tools = createLangChainTools(wallet);
 | Tool | Description |
 |------|-------------|
 | `wallet_transfer` | Transfer SOL or SPL tokens |
-| `wallet_swap` | Swap tokens via Jupiter |
 | `wallet_get_balance` | Query wallet balance |
 | `wallet_get_transaction_history` | Query past transactions |
-| `wallet_get_policy` | View current policy rules |
-| `wallet_mint` | Mint NFTs *(coming soon)* |
-| `wallet_stake` | Stake tokens *(coming soon)* |
-| `wallet_execute_custom` | Raw instructions (dangerous, opt-in only) |
+| `wallet_get_policy` | View current policy rules (opt-in, dangerous) |
+| `wallet_swap` | Swap tokens (requires custom chain adapter implementation) |
+| `wallet_mint` | Mint NFTs (requires custom chain adapter implementation) |
+| `wallet_stake` | Stake tokens (requires custom chain adapter implementation) |
+| `wallet_execute_custom` | Raw instructions (opt-in, dangerous) |
+
+> **Default tools**: Only `wallet_get_balance` and `wallet_get_transaction_history` are enabled by default. Write operations (`wallet_transfer`, etc.) must be explicitly enabled. `wallet_get_policy` and `wallet_execute_custom` require dangerous opt-in flags.
 
 ## Signers
 
@@ -255,8 +262,8 @@ The `Signer` interface is minimal — `getAddress()`, `sign()`, `healthCheck()`,
 | Store | Use case |
 |-------|----------|
 | `MemoryStore` | Development. In-memory, data lost on exit. Guarded against production. |
-| `SqliteStore` | Production (single server). Persistent, WAL mode, HMAC-protected counters, optional encryption. Requires `better-sqlite3`. |
-| `RedisStore` | Production (multi-server). Shared state via Redis. Natively atomic operations. Requires `ioredis`. |
+| `SqliteStore` | Production (single server). Persistent, WAL mode, HMAC-protected counters. Requires `better-sqlite3`. |
+| `RedisStore` | Production (multi-server). AES-256-GCM encryption at rest, HMAC counter integrity, optional TLS enforcement. Requires `ioredis`. |
 | `PrefixedStore` | Multi-wallet. Wraps any store, namespaces keys per wallet to prevent counter collisions. |
 
 > **Floating-point precision note**: `MemoryStore` counters use IEEE 754 doubles, which can accumulate drift over many increments. For high-precision accounting, prefer `SqliteStore` (native numeric types) or `RedisStore` (INCRBYFLOAT).
@@ -265,9 +272,19 @@ The `Signer` interface is minimal — `getAddress()`, `sign()`, `healthCheck()`,
 
 | Channel | How it works |
 |---------|-------------|
-| `TelegramApprovalBot` | Sends approval requests as Telegram messages with inline approve/reject buttons. Configurable timeout (default 5 min). User whitelist support. |
+| `WebhookApprovalChannel` | POSTs HMAC-SHA256 signed approval requests to your endpoint. SSRF protection with private IP blocking. Configurable timeout (default 5 min). |
+| `CallbackApprovalChannel` | Developer-provided callbacks for custom approval flows — Slack, Discord, email, push notifications, or any other channel. |
 
-The `ApprovalChannel` interface (`requestApproval()`) is open for custom implementations — Slack, Discord, email, or any other channel.
+The `ApprovalChannel` interface (`requestApproval()`) is open for custom implementations.
+
+## Oracles
+
+| Provider | How it works |
+|----------|-------------|
+| `createPythPriceProvider` | Reads Pyth on-chain price feeds directly from Solana RPC. In-memory TTL cache, staleness and confidence validation, fail-closed on error. |
+| `createConsensusProvider` | Multi-oracle aggregation with median or first-success fallback strategy. Resistant to single-source price manipulation. |
+
+Oracles power USD-denominated spending limits in the policy engine.
 
 ## Security
 
@@ -275,17 +292,16 @@ The `ApprovalChannel` interface (`requestApproval()`) is open for custom impleme
 |------------|---------------|
 | **Fail-closed** | Exceptions in policy rules deny the transaction. Audit log failures block all transactions. |
 | **Two-phase evaluation** | Dry-run prevents counter inflation on denied transactions. |
-| **Circuit breaker** | Consecutive denials trigger automatic cooldown with per-agent isolation. |
-| **Hash-chained audit** | SHA-256 linked entries with `verifyIntegrity()` tamper detection. Optional AES-256-GCM encryption. |
+| **Circuit breaker** | Consecutive denials trigger automatic cooldown with single-process lock enforcement. |
+| **Hash-chained audit** | SHA-256 linked entries with per-entry HMAC, checkpoint hashing every 1000 entries, `verifyIntegrity()` tamper detection. |
 | **Serialized execution** | FIFO async mutex prevents TOCTOU race conditions. |
 | **Approval integrity** | SHA-256 intent hashing prevents TOCTOU between approval and execution. |
 | **DNS pinning** | SSRF and DNS rebinding protection for RPC endpoints. |
+| **Store timeouts** | All store operations wrapped with configurable timeout (default 5s). |
+| **Timing resistance** | Configurable `minEvaluationTimeMs` pads policy evaluation to mask rule count and denial source. |
 | **Idempotency** | Duplicate intent IDs return cached results. |
-| **Error sanitization** | Errors are sanitized before returning to agents — no secret leakage. |
+| **Error sanitization** | Errors are sanitized before returning to agents — no policy reconnaissance. |
 | **Counter integrity** | HMAC-protected store counters detect tampering. |
-| **Defense-in-depth** | Multiple overlapping security layers at every level of the stack. |
-
-196 audit findings remediated: 14 Critical, 27 High, 38 Medium, 31 Low.
 
 Report vulnerabilities via [GitHub Security Advisory](https://github.com/kova-wallet/kova/security/advisories/new).
 
@@ -298,11 +314,12 @@ kova/
 │   ├── policy/         # Policy builder, engine, and 5 rule implementations
 │   ├── signers/        # LocalSigner, MpcSigner, TurnkeyProvider
 │   ├── stores/         # MemoryStore, SqliteStore, RedisStore, PrefixedStore
-│   ├── chains/solana/  # SolanaAdapter, transfers, Jupiter swaps
-│   ├── approval/       # TelegramApprovalBot, ApprovalChannel interface
+│   ├── chains/solana/  # SolanaAdapter, SOL + SPL token transfers
+│   ├── approval/       # WebhookApprovalChannel, CallbackApprovalChannel
 │   ├── adapters/       # Claude, OpenAI, LangChain tool adapters
+│   ├── oracles/        # Pyth price feeds, consensus provider
 │   └── logging/        # Hash-chained audit logger
-├── tests/              # 1100+ unit and integration tests
+├── tests/              # 1,281 unit and integration tests
 └── docs-site/          # VitePress documentation
 ```
 
