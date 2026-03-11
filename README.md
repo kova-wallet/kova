@@ -7,7 +7,7 @@
 <p align="center">
   Policy-constrained crypto wallet SDK for AI agents.
   <br />
-  <a href="https://0xkeysersoze.github.io/kova/"><strong>Documentation &rarr;</strong></a>
+  <a href="https://kova-wallet.github.io/kova/"><strong>Documentation &rarr;</strong></a>
 </p>
 
 <p align="center">
