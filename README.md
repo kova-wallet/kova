@@ -11,9 +11,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/0xKeyserSoze/kova/actions/workflows/ci.yml"><img src="https://github.com/0xKeyserSoze/kova/actions/workflows/ci.yml/badge.svg?branch=prod" alt="CI" /></a>
+  <a href="https://github.com/kova-wallet/kova/actions/workflows/ci.yml"><img src="https://github.com/kova-wallet/kova/actions/workflows/ci.yml/badge.svg?branch=prod" alt="CI" /></a>
   <a href="https://www.npmjs.com/package/@kova/wallet"><img src="https://img.shields.io/npm/v/@kova/wallet" alt="npm version" /></a>
-  <a href="https://github.com/0xKeyserSoze/kova/blob/prod/LICENSE"><img src="https://img.shields.io/npm/l/@kova/wallet" alt="license" /></a>
+  <a href="https://github.com/kova-wallet/kova/blob/prod/LICENSE"><img src="https://img.shields.io/npm/l/@kova/wallet" alt="license" /></a>
   <img src="https://img.shields.io/node/v/@kova/wallet" alt="node version" />
 </p>
 
@@ -287,7 +287,7 @@ The `ApprovalChannel` interface (`requestApproval()`) is open for custom impleme
 
 196 audit findings remediated: 14 Critical, 27 High, 38 Medium, 31 Low.
 
-Report vulnerabilities via [GitHub Security Advisory](https://github.com/0xKeyserSoze/kova/security/advisories/new).
+Report vulnerabilities via [GitHub Security Advisory](https://github.com/kova-wallet/kova/security/advisories/new).
 
 ## Project Structure
 
@@ -309,7 +309,7 @@ kova/
 ## Development
 
 ```bash
-git clone https://github.com/0xKeyserSoze/kova.git
+git clone https://github.com/kova-wallet/kova.git
 cd kova
 npm install
 npm run typecheck       # type checking

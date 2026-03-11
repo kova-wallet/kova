@@ -14,7 +14,7 @@ hero:
       link: /getting-started/how-it-works
     - theme: alt
       text: View on GitHub
-      link: https://github.com/0xKeyserSoze/kova
+      link: https://github.com/kova-wallet/kova
 
 features:
   - title: "AgentWallet -- One Object, Full Control"

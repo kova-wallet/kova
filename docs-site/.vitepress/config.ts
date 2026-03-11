@@ -111,7 +111,7 @@ export default defineConfig({
     },
 
     socialLinks: [
-      { icon: 'github', link: 'https://github.com/0xKeyserSoze/kova' },
+      { icon: 'github', link: 'https://github.com/kova-wallet/kova' },
     ],
 
     search: {
@@ -124,7 +124,7 @@ export default defineConfig({
     },
 
     editLink: {
-      pattern: 'https://github.com/0xKeyserSoze/kova/edit/prod/docs-site/:path',
+      pattern: 'https://github.com/kova-wallet/kova/edit/prod/docs-site/:path',
       text: 'Edit this page on GitHub',
     },
   },
