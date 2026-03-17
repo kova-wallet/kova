@@ -167,6 +167,9 @@ import {
   SqliteStore,
   SolanaAdapter,
   Policy,
+  PolicyEngine,
+  SpendingLimitRule,
+  RateLimitRule,
 } from "@kova-sdk/wallet";
 import { Keypair } from "@solana/web3.js";
 
@@ -198,22 +201,27 @@ const policy = Policy.create("tipbot-policy")
   })
   .build();
 
-// The PerRecipientCapRule is a custom rule (see Step 1) that you can add
-// as additional middleware. Pass it via the customRules option.
+// The PerRecipientCapRule is a custom rule (see Step 1). To include it
+// alongside the built-in policy rules, construct a PolicyEngine with
+// both the built-in rules and your custom rule, then pass it as `policy`.
+const policyConfig = policy.toJSON();
+const engine = new PolicyEngine([
+  new RateLimitRule(policyConfig.rateLimit!),
+  // Per-recipient cap: max 0.5 SOL to any single address per day.
+  // Prevents one user from draining the bot.
+  new PerRecipientCapRule({
+    maxPerRecipientDaily: "0.5",
+    token: "SOL",
+  }),
+  new SpendingLimitRule(policyConfig.spendingLimit!),
+], store);
+
 const wallet = new AgentWallet({
   signer,
   chain,
-  policy,
+  policy: engine,
   store,
   dangerouslyDisableAuth: true,
-  customRules: [
-    // Per-recipient cap: max 0.5 SOL to any single address per day.
-    // Prevents one user from draining the bot.
-    new PerRecipientCapRule({
-      maxPerRecipientDaily: "0.5",
-      token: "SOL",
-    }),
-  ],
 });
 ```
 

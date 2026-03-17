@@ -207,7 +207,10 @@ console.log("Address:", address);
 // Output: "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU"
 
 // Health check verifies the signer is operational.
-// For LocalSigner, this always returns true since the key is in memory.
+// For LocalSigner, this performs a cryptographic self-test: it validates that the
+// public key is a valid Ed25519 curve point and (when the private key seed is
+// available) performs a full sign+verify round-trip. Returns false if the keypair
+// is corrupted or the signer has been destroyed.
 // For remote signers (e.g., Fireblocks), this would check API connectivity.
 const healthy = await signer.healthCheck();
 console.log("Healthy:", healthy);
@@ -322,11 +325,19 @@ interface MpcSigningProvider {
   // Receives the unsigned transaction bytes and must return:
   //   - signedData: the fully assembled signed transaction (ready to broadcast)
   //   - signature: the raw signature bytes (64 bytes for Ed25519 on Solana)
-  signTransaction(transactionData: Uint8Array): Promise<MpcSignResult>;
+  // The optional AbortSignal enables cooperative cancellation on timeout.
+  // Providers should check signal.aborted and abort in-flight HTTP requests when signalled.
+  signTransaction(transactionData: Uint8Array, signal?: AbortSignal): Promise<MpcSignResult>;
 
   /** Check if the provider is reachable and the signing key is available */
   // A health probe. Return true if your MPC backend is operational.
   healthCheck(): Promise<boolean>;
+
+  /** Optional cleanup method for provider resources */
+  // Called by MpcSigner.destroy() to allow the provider to release connections,
+  // clear caches, or perform other cleanup. Providers should be idempotent
+  // (calling destroy multiple times should be safe).
+  destroy?(): Promise<void>;
 }
 ```
 
@@ -341,12 +352,14 @@ interface MpcSignerConfig {
   /** Chain this signer operates on (e.g., "solana") */
   // Validated against incoming transactions -- rejects mismatched chains.
   chain: string;
-  /** Max retries for transient provider failures (default: 2) */
+  /** Max retries for transient provider failures (default: 2, clamped to [0, 10]) */
   // If the provider throws a transient error (network blip, temporary 503),
   // MpcSigner will retry up to this many additional times before failing.
+  // Values outside [0, 10] are clamped to prevent infinite retry loops.
   maxRetries?: number;
-  /** Timeout in ms for individual provider calls (default: 30000) */
+  /** Timeout in ms for individual provider calls (default: 30000, clamped to [1, 120000]) */
   // If a provider call takes longer than this, it throws a TIMEOUT error.
+  // Values outside [1, 120000] are clamped to prevent unbounded waits.
   timeoutMs?: number;
 }
 ```

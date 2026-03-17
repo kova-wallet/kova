@@ -197,7 +197,7 @@ By default, transactions outside active hours are denied. You can change this to
 ```typescript
 // Create a rule where off-hours transactions require approval instead of being denied.
 // During business hours (Mon-Fri, 9-5): transactions are allowed normally.
-// Outside business hours: transactions are denied with a message indicating approval is required.
+// Outside business hours: transactions are routed to the approval channel for human review.
 const rule = new TimeWindowRule({
   timezone: "America/New_York",
   windows: [
@@ -207,8 +207,8 @@ const rule = new TimeWindowRule({
 });
 ```
 
-::: warning DEPRECATION NOTICE
-The `"require_approval"` value for `outsideHoursPolicy` is **deprecated**. It currently behaves identically to `"deny"` -- the only difference is the denial reason string (the message says "requires approval" instead of "outside active hours"). It does **not** route transactions to an approval channel. For real approval-gated behavior outside active hours, pair `TimeWindowRule` with [`ApprovalGateRule`](/guide/rules/approval-gate) instead.
+::: tip
+When `outsideHoursPolicy` is `"require_approval"` and an `ApprovalChannel` is configured on the `PolicyEngine`, transactions outside active hours are routed through the approval flow instead of being denied outright. The human approver can then approve or reject the off-hours transaction. If the approval times out, the transaction is denied.
 :::
 
 ## Code Examples
@@ -299,13 +299,13 @@ const rule = new TimeWindowRule({
 When a transaction is denied due to the time window:
 
 ```
-DENY: Transaction denied: outside active hours (timezone: America/New_York)
+Transaction denied: outside active hours
 ```
 
-When `outsideHoursPolicy` is `"require_approval"`:
+When `outsideHoursPolicy` is `"require_approval"` and the approval times out:
 
 ```
-DENY: Transaction requires approval outside active hours
+Transaction outside active hours was not approved in time
 ```
 
 ## Introspection

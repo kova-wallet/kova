@@ -34,24 +34,32 @@ import type { TransactionIntent, IntentType, ChainId, IntentMetadata } from "@ko
 ```
 
 ```typescript
-// The TransactionIntent interface is the core data structure that agents use
-// to express what they want to accomplish. The SDK translates this high-level
-// description into chain-specific transactions.
-interface TransactionIntent {
+// TransactionIntent is a discriminated union on the `type` field, not a plain interface.
+// Each variant pairs a specific `type` with its corresponding `params` type, enabling
+// TypeScript to narrow `params` automatically when you check `intent.type`.
+type TransactionIntent =
+  | (TransactionIntentBase & { readonly type: "transfer"; readonly params: TransferParams })
+  | (TransactionIntentBase & { readonly type: "swap"; readonly params: SwapParams })
+  | (TransactionIntentBase & { readonly type: "mint"; readonly params: MintParams })
+  | (TransactionIntentBase & { readonly type: "stake"; readonly params: StakeParams })
+  | (TransactionIntentBase & { readonly type: "custom"; readonly params: CustomParams });
+
+// The base fields shared by all intent variants:
+interface TransactionIntentBase {
   /** Unique identifier for this intent (auto-generated if not provided) */
-  id?: string;
-  /** The type of operation */
-  type: IntentType;
+  readonly id?: string;
   /** Target chain */
-  chain: ChainId;
-  /** Operation-specific parameters */
-  params: IntentParams;
+  readonly chain: ChainId;
   /** Optional metadata for audit and context */
-  metadata?: IntentMetadata;
+  readonly metadata?: IntentMetadata;
   /** Timestamp when the intent was created */
-  createdAt?: number;
+  readonly createdAt?: number;
 }
 ```
+
+::: tip
+Because `TransactionIntent` is a discriminated union (not a plain interface), TypeScript can automatically narrow `params` when you check `intent.type`. For example, inside `if (intent.type === "transfer")`, TypeScript knows `intent.params` is `TransferParams`. Use the exported type guard functions (`isTransferIntent`, etc.) for runtime validation of untrusted input.
+:::
 
 ::: tip Think of it like a REST API request
 A `TransactionIntent` is structured like a well-designed API call: it has a **verb** (`type` -- what operation to perform), a **target** (`chain` -- which network), **parameters** (`params` -- the details), and **headers** (`metadata` -- context for logging and approvals). You describe what you want; the SDK figures out the how.
@@ -85,10 +93,14 @@ type IntentType = "transfer" | "swap" | "mint" | "stake" | "custom";
 // Defines the supported blockchain identifiers.
 // "solana": fully implemented with the SolanaAdapter chain adapter.
 // "ethereum" and "base": reserved for future chain adapter implementations.
-// "system": used internally for system-level intents.
+// "system": used internally for system-level intents (NOT valid for execute()).
 // Using an unsupported chain ID will cause validation to fail at execution time.
 type ChainId = "solana" | "ethereum" | "base" | "system";
 ```
+
+::: warning
+The `"system"` chain ID is reserved for internal use and **cannot be used in `execute()` intents**. The wallet's validation logic only accepts `"solana"`, `"ethereum"`, and `"base"` as valid chain IDs. Passing `"system"` to `execute()` will result in a `VALIDATION_FAILED` error.
+:::
 
 ::: tip
 Currently, only `"solana"` has a full chain adapter implementation. `"ethereum"` and `"base"` are defined as valid chain IDs for forward compatibility.

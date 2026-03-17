@@ -65,6 +65,8 @@ interface RateLimitConfig {
   maxTransactionsPerMinute?: number;
   /** Maximum number of transactions per rolling hour */
   maxTransactionsPerHour?: number;
+  /** Counter algorithm: "fixed-window" (TTL-based reset) or "sliding-window" (rolling sum). Default: "fixed-window" */
+  algorithm?: "fixed-window" | "sliding-window";
   /** Optional key prefix for store isolation between rule instances */
   keyPrefix?: string;
 }
@@ -211,8 +213,8 @@ With both limits configured, both must pass for the transaction to be allowed. A
 ## Denial Messages
 
 ```
-DENY: Rate limit exceeded: 5/5 transactions per minute already used
-DENY: Rate limit exceeded: 30/30 transactions per hour already used
+Rate limit exceeded: 5/5 transactions per minute already used
+Rate limit exceeded: 30/30 transactions per hour already used
 ```
 
 The message includes both the current count and the configured limit.

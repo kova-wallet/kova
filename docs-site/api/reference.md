@@ -31,7 +31,7 @@ new AgentWallet(config: AgentWalletConfig)
 | `logger` | `AuditLogger` | No | Tamper-evident audit logger |
 | `circuitBreaker` | `Partial<CircuitBreakerConfig> \| { dangerouslyDisable: true } \| false` | No | Circuit breaker configuration. Use `{ dangerouslyDisable: true }` to disable. |
 | `onAuditFailure` | `AuditFailureCallback` | No | Callback fired on audit integrity failures |
-| `enabledTools` | `ReadonlySet<string>` | No | Set of tool names to enable (defaults to `wallet_get_balance` and `wallet_get_transaction_history` only) |
+| `enabledTools` | `ReadonlySet<string>` | No | Set of tool names to enable (defaults to 10 read-only tools: `wallet_get_balance`, `wallet_get_address`, `wallet_get_policy`, `wallet_get_transaction_history`, `wallet_get_all_balances`, `wallet_get_token_info`, `wallet_get_recent_transactions`, `wallet_get_spending_summary`, `wallet_get_circuit_breaker_status`, `wallet_get_supported_chains`) |
 | `idempotencyTtl` | `number` | No | TTL for idempotency cache entries in seconds |
 | `idempotencyHmacKey` | `string \| Buffer` | No | HMAC-SHA256 key for verifying cached idempotency entries |
 | `storePrefix` | `string` | No | Key prefix for multi-wallet store isolation |
@@ -108,7 +108,7 @@ Retrieve recent transaction results from the audit log. Default limit is 10, max
 const history = await wallet.getTransactionHistory(50);
 ```
 
-#### `handleToolCall(name: string, input: Record<string, unknown>): Promise<ToolCallResult>`
+#### `handleToolCall(name: string, input: Record<string, unknown>, authToken?: string): Promise<ToolCallResult>`
 
 Execute a wallet tool by name. Used in AI tool-use loops.
 
@@ -192,7 +192,7 @@ interface SwapParams {
   fromToken: string;       // Source token symbol or mint address (the token you're selling)
   toToken: string;         // Destination token symbol or mint address (the token you're buying)
   amount: string;          // Amount of the source token to swap (decimal string)
-  maxSlippage?: number;    // Max acceptable slippage as a percentage (e.g., 0.5 = 0.5%). Default: 0.5
+  maxSlippage?: number;    // Max acceptable slippage as a decimal fraction (e.g., 0.01 = 1%, 0.005 = 0.5%). Default: 0.01
 }
 ```
 

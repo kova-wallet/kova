@@ -75,13 +75,17 @@ const wallet = new AgentWallet({
     rpcUrl: "https://api.devnet.solana.com",  // Free test network
   }),
 
-  // policy: What's allowed. The policy engine evaluates every transaction
-  // against your rules before it can be signed and broadcast.
+  // policy: What's allowed. Accepts a Policy object or PolicyEngine instance.
+  // The wallet creates the PolicyEngine internally when given a Policy.
   policy: engine,
 
   // store: Where state lives. Spending counters, rate limit windows,
   // audit log entries, and idempotency caches all live in the store.
   store,
+
+  // dangerouslyDisableAuth: Dev-only. In production, provide an authToken instead.
+  // Without this flag or an authToken, the constructor throws an error.
+  dangerouslyDisableAuth: true,
 });
 ```
 
@@ -90,7 +94,7 @@ const wallet = new AgentWallet({
 | Method | What it does | When to use |
 |--------|-------------|-------------|
 | `execute(intent, authToken?)` | Runs the full 10-step pipeline: validate, policy check, sign, broadcast | Direct programmatic use |
-| `handleToolCall(name, params)` | Dispatches an AI agent's tool call to the right wallet method | AI agent integration |
+| `handleToolCall(name, params, authToken?)` | Dispatches an AI agent's tool call to the right wallet method | AI agent integration |
 | `getBalance(token)` | Returns the wallet's balance for a given token | Read-only queries |
 | `getAddress()` | Returns the wallet's public address | Display or verification |
 | `getPolicy()` | Returns a human-readable summary of active policy constraints | Agent introspection (opt-in) |
@@ -288,8 +292,9 @@ interface Store {
 | Store | Use case | Trade-off |
 |-------|----------|-----------|
 | `MemoryStore` | Development, testing, CI | Fast but all state lost on restart |
-| `SqliteStore` | Production | Persistent, encrypted, survives restarts |
-| Custom | Redis, PostgreSQL, etc. | Implement the `Store` interface |
+| `SqliteStore` | Single-server production | Persistent, encrypted, survives restarts |
+| `RedisStore` | Multi-server production | Shared state across processes via Redis |
+| Custom | PostgreSQL, etc. | Implement the `Store` interface |
 
 ::: warning Always use SqliteStore in production
 With `MemoryStore`, spending limits reset on every process restart. An agent could spend its daily limit, you restart the server, and the counter goes back to zero -- allowing the agent to spend the full limit again. `SqliteStore` persists to a file so counters survive restarts.

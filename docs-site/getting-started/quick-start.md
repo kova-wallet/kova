@@ -24,20 +24,12 @@ import {
                       // (validate -> policy check -> sign -> broadcast -> audit log)
   Policy,             // Fluent builder for declaratively defining policy configurations.
                       // Produces a serializable PolicyConfig object.
-  PolicyEngine,       // Evaluates an ordered list of rules against each transaction intent.
-                      // Two-phase evaluation (dry-run then commit) prevents counter inflation.
   MemoryStore,        // In-memory Store implementation for dev/testing.
                       // All state (spending counters, rate limits, audit log) is lost on restart.
   LocalSigner,        // Wraps a Solana Keypair and signs transactions locally.
                       // Development only -- key is held in process memory (insecure).
   SolanaAdapter,      // Handles Solana-specific operations: build unsigned transactions,
                       // broadcast signed transactions, query balances, validate addresses.
-  SpendingLimitRule,  // Enforces per-transaction and periodic (daily/weekly/monthly) spending caps.
-                      // Uses sliding windows (not fixed TTL) to prevent boundary double-spend.
-  RateLimitRule,      // Enforces max transactions per minute and per hour using rolling windows.
-                      // Has a built-in floor of 30 writes/min to protect against runaway agents.
-  AllowlistRule,      // Restricts which destination addresses the agent can send funds to.
-                      // Deny entries take precedence over allow entries.
 } from "@kova-sdk/wallet";
 
 // Keypair from Solana's web3.js library generates and holds a public/private key pair.
@@ -110,51 +102,28 @@ async function main() {
     })
     .build();  // Finalize and return the immutable Policy object
 
-  // ── 5. Extract config and create individual rules ───────────────────────
-  // toJSON() serializes the policy to a plain object so we can extract
-  // config for each rule type. This separation keeps policy definition
-  // (declarative builder) separate from policy execution (rule instances).
-  const config = policy.toJSON();
-
-  // Create concrete rule instances in evaluation order.
-  // Rules are evaluated sequentially; the cheapest checks go first to
-  // short-circuit early and avoid unnecessary work on denied transactions.
-  const rules = [
-    // RateLimitRule first: cheapest check (simple counter lookup).
-    // If the agent has exceeded its quota, we don't need to check anything else.
-    new RateLimitRule(config.rateLimit!),
-
-    // AllowlistRule second: fast address lookup (hash set membership check).
-    // If the recipient isn't on the allowlist, skip the spending calculation.
-    new AllowlistRule({
-      allowAddresses: config.allowAddresses,
-    }),
-
-    // SpendingLimitRule last: most expensive check (aggregates historical spending).
-    // Only runs if the rate limit and allowlist both passed.
-    new SpendingLimitRule(config.spendingLimit!),
-  ];
-
-  // ── 6. Create the policy engine ─────────────────────────────────────────
-  // PolicyEngine takes the ordered rules and a store (for stateful rules like
-  // spending limits and rate limits). It evaluates every intent against all
-  // rules sequentially. If ANY rule returns DENY, the engine stops immediately
-  // and returns DENY. The transaction only proceeds if ALL rules return ALLOW.
-  const engine = new PolicyEngine(rules, store);
-
-  // ── 7. Create the wallet ────────────────────────────────────────────────
-  // AgentWallet wires together the signer, chain adapter, policy engine, and store
+  // ── 5. Create the wallet ────────────────────────────────────────────────
+  // AgentWallet wires together the signer, chain adapter, policy, and store
   // into a single object. This is the only object that AI agents interact with.
-  // It exposes: execute(), getBalance(), getAddress(), getPolicy(), and
-  // getTransactionHistory().
+  // It exposes: execute(), handleToolCall(), getBalance(), getAddress(),
+  // getPolicy(), and getTransactionHistory().
+  // You can pass the Policy object directly -- the wallet automatically
+  // constructs the internal PolicyEngine from the policy configuration.
   const wallet = new AgentWallet({
     signer,         // Signs transactions with the private key before broadcast
     chain,          // Builds and broadcasts transactions to the Solana blockchain
-    policy: engine, // Evaluates policy rules before allowing any transaction
+    policy,         // The Policy object -- wallet creates the PolicyEngine internally
     store,          // Shared store for spending counters, audit logs, idempotency cache
+    dangerouslyDisableAuth: true,  // Dev-only; in production, provide an authToken instead
+    enabledTools: new Set([        // Explicitly enable write tools (read-only enabled by default)
+      "wallet_get_balance",
+      "wallet_get_transaction_history",
+      "wallet_get_policy",
+      "wallet_transfer",
+    ]),
   });
 
-  // ── 8. Execute a transfer ───────────────────────────────────────────────
+  // ── 6. Execute a transfer ───────────────────────────────────────────────
   // wallet.execute() runs the full 10-step pipeline:
   //   1. Validate intent structure and types
   //   2. Normalize (assign UUID, timestamp)
@@ -188,7 +157,7 @@ async function main() {
     },
   });
 
-  // ── 9. Log the result ───────────────────────────────────────────────────
+  // ── 7. Log the result ───────────────────────────────────────────────────
   // TransactionResult is a discriminated union with four possible statuses:
   //   "confirmed" -- transaction was broadcast and confirmed on-chain
   //   "denied"    -- policy engine rejected the transaction (with reason)
@@ -201,17 +170,18 @@ async function main() {
     intentId: result.intentId, // Unique ID assigned to this intent (UUID v4)
   });
 
-  // ── 10. Check the wallet's policy summary ───────────────────────────────
+  // ── 8. Check the wallet's policy summary ───────────────────────────────
   // getPolicy() returns a human-readable summary of the active policy,
   // including all configured limits, allowlists, and thresholds.
   // This is the same information exposed to the AI agent via wallet_get_policy.
   const policySummary = await wallet.getPolicy();
   console.log("Policy summary:", JSON.stringify(policySummary, null, 2));
 
-  // ── 11. View transaction history ────────────────────────────────────────
-  // getTransactionHistory(n) retrieves the last n entries from the audit log.
-  // Each entry includes: status, summary, timestamp, txId, intentId, and
-  // the per-rule policy evaluation results.
+  // ── 9. View transaction history ────────────────────────────────────────
+  // getTransactionHistory(limit, options?) retrieves the last `limit` entries
+  // from the audit log. Each entry includes: status, summary, timestamp, txId,
+  // intentId, and the per-rule policy evaluation results.
+  // Optional second parameter: { redactAddresses?: boolean } to mask addresses.
   const history = await wallet.getTransactionHistory(5);
   console.log("Recent transactions:", history.length);
 }
@@ -270,12 +240,10 @@ Here's a step-by-step breakdown of what the code above did. If you're coming fro
 2. **Signer** -- The `LocalSigner` wraps the keypair and can sign transactions (like adding your signature to a check before it can be cashed)
 3. **Store** -- The `MemoryStore` tracks spending counters and audit logs in memory (like an in-memory cache such as Redis, but simpler)
 4. **Chain adapter** -- The `SolanaAdapter` connects to Solana devnet (a free test network) via RPC (a URL used to talk to the blockchain, similar to a REST API endpoint)
-5. **Policy** -- The fluent builder created a policy config with spending limits, an allowlist (a pre-approved list of recipient addresses), and rate limits
-6. **Rules** -- Individual rule instances were created from the policy config (each rule is like a middleware function that checks one condition)
-7. **Engine** -- The `PolicyEngine` evaluates rules sequentially (cheapest rules first, to fail fast -- just like you'd put your lightest validation middleware first in Express)
-8. **Wallet** -- The `AgentWallet` wires everything together (this is the main entry point, like an Express `app` object that ties routes, middleware, and database together)
-9. **Execute** -- The `execute()` pipeline validated the intent, checked all policy rules, built the transaction, signed it, and broadcast it to Solana
-10. **Result** -- A structured `TransactionResult` with status, transaction ID, and summary
+5. **Policy** -- The fluent builder created a policy with spending limits, an allowlist (a pre-approved list of recipient addresses), and rate limits. The `AgentWallet` automatically creates the `PolicyEngine` and individual rules from the `Policy` object internally.
+6. **Wallet** -- The `AgentWallet` wires everything together (this is the main entry point, like an Express `app` object that ties routes, middleware, and database together)
+7. **Execute** -- The `execute()` pipeline validated the intent, checked all policy rules, built the transaction, signed it, and broadcast it to Solana
+8. **Result** -- A structured `TransactionResult` with status, transaction ID, and summary
 
 ### Why this matters
 
@@ -304,7 +272,7 @@ The `AllowlistRule` will deny the transaction before it ever reaches the blockch
 Performance. Rules are checked in order, and evaluation stops at the first denial. The cheapest checks go first -- counting recent transactions (rate limit) is faster than aggregating spending amounts. This is the same pattern as putting lightweight middleware before expensive middleware in a web framework.
 
 **Q: What is the difference between `Policy.create()` and creating rules manually?**
-`Policy.create()` is a convenient builder that generates a configuration object. You still need to create individual rule instances from that configuration for the `PolicyEngine`. Think of the builder as a form that collects settings, and the rules as the actual validators that enforce them.
+`Policy.create()` is a convenient builder that produces a `Policy` object you can pass directly to `AgentWallet`. The wallet automatically creates the `PolicyEngine` and individual rule instances internally. For advanced use cases, you can also construct a `PolicyEngine` with manual rule instances and pass that instead.
 
 **Q: Can I add my own custom policy rules?**
 Yes. Any class that implements the `PolicyRule` interface (with an `evaluate()` method) can be added to the `PolicyEngine`. See the [Policy Engine guide](/guide/policy-engine) for details on creating custom rules.

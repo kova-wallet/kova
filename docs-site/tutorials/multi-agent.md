@@ -117,7 +117,7 @@ The trading agent can execute swaps on Jupiter and Orca and transfer SOL, with a
 // Each agent gets its own keypair. In production, load these from
 // separate environment variables or a secrets manager.
 const tradingKeypair = Keypair.generate();
-const tradingSigner = new LocalSigner(tradingKeypair); // Dev-only; throws in production unless KOVA_ALLOW_LOCAL_SIGNER=1
+const tradingSigner = new LocalSigner(tradingKeypair, { network: "devnet" }); // Dev-only; throws in production unless KOVA_ALLOW_LOCAL_SIGNER=1
 
 // Build the trading policy: generous limits, program-restricted swaps.
 const tradingPolicy = Policy.create("trading-agent")
@@ -152,6 +152,7 @@ const tradingWallet = new AgentWallet({
   policy: tradingEngine,
   store,
   logger: tradingLogger,
+  dangerouslyDisableAuth: true,  // Dev-only; use authToken in production
   // Key prefix isolates this agent's counters and logs in the shared store.
   // All keys written by this wallet will be prefixed with "trade:"
   // e.g., "trade:spending:daily:SOL", "trade:audit:log"
@@ -169,7 +170,7 @@ The payments agent can only send SOL transfers to a pre-approved list of address
 // ── Payments Agent ──────────────────────────────────────────────────────────
 
 const paymentsKeypair = Keypair.generate();
-const paymentsSigner = new LocalSigner(paymentsKeypair); // Dev-only; throws in production unless KOVA_ALLOW_LOCAL_SIGNER=1
+const paymentsSigner = new LocalSigner(paymentsKeypair, { network: "devnet" }); // Dev-only; throws in production unless KOVA_ALLOW_LOCAL_SIGNER=1
 
 // Build the payments policy: conservative limits, address-restricted.
 const paymentsPolicy = Policy.create("payments-agent")
@@ -205,6 +206,7 @@ const paymentsWallet = new AgentWallet({
   policy: paymentsEngine,
   store,
   logger: paymentsLogger,
+  dangerouslyDisableAuth: true,  // Dev-only; use authToken in production
   // Different prefix -- keeps this agent's data separate from the trading agent.
   storePrefix: "pay:",
 });
@@ -373,7 +375,7 @@ The pattern is the same for any number of agents. Each one gets:
 
 ```typescript
 const agentN = new AgentWallet({
-  signer: new LocalSigner(keypairN),    // Unique signer (Dev-only; throws in production unless KOVA_ALLOW_LOCAL_SIGNER=1)
+  signer: new LocalSigner(keypairN, { network: "devnet" }),    // Unique signer (Dev-only; throws in production unless KOVA_ALLOW_LOCAL_SIGNER=1)
   chain,                                 // Shared chain adapter
   policy: new PolicyEngine(rulesN, store), // Unique policy
   store,                                 // Shared store

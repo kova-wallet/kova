@@ -128,7 +128,7 @@ kova is made up of composable pieces. Here they are from most central to most sp
 | **TransactionIntent** | High-level "what" not "how" -- agents describe transfers, swaps, mints, stakes | 5 built-in types |
 | **PolicyEngine** | Evaluates rules sequentially against every intent, deny-by-default | Which rules to include |
 | **Policy Rules** | Individual constraints plugged into the engine | Mix and match: spending limits, allowlists, rate limits, time windows, approval gates |
-| **Store** | Persists counters, audit logs, and idempotency caches | `MemoryStore` (dev) or `SqliteStore` (production) |
+| **Store** | Persists counters, audit logs, and idempotency caches | `MemoryStore` (dev), `SqliteStore` (single-server), or `RedisStore` (multi-server) |
 | **Signer** | Holds keys, signs transactions | `LocalSigner` (dev) or `MpcSigner` (production) |
 | **ChainAdapter** | Talks to the blockchain, builds and broadcasts transactions | `SolanaAdapter` (more chains planned) |
 | **MCP Server** | Exposes wallet tools via Model Context Protocol -- the sole agent interface | `createMcpServer()`, `createMcpStdioServer()` |
@@ -193,8 +193,6 @@ const policy = Policy.create("my-agent")
 // ── Step 4: Wire everything into an AgentWallet ─────────────────────────────
 // The Policy builder can be passed directly to the AgentWallet constructor.
 // The wallet handles creating the PolicyEngine and rules internally.
-
-// ── Step 5: Wire everything into an AgentWallet ─────────────────────────────
 // AgentWallet is the single object that AI agents interact with.
 // It connects the signer (who signs), chain adapter (where to send),
 // policy engine (what's allowed), and store (tracking state).
@@ -205,9 +203,11 @@ const wallet = new AgentWallet({
   }),
   policy,          // The Policy that enforces spending limits and rate limits
   store,           // Shared store for counters, audit logs, and idempotency
+  dangerouslyDisableAuth: true,  // Dev-only; in production, provide an authToken instead
+  enabledTools: new Set(["wallet_transfer", "wallet_get_balance"]),  // Explicitly enable write tools
 });
 
-// ── Step 6: Execute a transaction ───────────────────────────────────────────
+// ── Step 5: Execute a transaction ───────────────────────────────────────────
 // This is what the AI agent triggers when it calls the wallet_transfer tool.
 // The full pipeline runs: validate -> policy check -> build tx -> sign -> broadcast.
 const result = await wallet.handleToolCall("wallet_transfer", {
@@ -220,6 +220,10 @@ const result = await wallet.handleToolCall("wallet_transfer", {
 ```
 
 That's the entire model. Your server holds the keys and enforces the rules. The agent just sees tools and results.
+
+::: warning Write tools must be explicitly enabled
+By default, `AgentWallet` only enables read-only tools (`wallet_get_balance`, `wallet_get_transaction_history`, `wallet_get_policy`). Write tools like `wallet_transfer`, `wallet_swap`, `wallet_mint`, and `wallet_stake` must be explicitly enabled via the `enabledTools` config option. This prevents accidental exposure of dangerous operations.
+:::
 
 ## Common Questions
 

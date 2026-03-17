@@ -134,6 +134,7 @@ const wallet = new AgentWallet({
   chain: new SolanaAdapter({ rpcUrl: process.env.SOLANA_RPC_URL! }),
   policy: engine,
   store,
+  dangerouslyDisableAuth: true, // Opt out of authToken requirement (provide authToken in production)
 });
 
 // --- 3. Create the MCP server ---

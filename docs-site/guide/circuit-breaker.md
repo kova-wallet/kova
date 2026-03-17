@@ -46,7 +46,7 @@ interface CircuitBreakerConfig {
 | `threshold` | `5` | Number of consecutive `DENY` decisions before the circuit opens |
 | `cooldownMs` | `300000` (5 min) | How long the circuit stays open before auto-resetting |
 | `intentTypes` | `["transfer", "swap", "stake", "custom"]` | Intent types to track. Maximum 20 entries. |
-| `failOnMultiInstance` | `undefined` | Whether to fail when multiple wallet instances are detected |
+| `failOnMultiInstance` | `true` | Whether to throw an error when multiple wallet instances sharing the same store are detected. Set to `false` only if you have implemented distributed locking. |
 
 ## State Machine
 
