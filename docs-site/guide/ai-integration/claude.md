@@ -13,7 +13,7 @@ import { Keypair } from "@solana/web3.js";
 import {
   AgentWallet, Policy, LocalSigner, MemoryStore, SolanaAdapter,
   createMcpStdioServer,
-} from "@kova/wallet";
+} from "@kova-sdk/wallet";
 
 // 1. Configure the wallet
 const signer = new LocalSigner(Keypair.generate());

@@ -38,7 +38,7 @@ import {
                       // Has a built-in floor of 30 writes/min to protect against runaway agents.
   AllowlistRule,      // Restricts which destination addresses the agent can send funds to.
                       // Deny entries take precedence over allow entries.
-} from "@kova/wallet";
+} from "@kova-sdk/wallet";
 
 // Keypair from Solana's web3.js library generates and holds a public/private key pair.
 // The public key is the wallet's "address" (visible to everyone, like a bank account number).

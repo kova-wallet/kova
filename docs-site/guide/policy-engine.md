@@ -17,7 +17,7 @@ Without a PolicyEngine, your AI agent would have unrestricted access to your wal
 The `PolicyEngine` is the core enforcement layer of `kova`. It holds an ordered list of policy rules and evaluates them sequentially against each transaction intent.
 
 ::: warning Advanced API
-`PolicyEngine` is exported as `@internal` from `@kova/wallet`. For most use cases, prefer the `Policy` builder pattern (shown below) which provides a safer, declarative API. Direct `PolicyEngine` usage is available for advanced scenarios where you need fine-grained control over rule construction.
+`PolicyEngine` is exported as `@internal` from `@kova-sdk/wallet`. For most use cases, prefer the `Policy` builder pattern (shown below) which provides a safer, declarative API. Direct `PolicyEngine` usage is available for advanced scenarios where you need fine-grained control over rule construction.
 :::
 
 ### When would I use this?
@@ -33,7 +33,7 @@ The `PolicyEngine` is the core enforcement layer of `kova`. It holds an ordered 
 ```typescript
 // Import the PolicyEngine class from the kova SDK.
 // The PolicyEngine is responsible for evaluating transaction intents against a set of rules.
-import { PolicyEngine } from "@kova/wallet";
+import { PolicyEngine } from "@kova-sdk/wallet";
 
 // Create a new PolicyEngine instance.
 // - rules: an ordered array of PolicyRule objects (evaluated sequentially; order matters!).
@@ -67,7 +67,7 @@ import {
   MemoryStore,
   SpendingLimitRule,
   RateLimitRule,
-} from "@kova/wallet";
+} from "@kova-sdk/wallet";
 
 // Create an in-memory store for rule state persistence.
 // In production, use SqliteStore or a custom Store implementation for durability.
@@ -351,7 +351,7 @@ import {
   TimeWindowRule,      // Restricts when transactions can occur
   ApprovalGateRule,    // Requires human approval above a threshold
   CallbackApprovalChannel, // Sends approval requests via callbacks
-} from "@kova/wallet";
+} from "@kova-sdk/wallet";
 
 // Step 1: Build the policy config using the fluent builder API.
 // The builder provides a chainable interface for defining all constraints.
@@ -516,7 +516,7 @@ const name: string = policy.getName();
 Policies can be serialized to JSON for storage, transmission, or configuration files. This makes it easy to store your policy in a database, load it from a config file, or send it over an API -- and reconstruct the exact same policy later.
 
 ```typescript
-import { Policy } from "@kova/wallet";
+import { Policy } from "@kova-sdk/wallet";
 
 // Create a policy with spending limits, rate limits, and an address allowlist.
 const original = Policy.create("agent-policy")

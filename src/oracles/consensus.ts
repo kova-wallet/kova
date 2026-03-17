@@ -33,8 +33,8 @@ export interface ConsensusProvider {
  *
  * @example
  * ```typescript
- * import { createPythPriceProvider } from "@kova/wallet/oracles";
- * import { createConsensusProvider } from "@kova/wallet/oracles";
+ * import { createPythPriceProvider } from "@kova-sdk/wallet/oracles";
+ * import { createConsensusProvider } from "@kova-sdk/wallet/oracles";
  *
  * const provider = createConsensusProvider([
  *   createPythPriceProvider(connection),

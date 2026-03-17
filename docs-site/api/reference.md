@@ -798,7 +798,7 @@ No configuration parameters. Ideal for development, testing, and ephemeral workl
 ```typescript
 // Import and create an in-memory store.
 // Fast and simple, but all data is lost on process restart.
-import { MemoryStore } from "@kova/wallet";
+import { MemoryStore } from "@kova-sdk/wallet";
 
 const store = new MemoryStore();
 ```
@@ -824,7 +824,7 @@ new SqliteStore(config: SqliteStoreConfig)
 ```typescript
 // Import and create a file-backed SQLite store.
 // The database file is created automatically if it doesn't exist.
-import { SqliteStore } from "@kova/wallet";
+import { SqliteStore } from "@kova-sdk/wallet";
 
 const store = new SqliteStore({
   path: "./data/kova.db",  // Path to the SQLite database file
@@ -857,7 +857,7 @@ new RedisStore(config?: RedisStoreConfig)
 
 ```typescript
 // Import and create a Redis-backed store.
-import { RedisStore } from "@kova/wallet";
+import { RedisStore } from "@kova-sdk/wallet";
 
 // Simple: connect with a URL
 const store = new RedisStore({ url: "redis://localhost:6379" });
@@ -945,7 +945,7 @@ new LocalSigner(keypair: Keypair)
 ```typescript
 // Import Keypair from Solana's web3.js library and LocalSigner from kova.
 import { Keypair } from "@solana/web3.js";
-import { LocalSigner } from "@kova/wallet";
+import { LocalSigner } from "@kova-sdk/wallet";
 
 // Generate a new random keypair for development/testing.
 const keypair = Keypair.generate();
@@ -981,7 +981,7 @@ new MPCSigner(config: MPCSignerConfig)
 
 ```typescript
 // Import MPCSigner from kova.
-import { MPCSigner } from "@kova/wallet";
+import { MPCSigner } from "@kova-sdk/wallet";
 
 // Create an MPCSigner instance pointing to your MPC service.
 // In production, the private key is split across multiple parties
@@ -1069,7 +1069,7 @@ new SolanaAdapter(config: SolanaAdapterConfig)
 
 ```typescript
 // Import and configure the Solana adapter with a Pyth price oracle.
-import { SolanaAdapter, createPythPriceProvider } from "@kova/wallet";
+import { SolanaAdapter, createPythPriceProvider } from "@kova-sdk/wallet";
 import { Connection } from "@solana/web3.js";
 
 const connection = new Connection("https://api.mainnet-beta.solana.com");
@@ -1149,7 +1149,7 @@ new CallbackApprovalChannel(config: CallbackApprovalChannelConfig)
 | `defaultTimeout` | `number` | No | Default timeout in ms (default: 300000 = 5 min) |
 
 ```typescript
-import { CallbackApprovalChannel } from "@kova/wallet";
+import { CallbackApprovalChannel } from "@kova-sdk/wallet";
 
 const approval = new CallbackApprovalChannel({
   name: "my-approval",
@@ -1183,7 +1183,7 @@ new WebhookApprovalChannel(config: WebhookApprovalChannelConfig)
 | `defaultTimeout` | `number` | No | Default timeout in ms (default: 300000 = 5 min) |
 
 ```typescript
-import { WebhookApprovalChannel } from "@kova/wallet";
+import { WebhookApprovalChannel } from "@kova-sdk/wallet";
 
 const approval = new WebhookApprovalChannel({
   webhookUrl: "https://your-approval-service.com/approve",
@@ -1206,7 +1206,7 @@ await approval.start();
 Create an MCP Server instance with all wallet tools registered. The returned server is not yet connected to a transport -- call `server.connect(transport)` with a `StdioServerTransport` or any other MCP-compatible transport.
 
 ```typescript
-import { createMcpServer } from "@kova/wallet";
+import { createMcpServer } from "@kova-sdk/wallet";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 
 const server = createMcpServer(wallet);
@@ -1218,7 +1218,7 @@ await server.connect(new StdioServerTransport());
 Convenience function that creates an MCP server and connects it to stdio transport.
 
 ```typescript
-import { createMcpStdioServer } from "@kova/wallet";
+import { createMcpStdioServer } from "@kova-sdk/wallet";
 
 const server = await createMcpStdioServer(wallet);
 ```
@@ -1267,7 +1267,7 @@ new AuditLogger(config: AuditLoggerConfig)
 
 ```typescript
 // Import AuditLogger from kova.
-import { AuditLogger } from "@kova/wallet";
+import { AuditLogger } from "@kova-sdk/wallet";
 
 // Create an audit logger with failure monitoring.
 // When audit writes fail 3 times in a row, the circuit breaker opens

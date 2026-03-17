@@ -1,7 +1,7 @@
 # MPC Signing with Turnkey (End-to-End)
 
 ::: tip BUILT-IN PROVIDER AVAILABLE
-kova ships with a built-in `TurnkeyProvider` that you can import directly from `@kova/wallet`. For most use cases, you do not need to build your own. This tutorial walks through creating a custom provider from scratch for educational purposes, so you understand how the `MpcSigningProvider` interface works under the hood.
+kova ships with a built-in `TurnkeyProvider` that you can import directly from `@kova-sdk/wallet`. For most use cases, you do not need to build your own. This tutorial walks through creating a custom provider from scratch for educational purposes, so you understand how the `MpcSigningProvider` interface works under the hood.
 :::
 
 ---
@@ -108,7 +108,7 @@ npm install @turnkey/sdk-server @turnkey/api-key-stamper
 Create a new file `turnkey-provider.ts`:
 
 ```typescript
-import type { MpcSigningProvider, MpcSignResult } from "@kova/wallet";
+import type { MpcSigningProvider, MpcSignResult } from "@kova-sdk/wallet";
 import { Turnkey } from "@turnkey/sdk-server";
 import { ApiKeyStamper } from "@turnkey/api-key-stamper";
 
@@ -269,7 +269,7 @@ import {
   SqliteStore,
   SolanaAdapter,
   Policy,
-} from "@kova/wallet";
+} from "@kova-sdk/wallet";
 import { TurnkeyProvider } from "./turnkey-provider";
 
 async function main() {
@@ -421,8 +421,8 @@ Here is a test suite for your `TurnkeyProvider` using mocks (no live API needed)
 
 ```typescript
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { MpcSigner, MpcSignerError } from "@kova/wallet";
-import type { MpcSigningProvider, MpcSignResult } from "@kova/wallet";
+import { MpcSigner, MpcSignerError } from "@kova-sdk/wallet";
+import type { MpcSigningProvider, MpcSignResult } from "@kova-sdk/wallet";
 
 // Mock provider that simulates Turnkey behavior without API calls.
 function createMockTurnkeyProvider(

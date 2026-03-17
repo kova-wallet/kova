@@ -161,8 +161,8 @@ export interface PythPriceProvider {
  * @example
  * ```typescript
  * import { Connection } from "@solana/web3.js";
- * import { SolanaAdapter } from "@kova/wallet";
- * import { createPythPriceProvider } from "@kova/wallet/oracles";
+ * import { SolanaAdapter } from "@kova-sdk/wallet";
+ * import { createPythPriceProvider } from "@kova-sdk/wallet/oracles";
  *
  * const connection = new Connection("https://api.mainnet-beta.solana.com");
  * const adapter = new SolanaAdapter({

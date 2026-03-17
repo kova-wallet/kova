@@ -48,11 +48,11 @@ Here is a complete, working server that exposes kova as an HTTP API. It uses MCP
 ```bash
 # Create a new project and install all dependencies.
 # express                      - HTTP server framework
-# @kova/wallet                 - The wallet SDK
+# @kova-sdk/wallet                 - The wallet SDK
 # @solana/web3.js              - Solana client library for Keypair loading
 # @modelcontextprotocol/sdk    - MCP server support
 npm init -y
-npm install express @kova/wallet @solana/web3.js @modelcontextprotocol/sdk
+npm install express @kova-sdk/wallet @solana/web3.js @modelcontextprotocol/sdk
 npm install -D typescript ts-node @types/express @types/node
 ```
 
@@ -88,9 +88,9 @@ import {
   PolicyEngine,       // Evaluates rules against each transaction intent
   SpendingLimitRule,  // Caps per-transaction and daily spending
   RateLimitRule,      // Limits transactions per time window
-} from "@kova/wallet";
+} from "@kova-sdk/wallet";
 // Import the MCP server factory to expose wallet tools via Model Context Protocol.
-import { createMcpServer } from "@kova/wallet";
+import { createMcpServer } from "@kova-sdk/wallet";
 // Import Node.js fs for reading the keypair file from disk.
 import { readFileSync } from "fs";
 

@@ -84,7 +84,7 @@ import {
   RateLimitRule,
   AllowlistRule,
   AuditLogger,
-} from "@kova/wallet";
+} from "@kova-sdk/wallet";
 import { Keypair } from "@solana/web3.js";
 
 // ── Shared Store ────────────────────────────────────────────────────────────

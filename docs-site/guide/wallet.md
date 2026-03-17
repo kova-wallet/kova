@@ -28,11 +28,11 @@ The `AgentWallet` class is the main entry point for the SDK. It wires together t
 // Import the main AgentWallet class from the kova SDK.
 // AgentWallet is the top-level object that orchestrates transaction execution,
 // policy enforcement, signing, and chain interaction.
-import { AgentWallet } from "@kova/wallet";
+import { AgentWallet } from "@kova-sdk/wallet";
 
 // Import the TypeScript type for the wallet configuration object.
 // This type defines the shape of the options you pass when constructing an AgentWallet.
-import type { AgentWalletConfig } from "@kova/wallet";
+import type { AgentWalletConfig } from "@kova-sdk/wallet";
 ```
 
 ### AgentWalletConfig
@@ -81,7 +81,7 @@ import {
   MemoryStore,
   LocalSigner,
   SolanaAdapter,
-} from "@kova/wallet";
+} from "@kova-sdk/wallet";
 
 // Import the Keypair class from the Solana web3.js library.
 // Keypair represents a Solana public/private key pair used for signing transactions.
@@ -150,7 +150,7 @@ import {
   ApprovalGateRule,
   CallbackApprovalChannel,
   AuditLogger,
-} from "@kova/wallet";
+} from "@kova-sdk/wallet";
 import { Keypair } from "@solana/web3.js";
 
 // Create a persistent SQLite-backed store.
@@ -479,7 +479,7 @@ To allow the AI agent to execute transactions, list the tools explicitly in `ena
 
 ```typescript
 // Import the main AgentWallet class.
-import { AgentWallet } from "@kova/wallet";
+import { AgentWallet } from "@kova-sdk/wallet";
 
 const wallet = new AgentWallet({
   signer,

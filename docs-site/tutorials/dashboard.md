@@ -1,7 +1,7 @@
 # Kova Dashboard
 
 ::: danger Dashboard Removed from Repository
-The Kova Dashboard has been **removed from the repository** (as of commit `487b875`). The `dashboard/` directory no longer exists in the `@kova/wallet` repo. This tutorial is preserved as a **reference implementation guide** -- you can use it to build your own dashboard from scratch, but there is no pre-built dashboard to install.
+The Kova Dashboard has been **removed from the repository** (as of commit `487b875`). The `dashboard/` directory no longer exists in the `@kova-sdk/wallet` repo. This tutorial is preserved as a **reference implementation guide** -- you can use it to build your own dashboard from scratch, but there is no pre-built dashboard to install.
 :::
 
 ::: info What you'll learn
@@ -12,7 +12,7 @@ The Kova Dashboard has been **removed from the repository** (as of commit `487b8
 :::
 
 ::: warning Reference Implementation Only
-The Kova Dashboard was a separate project that has been **removed** from the `@kova/wallet` repository. It is **not included** in the npm package. The code below describes a reference architecture you can build yourself.
+The Kova Dashboard was a separate project that has been **removed** from the `@kova-sdk/wallet` repository. It is **not included** in the npm package. The code below describes a reference architecture you can build yourself.
 :::
 
 The Kova Dashboard is a **Next.js admin UI** for testing and exploring the SDK on Solana devnet. Think of it as a visual control panel for your agent wallet -- you can create wallets, configure policies, execute transactions, and approve requests, all from a browser instead of writing code.
@@ -38,7 +38,7 @@ The dashboard is for **development and testing only**. It uses `MemoryStore` (st
 ## Setup
 
 ```bash
-# From the @kova/wallet project root, navigate to the dashboard directory.
+# From the @kova-sdk/wallet project root, navigate to the dashboard directory.
 cd dashboard
 
 # Install the dashboard's dependencies (Next.js, React, Tailwind CSS, etc.).

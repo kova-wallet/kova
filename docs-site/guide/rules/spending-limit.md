@@ -47,13 +47,13 @@ Each limit is scoped to a specific token (e.g., SOL or USDC). If the intent's to
 
 ```typescript
 // Import the SpendingLimitRule class, which enforces spending caps on transactions.
-import { SpendingLimitRule } from "@kova/wallet";
+import { SpendingLimitRule } from "@kova-sdk/wallet";
 
 // Import the TypeScript types for configuring spending limits.
 // SpendingLimitConfig: defines per-transaction, daily, weekly, and monthly caps.
 // TokenAmount: a { amount, token } pair representing a cap value and the token it applies to.
 // UsdSpendingLimit: a { amount } pair for USD-denominated limits.
-import type { SpendingLimitConfig, TokenAmount, UsdSpendingLimit } from "@kova/wallet";
+import type { SpendingLimitConfig, TokenAmount, UsdSpendingLimit } from "@kova-sdk/wallet";
 ```
 
 ## SpendingLimitConfig
@@ -220,7 +220,7 @@ To enforce limits on multiple tokens, create separate rules:
 
 ```typescript
 // Import the necessary classes for a multi-token spending limit setup.
-import { PolicyEngine, SpendingLimitRule, MemoryStore } from "@kova/wallet";
+import { PolicyEngine, SpendingLimitRule, MemoryStore } from "@kova-sdk/wallet";
 
 // Create a store shared by all rules for counter persistence.
 const store = new MemoryStore();

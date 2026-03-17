@@ -13,7 +13,7 @@
 Before diving in, make sure you have:
 
 - **Node.js 18 or later** installed ([download here](https://nodejs.org/))
-- **@kova/wallet installed** in your project (`npm install @kova/wallet`)
+- **@kova-sdk/wallet installed** in your project (`npm install @kova-sdk/wallet`)
 - **A basic understanding of what an agent wallet is.** If you are new, start with [Your First Agent Wallet](/tutorials/first-wallet) first.
 - **Familiarity with TypeScript.** All examples use TypeScript, but the concepts apply to JavaScript too.
 
@@ -32,12 +32,12 @@ At the end, you will learn how to serialize policies to JSON and extend existing
 All examples use these imports:
 
 ```typescript
-// Import all policy-related components from @kova/wallet.
+// Import all policy-related components from @kova-sdk/wallet.
 // These are used across every example in this cookbook.
 import {
   Policy,             // Fluent builder for creating policy configurations declaratively
   MemoryStore,        // In-memory Store implementation for dev/testing (state lost on restart)
-} from "@kova/wallet";
+} from "@kova-sdk/wallet";
 ```
 
 ---
@@ -281,7 +281,7 @@ The timezone parameter uses the IANA timezone database format (e.g., `"America/N
 **Use case:** An agent that can handle small payments autonomously but requires human approval for anything above a threshold. Perfect for finance teams that want automation for routine payments with oversight for large ones.
 
 ```typescript
-import { CallbackApprovalChannel } from "@kova/wallet";
+import { CallbackApprovalChannel } from "@kova-sdk/wallet";
 
 // Create a callback-based approval channel for human-in-the-loop approval.
 // When a high-value transaction is attempted, the channel notifies a human
@@ -546,7 +546,7 @@ Policies can be serialized to JSON for storage, version control, or sharing acro
 ```typescript
 // Node.js file system utilities for reading and writing policy files.
 import { writeFileSync, readFileSync } from "fs";
-import { Policy } from "@kova/wallet";
+import { Policy } from "@kova-sdk/wallet";
 
 // Build a policy using the fluent builder.
 const policy = Policy.create("my-policy")
@@ -617,7 +617,7 @@ Store policy JSON files in version control alongside your application code. This
 Use `Policy.extend()` to derive a new policy from an existing one. The new policy inherits all settings from the base and lets you override or add rules.
 
 ```typescript
-import { Policy } from "@kova/wallet";
+import { Policy } from "@kova-sdk/wallet";
 
 // Start with a liberal base policy that has high limits and no allowlist.
 // This serves as the "template" that we will derive stricter variants from.

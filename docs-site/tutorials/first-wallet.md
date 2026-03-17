@@ -44,10 +44,10 @@ cd my-agent-wallet
 npm init -y
 
 # Install runtime dependencies:
-#   @kova/wallet    - The agent wallet SDK (policy engine, signers, chain adapters)
-#   @solana/web3.js - Solana's JavaScript client library (also bundled with @kova/wallet,
+#   @kova-sdk/wallet    - The agent wallet SDK (policy engine, signers, chain adapters)
+#   @solana/web3.js - Solana's JavaScript client library (also bundled with @kova-sdk/wallet,
 #                     but listed explicitly here for direct Keypair usage)
-npm install @kova/wallet @solana/web3.js
+npm install @kova-sdk/wallet @solana/web3.js
 
 # Install development dependencies:
 #   typescript     - The TypeScript compiler
@@ -73,7 +73,7 @@ Successfully created a tsconfig.json file.
 ::: details Troubleshooting: Installation issues
 **If you see `npm ERR! code EACCES`** -- You have a permissions issue. Try running with `sudo` or, better yet, [fix your npm permissions](https://docs.npmjs.com/resolving-eacces-permissions-errors-when-installing-packages-globally).
 
-**If you see `Cannot find module '@kova/wallet'` later** -- Make sure you ran `npm install @kova/wallet` from inside the `my-agent-wallet` directory (not from your home directory). Run `ls node_modules/@kova/wallet` to verify the package is installed.
+**If you see `Cannot find module '@kova-sdk/wallet'` later** -- Make sure you ran `npm install @kova-sdk/wallet` from inside the `my-agent-wallet` directory (not from your home directory). Run `ls node_modules/@kova-sdk/wallet` to verify the package is installed.
 
 **If `npx tsc --init` fails** -- Make sure TypeScript is installed as a dev dependency: `npm install -D typescript`.
 :::
@@ -105,7 +105,7 @@ import {
   MemoryStore,        // In-memory implementation of the Store interface (dev/testing only)
   SolanaAdapter,      // Chain adapter for Solana: builds, signs, and broadcasts transactions
   Policy,             // Fluent builder for creating policy configurations declaratively
-} from "@kova/wallet";
+} from "@kova-sdk/wallet";
 ```
 
 These imports cover:
@@ -171,13 +171,13 @@ const store = new MemoryStore({ dangerouslyAllowInProduction: true }); // Dev-on
 
 ::: details Checkpoint -- Steps 3 through 6
 At this point, your `first-wallet.ts` file should have:
-1. Two import statements at the top (one for `@solana/web3.js`, one for `@kova/wallet`)
+1. Two import statements at the top (one for `@solana/web3.js`, one for `@kova-sdk/wallet`)
 2. A `keypair` variable created by `Keypair.generate()`
 3. A `console.log` printing the public key
 4. A `signer` variable wrapping the keypair
 5. A `store` variable created by `new MemoryStore({ dangerouslyAllowInProduction: true })`
 
-If you see red squiggly lines in your editor, make sure you ran `npm install @kova/wallet @solana/web3.js` and that your `tsconfig.json` exists. A common fix is to set `"moduleResolution": "node"` in `tsconfig.json`.
+If you see red squiggly lines in your editor, make sure you ran `npm install @kova-sdk/wallet @solana/web3.js` and that your `tsconfig.json` exists. A common fix is to set `"moduleResolution": "node"` in `tsconfig.json`.
 :::
 
 ## Step 7: Create a SolanaAdapter
@@ -587,7 +587,7 @@ import {
   MemoryStore,        // In-memory state store for dev/testing (not persistent)
   SolanaAdapter,      // Chain adapter that builds and broadcasts Solana transactions
   Policy,             // Fluent builder for creating policy configurations
-} from "@kova/wallet";
+} from "@kova-sdk/wallet";
 
 async function main() {
   // 1. Generate a keypair (use a stored key in production)

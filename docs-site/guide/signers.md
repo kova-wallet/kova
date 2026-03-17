@@ -46,7 +46,7 @@ A private key is a secret number (usually 32-64 bytes) that proves ownership of 
 // - Signer: the interface that all signing backends must implement
 // - UnsignedTransaction: represents a transaction before it has been signed
 // - SignedTransaction: represents a transaction after signing, including the signature bytes
-import type { Signer, UnsignedTransaction, SignedTransaction } from "@kova/wallet";
+import type { Signer, UnsignedTransaction, SignedTransaction } from "@kova-sdk/wallet";
 ```
 
 ```typescript
@@ -140,7 +140,7 @@ Holds a Solana `Keypair` in memory. Supports both legacy and versioned Solana tr
 
 ```typescript
 // Import LocalSigner from kova -- the simplest signer for development use.
-import { LocalSigner } from "@kova/wallet";
+import { LocalSigner } from "@kova-sdk/wallet";
 // Import Keypair from the Solana web3.js library.
 // A Keypair contains both the 32-byte secret key and the 32-byte public key.
 import { Keypair } from "@solana/web3.js";
@@ -293,8 +293,8 @@ Provider-agnostic MPC signer for production use. You implement the `MpcSigningPr
 
 ```typescript
 // Import MpcSigner and the provider interface from kova.
-import { MpcSigner } from "@kova/wallet";
-import type { MpcSigningProvider } from "@kova/wallet";
+import { MpcSigner } from "@kova-sdk/wallet";
+import type { MpcSigningProvider } from "@kova-sdk/wallet";
 ```
 
 ::: tip WHAT IS MPC (MULTI-PARTY COMPUTATION)?
@@ -366,8 +366,8 @@ npm install @turnkey/sdk-server
 #### Configuration
 
 ```typescript
-import { TurnkeyProvider } from "@kova/wallet";
-import type { TurnkeyProviderConfig } from "@kova/wallet";
+import { TurnkeyProvider } from "@kova-sdk/wallet";
+import type { TurnkeyProviderConfig } from "@kova-sdk/wallet";
 ```
 
 ```typescript
@@ -394,7 +394,7 @@ interface TurnkeyProviderConfig {
 #### Usage
 
 ```typescript
-import { TurnkeyProvider, MpcSigner, AgentWallet, SolanaAdapter } from "@kova/wallet";
+import { TurnkeyProvider, MpcSigner, AgentWallet, SolanaAdapter } from "@kova-sdk/wallet";
 
 // 1. Create the Turnkey provider with your API credentials
 const provider = new TurnkeyProvider({
@@ -445,7 +445,7 @@ If your MPC backend is not Turnkey, implement `MpcSigningProvider` directly:
 
 ```typescript
 // Example: A custom MPC provider adapter for Lit Protocol.
-import type { MpcSigningProvider, MpcSignResult } from "@kova/wallet";
+import type { MpcSigningProvider, MpcSignResult } from "@kova-sdk/wallet";
 
 class LitProtocolProvider implements MpcSigningProvider {
   readonly name = "lit-protocol";
@@ -523,7 +523,7 @@ In error messages returned to callers, the MPC provider name is hashed and trunc
 `MpcSigner` throws `MpcSignerError` with typed error codes:
 
 ```typescript
-import { MpcSignerError } from "@kova/wallet";
+import { MpcSignerError } from "@kova-sdk/wallet";
 
 try {
   await wallet.execute(intent);
@@ -548,7 +548,7 @@ For production use with services like Fireblocks, AWS KMS, or hardware wallets, 
 
 ```typescript
 // Import the Signer interface and transaction types from kova.
-import type { Signer, UnsignedTransaction, SignedTransaction } from "@kova/wallet";
+import type { Signer, UnsignedTransaction, SignedTransaction } from "@kova-sdk/wallet";
 
 // Example: A production-grade signer that delegates signing to Fireblocks,
 // an institutional-grade key management and custody platform.
@@ -657,7 +657,7 @@ Cache the address in `getAddress()` to avoid repeated API calls. The wallet addr
 
 ```typescript
 // Import the core Kova components for assembling a production wallet.
-import { AgentWallet, PolicyEngine, SqliteStore, SolanaAdapter } from "@kova/wallet";
+import { AgentWallet, PolicyEngine, SqliteStore, SolanaAdapter } from "@kova-sdk/wallet";
 // Import the custom Fireblocks signer we defined above.
 import { FireblocksSigner } from "./fireblocks-signer";
 

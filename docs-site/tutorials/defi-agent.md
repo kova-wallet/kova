@@ -25,7 +25,7 @@ This tutorial walks you through building an agent that can execute <Term id="tok
 ```bash
 # Install kova (agent wallet SDK) and @solana/web3.js (Solana client library).
 # Note: Jupiter swap integration requires custom implementation — it is not built into SolanaAdapter.
-npm install @kova/wallet @solana/web3.js
+npm install @kova-sdk/wallet @solana/web3.js
 ```
 
 ::: warning
@@ -44,7 +44,7 @@ import {
   MemoryStore,        // In-memory state store (use SqliteStore in production)
   SolanaAdapter,      // Chain adapter for Solana (Jupiter swap routing requires custom implementation)
   Policy,             // Fluent builder for policy configuration
-} from "@kova/wallet";
+} from "@kova-sdk/wallet";
 
 // ⚠️ SECURITY WARNING: Environment variables are NOT safe for private keys in production.
 // Keys in env vars are exposed via /proc/[pid]/environ, `ps e`, shell history, and logging systems.
@@ -394,7 +394,7 @@ import {
   MemoryStore,
   SolanaAdapter,
   Policy,
-} from "@kova/wallet";
+} from "@kova-sdk/wallet";
 
 // USDC SPL token mint address on Solana mainnet.
 const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";

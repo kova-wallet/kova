@@ -53,10 +53,10 @@ This tutorial shows you how to build a Claude-powered AI agent that can check wa
 
 ```bash
 # Install the three main dependencies for a Claude-powered payment agent:
-#   @kova/wallet                 - The agent wallet SDK (policy engine, signers, chain adapters, MCP server)
+#   @kova-sdk/wallet                 - The agent wallet SDK (policy engine, signers, chain adapters, MCP server)
 #   @modelcontextprotocol/sdk    - MCP SDK for the stdio transport
 #   @solana/web3.js              - Solana's JavaScript client for Keypair and address utilities
-npm install @kova/wallet @modelcontextprotocol/sdk @solana/web3.js
+npm install @kova-sdk/wallet @modelcontextprotocol/sdk @solana/web3.js
 ```
 
 **Expected output:**
@@ -72,7 +72,7 @@ npm install -D typescript ts-node @types/node
 ```
 
 ::: details Troubleshooting: Installation issues
-**If you see `Cannot find module 'kova'`** -- Run `npm install @kova/wallet` again from your project directory. Verify with `ls node_modules/@kova/wallet`.
+**If you see `Cannot find module 'kova'`** -- Run `npm install @kova-sdk/wallet` again from your project directory. Verify with `ls node_modules/@kova-sdk/wallet`.
 
 **If you see `Cannot find module '@modelcontextprotocol/sdk'`** -- Run `npm install @modelcontextprotocol/sdk`. This is the MCP SDK needed for the stdio transport.
 
@@ -93,7 +93,7 @@ import {
   MemoryStore,        // In-memory state store for dev/testing
   SolanaAdapter,      // Chain adapter for Solana (build tx, broadcast, query balance)
   Policy,             // Fluent builder for policy configuration
-} from "@kova/wallet";
+} from "@kova-sdk/wallet";
 
 // ⚠️ SECURITY WARNING: Environment variables are NOT safe for private keys in production.
 // Keys in env vars are exposed via /proc/[pid]/environ, `ps e`, shell history, and logging systems.
@@ -161,7 +161,7 @@ Before moving on, verify:
 2. All packages are installed (`ls node_modules/@kova node_modules/@modelcontextprotocol`)
 3. The code above compiles without errors in your editor
 
-If you see `Cannot find name 'AllowlistRule'`, update kova: `npm install @kova/wallet@latest`.
+If you see `Cannot find name 'AllowlistRule'`, update kova: `npm install @kova-sdk/wallet@latest`.
 
 If you see `Error: Cannot read properties of undefined (reading 'fromSecretKey')`, your `SOLANA_SECRET_KEY` environment variable is not set or is not valid JSON.
 :::
@@ -206,7 +206,7 @@ The `createMcpServer()` function creates an MCP server with all wallet tools reg
 **MCP (Model Context Protocol)** is an open standard for connecting AI agents to tools. Claude has first-class MCP support. The MCP server exposes tool definitions that describe each operation's name, purpose, and parameters. No secrets, private keys, or internal state are included.
 
 ```typescript
-import { createMcpServer } from "@kova/wallet";
+import { createMcpServer } from "@kova-sdk/wallet";
 
 // createMcpServer() registers all wallet tools on an MCP server.
 // When Claude connects, it discovers these tools automatically:
@@ -245,7 +245,7 @@ Connect the MCP server to a transport so Claude can communicate with it. The mos
 A **multi-turn conversation** means Claude and your server go back and forth multiple times. Claude calls a tool, the MCP server executes it via the wallet and returns the result, Claude decides what to do next. This continues until Claude has gathered enough information to respond to the user with text.
 
 ```typescript
-import { createMcpStdioServer } from "@kova/wallet";
+import { createMcpStdioServer } from "@kova-sdk/wallet";
 
 // Start the MCP server on stdio transport.
 // Claude Desktop connects to this server and discovers wallet tools automatically.
@@ -478,7 +478,7 @@ import {
   SolanaAdapter,
   Policy,
   createMcpStdioServer,
-} from "@kova/wallet";
+} from "@kova-sdk/wallet";
 
 // --- Wallet Setup ---
 // SECURITY WARNING: Environment variables are NOT safe for private keys in production.

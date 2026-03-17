@@ -49,7 +49,7 @@ An RPC (Remote Procedure Call) endpoint is a URL that lets your application comm
 // - TransactionStatusResult: describes the on-chain status of a submitted transaction
 // - ChainTransactionStatus: a union type of possible transaction states
 // - SimulationResult: describes the result of simulating a transaction before signing
-import type { ChainAdapter, TransactionStatusResult, ChainTransactionStatus, SimulationResult } from "@kova/wallet";
+import type { ChainAdapter, TransactionStatusResult, ChainTransactionStatus, SimulationResult } from "@kova-sdk/wallet";
 ```
 
 ```typescript
@@ -166,7 +166,7 @@ The `SolanaAdapter` is the production chain adapter for Solana. It uses `@solana
 ```typescript
 // Import the SolanaAdapter, which is the built-in ChainAdapter implementation for Solana.
 // This is the only chain adapter currently shipped with kova.
-import { SolanaAdapter } from "@kova/wallet";
+import { SolanaAdapter } from "@kova-sdk/wallet";
 ```
 
 ::: tip WHAT IS SOLANA?
@@ -176,7 +176,7 @@ Solana is a high-performance blockchain known for fast transactions (sub-second 
 ### Configuration
 
 ```typescript
-import { SolanaAdapter, createPythPriceProvider } from "@kova/wallet";
+import { SolanaAdapter, createPythPriceProvider } from "@kova-sdk/wallet";
 import { Connection } from "@solana/web3.js";
 
 const connection = new Connection("https://api.devnet.solana.com");
@@ -345,7 +345,7 @@ While `AgentWallet.execute()` handles the full pipeline, you can use the chain a
 
 ```typescript
 // Import the chain adapter and signer for manual transaction construction.
-import { SolanaAdapter, LocalSigner } from "@kova/wallet";
+import { SolanaAdapter, LocalSigner } from "@kova-sdk/wallet";
 import { Keypair } from "@solana/web3.js";
 
 // Step 0: Set up the chain adapter and signer.

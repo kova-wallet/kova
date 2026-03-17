@@ -63,7 +63,7 @@ Before we begin coding, make sure Node.js and npm are installed (see Prerequisit
 ## Step 1: Install Dependencies
 
 ```bash
-npm install @kova/wallet @solana/web3.js @modelcontextprotocol/sdk
+npm install @kova-sdk/wallet @solana/web3.js @modelcontextprotocol/sdk
 ```
 
 **Expected output:**
@@ -73,7 +73,7 @@ added 15 packages in 4s
 ```
 
 ::: details Troubleshooting: Installation issues
-**If you see `Cannot find module '@kova/wallet'`** -- Run `npm install @kova/wallet` again. Make sure you are in the correct project directory.
+**If you see `Cannot find module '@kova-sdk/wallet'`** -- Run `npm install @kova-sdk/wallet` again. Make sure you are in the correct project directory.
 
 **If you see `Cannot find module '@modelcontextprotocol/sdk'`** -- Run `npm install @modelcontextprotocol/sdk`. This is the official MCP SDK for Node.js.
 :::
@@ -92,7 +92,7 @@ import {
   LocalSigner,
   SolanaAdapter,
   MemoryStore,
-} from "@kova/wallet";
+} from "@kova-sdk/wallet";
 
 // The private key stays on your server
 const keypair = Keypair.generate();
@@ -134,10 +134,10 @@ None of this is exposed to Claude. The agent will only interact through tool sch
 
 ::: details Checkpoint -- Step 2
 Before moving on, verify that:
-1. You have `@kova/wallet`, `@solana/web3.js`, and `@modelcontextprotocol/sdk` installed (`ls node_modules/@kova/wallet`)
+1. You have `@kova-sdk/wallet`, `@solana/web3.js`, and `@modelcontextprotocol/sdk` installed (`ls node_modules/@kova-sdk/wallet`)
 2. The code above compiles without errors (no red squiggly lines in your editor)
 
-If you see `Cannot find name 'AllowlistRule'`, make sure you have the latest version of kova installed: `npm install @kova/wallet@latest`.
+If you see `Cannot find name 'AllowlistRule'`, make sure you have the latest version of kova installed: `npm install @kova-sdk/wallet@latest`.
 :::
 
 ## Step 3: Create the MCP Server
@@ -147,7 +147,7 @@ Call `createMcpServer(wallet)` to create an MCP server with all wallet tools reg
 **MCP (Model Context Protocol)** is an open standard for connecting AI agents to tools. Claude has first-class MCP support -- when Claude connects to your MCP server, it automatically discovers available tools and their schemas. This is the same protocol used across AI frameworks (Claude Desktop, OpenAI, LangChain, and custom agents).
 
 ```typescript
-import { createMcpServer } from "@kova/wallet";
+import { createMcpServer } from "@kova-sdk/wallet";
 
 const server = createMcpServer(wallet);
 ```
@@ -210,7 +210,7 @@ await server.connect(transport);
 Or use the convenience function that does both steps in one call:
 
 ```typescript
-import { createMcpStdioServer } from "@kova/wallet";
+import { createMcpStdioServer } from "@kova-sdk/wallet";
 
 const server = await createMcpStdioServer(wallet);
 // Server is running on stdio, ready for Claude to connect
@@ -339,7 +339,7 @@ import {
   SolanaAdapter,
   MemoryStore,
   createMcpStdioServer,
-} from "@kova/wallet";
+} from "@kova-sdk/wallet";
 
 const TREASURY = "9aE4Uy6gzM..."; // your recipient address
 

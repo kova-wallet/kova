@@ -1,6 +1,6 @@
 # Integration Tests
 
-This directory contains integration tests for @kova/wallet. Unlike unit tests, integration
+This directory contains integration tests for @kova-sdk/wallet. Unlike unit tests, integration
 tests exercise real I/O: file system persistence, network calls, and external services.
 
 ---

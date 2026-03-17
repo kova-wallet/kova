@@ -33,7 +33,7 @@ If no `priceProvider` is configured and a policy uses USD limits, the SDK **fail
 
 ```typescript
 import { Connection } from "@solana/web3.js";
-import { SolanaAdapter, createPythPriceProvider } from "@kova/wallet";
+import { SolanaAdapter, createPythPriceProvider } from "@kova-sdk/wallet";
 
 // Reuse the same RPC connection — no additional infrastructure needed
 const connection = new Connection("https://api.mainnet-beta.solana.com");
@@ -53,7 +53,7 @@ Pyth Network is a decentralized oracle that publishes real-time price data on-ch
 ### Configuration
 
 ```typescript
-import { createPythPriceProvider } from "@kova/wallet";
+import { createPythPriceProvider } from "@kova-sdk/wallet";
 
 const provider = createPythPriceProvider(connection, {
   // Maximum age of a price before it's considered stale.
@@ -143,7 +143,7 @@ For production deployments handling significant value, use `createConsensusProvi
 Fetches prices from all providers in parallel and returns the **median** — resistant to any single oracle being compromised:
 
 ```typescript
-import { createPythPriceProvider, createConsensusProvider } from "@kova/wallet";
+import { createPythPriceProvider, createConsensusProvider } from "@kova-sdk/wallet";
 
 const provider = createConsensusProvider([
   createPythPriceProvider(connection),

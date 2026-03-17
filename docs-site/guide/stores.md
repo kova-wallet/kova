@@ -51,7 +51,7 @@ In development, `MemoryStore` is fine -- your agent is short-lived and you are n
 ```typescript
 // Import the Store type from the kova SDK.
 // Store is the interface that all persistence backends must implement.
-import type { Store } from "@kova/wallet";
+import type { Store } from "@kova-sdk/wallet";
 ```
 
 ```typescript
@@ -111,7 +111,7 @@ In-memory store for development and testing. All data is lost when the process e
 
 ```typescript
 // Import the built-in MemoryStore from kova. No external dependencies are needed.
-import { MemoryStore } from "@kova/wallet";
+import { MemoryStore } from "@kova-sdk/wallet";
 
 // Create an in-memory store instance. All data lives in JavaScript objects/maps
 // within the current Node.js process. Fast and simple, but nothing survives a restart.
@@ -172,7 +172,7 @@ Persistent store using `better-sqlite3`. Data survives process restarts.
 ```typescript
 // Import SqliteStore, which uses the better-sqlite3 npm package under the hood.
 // better-sqlite3 is a synchronous, native SQLite binding for Node.js.
-import { SqliteStore } from "@kova/wallet";
+import { SqliteStore } from "@kova-sdk/wallet";
 
 // Create a persistent store backed by an SQLite database file on disk.
 // The file "wallet-data.db" will be created automatically if it doesn't exist.
@@ -197,7 +197,7 @@ SQLite is a lightweight database engine that stores everything in a single file 
 | `encryptionKey` | `Buffer` | No | AES-256-GCM key (32 bytes) for application-level encryption of all stored values |
 
 ```typescript
-import { SqliteStore } from "@kova/wallet";
+import { SqliteStore } from "@kova-sdk/wallet";
 
 // Production SqliteStore with application-level encryption.
 const store = new SqliteStore({
@@ -277,7 +277,7 @@ npm install ioredis
 
 ```typescript
 // Import the built-in RedisStore from kova. Requires ioredis to be installed.
-import { RedisStore } from "@kova/wallet";
+import { RedisStore } from "@kova-sdk/wallet";
 
 // Connect to a Redis server with a URL.
 const store = new RedisStore({ url: "redis://localhost:6379" });
@@ -296,7 +296,7 @@ const store = new RedisStore();
 | `listPrefix` | `string` | No | Internal prefix for list keys to avoid collisions with KV keys. Default: `"list:"`. |
 
 ```typescript
-import { RedisStore } from "@kova/wallet";
+import { RedisStore } from "@kova-sdk/wallet";
 
 // Production RedisStore with an application-level key prefix.
 const store = new RedisStore({
@@ -313,7 +313,7 @@ For advanced setups (Sentinel, Cluster, custom retry logic), pass an existing io
 
 ```typescript
 import Redis from "ioredis";
-import { RedisStore } from "@kova/wallet";
+import { RedisStore } from "@kova-sdk/wallet";
 
 // Create an ioredis Cluster client for high availability.
 const cluster = new Redis.Cluster([
@@ -387,7 +387,7 @@ The key design constraint for custom stores is that `increment()` must be **atom
 
 ```typescript
 // Import all the core Kova components needed to wire up a wallet.
-import { AgentWallet, PolicyEngine, RedisStore } from "@kova/wallet";
+import { AgentWallet, PolicyEngine, RedisStore } from "@kova-sdk/wallet";
 
 // Create a RedisStore instance pointing to your Redis server.
 // In production, this would typically be a Redis Sentinel or Cluster URL.
