@@ -45,12 +45,12 @@ Given a rule configured for Mon-Fri, 09:00-17:00, America/New_York:
 
 ```typescript
 // Import the TimeWindowRule class, which restricts WHEN the agent can execute transactions.
-import { TimeWindowRule } from "@kova/wallet";
+import { TimeWindowRule } from "@kova-sdk/wallet";
 
 // Import the TypeScript types for configuring active hours.
 // ActiveHoursConfig: the top-level config with timezone, windows, and outside-hours policy.
 // TimeWindow: defines a specific window of days and times when transactions are allowed.
-import type { ActiveHoursConfig, TimeWindow } from "@kova/wallet";
+import type { ActiveHoursConfig, TimeWindow } from "@kova-sdk/wallet";
 ```
 
 ## ActiveHoursConfig

@@ -56,7 +56,7 @@ The MCP server is created from a configured wallet instance using `createMcpServ
 import {
   AgentWallet, Policy, LocalSigner, MemoryStore, SolanaAdapter,
   createMcpServer,
-} from "@kova/wallet";
+} from "@kova-sdk/wallet";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 
 // 1. Set up the wallet (signer, chain, policy, store)
@@ -73,7 +73,7 @@ await server.connect(transport);
 Or use the convenience helper that combines steps 2 and 3:
 
 ```typescript
-import { createMcpStdioServer } from "@kova/wallet";
+import { createMcpStdioServer } from "@kova-sdk/wallet";
 
 const server = await createMcpStdioServer(wallet);
 // Server is now running and accepting tool calls via stdio
@@ -82,7 +82,7 @@ const server = await createMcpStdioServer(wallet);
 ### MCP Server Options
 
 ```typescript
-import { createMcpServer } from "@kova/wallet";
+import { createMcpServer } from "@kova-sdk/wallet";
 
 const server = createMcpServer(wallet, {
   // Include dangerous tools (wallet_execute_custom)

@@ -258,7 +258,7 @@ Hash verification uses **timing-safe comparison** (`crypto.timingSafeEqual`) to 
 ```typescript
 // Import the AuditLogger and a store implementation.
 // AuditLogger manages the tamper-evident hash chain of audit entries.
-import { AuditLogger, MemoryStore } from "@kova/wallet";
+import { AuditLogger, MemoryStore } from "@kova-sdk/wallet";
 
 // Create a store and an audit logger instance.
 // The audit logger writes entries to the store and maintains the hash chain.
@@ -313,7 +313,7 @@ The `CircuitBreaker` tracks consecutive policy denials and enters a cooldown per
 
 ```typescript
 // Import AgentWallet and configure it with a circuit breaker.
-import { AgentWallet } from "@kova/wallet";
+import { AgentWallet } from "@kova-sdk/wallet";
 
 // Create a wallet with a circuit breaker that activates after 5 consecutive denials.
 // The circuit breaker is a safety mechanism that protects the system from runaway agents

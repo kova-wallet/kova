@@ -12,7 +12,7 @@ Connect an OpenAI-based agent to kova via the MCP server:
 import {
   AgentWallet, Policy, LocalSigner, MemoryStore, SolanaAdapter,
   createMcpServer,
-} from "@kova/wallet";
+} from "@kova-sdk/wallet";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 
 // 1. Configure the wallet

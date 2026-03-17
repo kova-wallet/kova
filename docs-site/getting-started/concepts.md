@@ -60,7 +60,7 @@ import {
   MemoryStore,    // Persists counters and logs (dev: in-memory; prod: use SqliteStore)
   SolanaAdapter,  // Handles Solana-specific operations (build tx, broadcast, balance)
   Policy,         // Fluent builder for declaring policy constraints
-} from "@kova/wallet";
+} from "@kova-sdk/wallet";
 
 // Create the wallet by wiring together all components.
 // Each component is a self-contained module with a clear interface.

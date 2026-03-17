@@ -81,8 +81,8 @@ export interface McpServerOptions {
  *
  * @example
  * ```typescript
- * import { AgentWallet } from "@kova/wallet";
- * import { createMcpServer } from "@kova/wallet/adapters";
+ * import { AgentWallet } from "@kova-sdk/wallet";
+ * import { createMcpServer } from "@kova-sdk/wallet/adapters";
  * import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
  *
  * const wallet = new AgentWallet({ ... });
@@ -217,8 +217,8 @@ export function createMcpServer(
  *
  * @example
  * ```typescript
- * import { AgentWallet } from "@kova/wallet";
- * import { createMcpStdioServer } from "@kova/wallet/adapters";
+ * import { AgentWallet } from "@kova-sdk/wallet";
+ * import { createMcpStdioServer } from "@kova-sdk/wallet/adapters";
  *
  * const wallet = new AgentWallet({ ... });
  * const server = await createMcpStdioServer(wallet);

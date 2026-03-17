@@ -12,9 +12,9 @@
 
 <p align="center">
   <a href="https://github.com/kova-wallet/kova/actions/workflows/ci.yml"><img src="https://github.com/kova-wallet/kova/actions/workflows/ci.yml/badge.svg?branch=prod" alt="CI" /></a>
-  <a href="https://www.npmjs.com/package/@kova/wallet"><img src="https://img.shields.io/npm/v/@kova/wallet" alt="npm version" /></a>
-  <a href="https://github.com/kova-wallet/kova/blob/prod/LICENSE"><img src="https://img.shields.io/npm/l/@kova/wallet" alt="license" /></a>
-  <img src="https://img.shields.io/node/v/@kova/wallet" alt="node version" />
+  <a href="https://www.npmjs.com/package/@kova-sdk/wallet"><img src="https://img.shields.io/npm/v/@kova-sdk/wallet" alt="npm version" /></a>
+  <a href="https://github.com/kova-wallet/kova/blob/prod/LICENSE"><img src="https://img.shields.io/npm/l/@kova-sdk/wallet" alt="license" /></a>
+  <img src="https://img.shields.io/node/v/@kova-sdk/wallet" alt="node version" />
 </p>
 
 ---
@@ -67,7 +67,7 @@ Agent → Intent → Policy Engine → Build Tx → Sign → Broadcast → Audit
 ### Install
 
 ```bash
-npm install @kova/wallet
+npm install @kova-sdk/wallet
 ```
 
 For persistent storage (single server):
@@ -86,7 +86,7 @@ npm install ioredis
 import { Keypair } from "@solana/web3.js";
 import {
   AgentWallet, Policy, LocalSigner, MemoryStore, SolanaAdapter,
-} from "@kova/wallet";
+} from "@kova-sdk/wallet";
 
 const signer = new LocalSigner(Keypair.generate());
 const store  = new MemoryStore();
@@ -194,7 +194,7 @@ import { Keypair } from "@solana/web3.js";
 import {
   AgentWallet, Policy, LocalSigner, MemoryStore, SolanaAdapter,
   createMcpServer,
-} from "@kova/wallet";
+} from "@kova-sdk/wallet";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 
 const wallet = new AgentWallet({ signer, chain, policy, store });
@@ -207,7 +207,7 @@ await server.connect(new StdioServerTransport());
 Or use the convenience helper:
 
 ```typescript
-import { createMcpStdioServer } from "@kova/wallet";
+import { createMcpStdioServer } from "@kova-sdk/wallet";
 
 const server = await createMcpStdioServer(wallet);
 // Server is now running and accepting tool calls via stdio

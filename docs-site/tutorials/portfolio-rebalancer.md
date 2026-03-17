@@ -73,8 +73,8 @@ import {
   AllowlistRule,
   TimeWindowRule,
   AuditLogger,
-} from "@kova/wallet";
-import type { PolicyRule, PolicyDecision, PolicyContext, TransactionIntent } from "@kova/wallet";
+} from "@kova-sdk/wallet";
+import type { PolicyRule, PolicyDecision, PolicyContext, TransactionIntent } from "@kova-sdk/wallet";
 import { Keypair } from "@solana/web3.js";
 
 // ── Portfolio Configuration ─────────────────────────────────────────────────

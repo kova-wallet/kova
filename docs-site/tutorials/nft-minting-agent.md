@@ -67,7 +67,7 @@ import {
   SqliteStore,
   SolanaAdapter,
   Policy,
-} from "@kova/wallet";
+} from "@kova-sdk/wallet";
 import { Keypair } from "@solana/web3.js";
 
 // ── Configuration ───────────────────────────────────────────────────────────
@@ -334,7 +334,7 @@ The metadata URI must be accessible at mint time. If the URI returns a 404, the 
 For the 1/1 drops scenario, add an `ApprovalGateRule` to require human approval for each mint:
 
 ```typescript
-import { ApprovalGateRule, CallbackApprovalChannel } from "@kova/wallet";
+import { ApprovalGateRule, CallbackApprovalChannel } from "@kova-sdk/wallet";
 
 const approval = new CallbackApprovalChannel({
   name: "nft-approval",

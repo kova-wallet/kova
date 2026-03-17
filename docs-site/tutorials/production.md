@@ -26,7 +26,7 @@ This guide covers hardening your agent wallet for production use. You will learn
 `MemoryStore` loses all data when your process restarts. For production, use `SqliteStore` which persists spending counters, rate limit windows, and audit logs to a SQLite database file.
 
 ```typescript
-import { SqliteStore } from "@kova/wallet";
+import { SqliteStore } from "@kova-sdk/wallet";
 
 // SqliteStore is the production-ready Store implementation.
 // It persists all SDK state to a local SQLite database file using WAL
@@ -66,7 +66,7 @@ The single most important benefit: **your daily spending limit counter survives 
 The circuit breaker stops all transactions if too many consecutive failures occur. This protects against cascading failures, RPC outages, or unexpected errors.
 
 ```typescript
-import { AgentWallet, LocalSigner, SolanaAdapter, Policy } from "@kova/wallet";
+import { AgentWallet, LocalSigner, SolanaAdapter, Policy } from "@kova-sdk/wallet";
 
 // Configure the AgentWallet with a circuit breaker to protect against
 // cascading failures, RPC outages, or a runaway agent hammering the wallet
@@ -107,7 +107,7 @@ When the circuit breaker is open, ALL transactions are rejected, including small
 Configure a callback that fires when the audit logger detects integrity violations or consecutive write failures.
 
 ```typescript
-import { AuditLogger } from "@kova/wallet";
+import { AuditLogger } from "@kova-sdk/wallet";
 
 // Configure the AuditLogger with failure alerting.
 // The audit logger is critical infrastructure: if it cannot write entries,
@@ -219,7 +219,7 @@ Never log secret keys. Never commit `.env` files. Use a secrets manager (AWS Sec
 Set up periodic integrity verification to detect any tampering with the audit log's <Term id="hash-chain" />.
 
 ```typescript
-import { AuditLogger } from "@kova/wallet";
+import { AuditLogger } from "@kova-sdk/wallet";
 
 // monitorIntegrity() verifies the SHA-256 hash chain of the audit log.
 // Each entry includes the hash of the previous entry, forming a tamper-evident chain.
@@ -388,7 +388,7 @@ import {
   SolanaAdapter,
   Policy,
   CallbackApprovalChannel,
-} from "@kova/wallet";
+} from "@kova-sdk/wallet";
 
 // --- Configuration ---
 // Helper to load required environment variables. Throws immediately if missing.

@@ -51,7 +51,7 @@ import {
   LocalSigner,          // Signs transactions using a Solana Keypair held in local memory
   SolanaAdapter,        // Chain adapter that connects to a Solana RPC node for building and broadcasting transactions
   SpendingLimitRule,    // Policy rule that enforces per-transaction, daily, weekly, and monthly spending caps
-} from "@kova/wallet";
+} from "@kova-sdk/wallet";
 
 // Each console.log checks that the imported symbol is a constructor function ("function"),
 // confirming the SDK is properly installed and all exports are accessible.

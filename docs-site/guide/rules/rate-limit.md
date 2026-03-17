@@ -48,10 +48,10 @@ The same logic applies to the per-hour counter, but with a 3,600-second window.
 ```typescript
 // Import the RateLimitRule class, which limits how many transactions
 // the agent can execute per minute and/or per hour.
-import { RateLimitRule } from "@kova/wallet";
+import { RateLimitRule } from "@kova-sdk/wallet";
 
 // Import the TypeScript type for the rate limit configuration.
-import type { RateLimitConfig } from "@kova/wallet";
+import type { RateLimitConfig } from "@kova-sdk/wallet";
 ```
 
 ## RateLimitConfig
@@ -177,7 +177,7 @@ Apply both per-minute and per-hour limits:
 
 ```typescript
 // Import the necessary classes for a complete rate-limited policy engine.
-import { PolicyEngine, RateLimitRule, SpendingLimitRule, MemoryStore } from "@kova/wallet";
+import { PolicyEngine, RateLimitRule, SpendingLimitRule, MemoryStore } from "@kova-sdk/wallet";
 
 // Create a shared in-memory store for counter persistence.
 const store = new MemoryStore();

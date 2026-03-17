@@ -86,10 +86,10 @@ import type {
   PolicyRule,
   PolicyDecision,
   PolicyContext,
-} from "@kova/wallet";
+} from "@kova-sdk/wallet";
 
 // TransactionIntent is the structured description of what the agent wants to do.
-import type { TransactionIntent } from "@kova/wallet";
+import type { TransactionIntent } from "@kova-sdk/wallet";
 ```
 
 ---
@@ -256,7 +256,7 @@ import {
   RateLimitRule,
   AllowlistRule,
   MemoryStore,
-} from "@kova/wallet";
+} from "@kova-sdk/wallet";
 import { RecipientReputationRule } from "./recipient-reputation-rule";
 
 const store = new MemoryStore(); // Dev-only; throws in production unless KOVA_ALLOW_MEMORY_STORE=1
@@ -323,8 +323,8 @@ Here is a test suite using Vitest:
 
 ```typescript
 import { describe, it, expect, vi } from "vitest";
-import { MemoryStore } from "@kova/wallet";
-import type { PolicyContext, TransactionIntent } from "@kova/wallet";
+import { MemoryStore } from "@kova-sdk/wallet";
+import type { PolicyContext, TransactionIntent } from "@kova-sdk/wallet";
 import { RecipientReputationRule } from "./recipient-reputation-rule";
 
 // Helper to create a PolicyContext with a fresh store.

@@ -158,7 +158,7 @@ import {
   MemoryStore,        // In-memory persistence for counters and logs (development only -- lost on restart)
   SolanaAdapter,      // Connects to a Solana RPC endpoint and handles chain-specific operations
   Policy,             // Fluent builder for declaring policy constraints in a chainable API
-} from "@kova/wallet";
+} from "@kova-sdk/wallet";
 
 // ── Step 1: Generate a keypair ──────────────────────────────────────────────
 // In production, you'd load an existing key from a secrets manager (AWS KMS,

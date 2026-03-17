@@ -72,7 +72,7 @@ import type {
   PolicyDecision,
   PolicyContext,
   TransactionIntent,
-} from "@kova/wallet";
+} from "@kova-sdk/wallet";
 
 /**
  * PerRecipientCapRule — Limits how much can be sent to any single
@@ -167,7 +167,7 @@ import {
   SqliteStore,
   SolanaAdapter,
   Policy,
-} from "@kova/wallet";
+} from "@kova-sdk/wallet";
 import { Keypair } from "@solana/web3.js";
 
 // ── Bot wallet setup ────────────────────────────────────────────────────────

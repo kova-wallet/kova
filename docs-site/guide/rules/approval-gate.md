@@ -50,13 +50,13 @@ Given a threshold of 10 SOL with a 5-minute timeout:
 ```typescript
 // Import the ApprovalGateRule class, which blocks high-value transactions
 // until a human approver grants permission via the configured ApprovalChannel.
-import { ApprovalGateRule } from "@kova/wallet";
+import { ApprovalGateRule } from "@kova-sdk/wallet";
 
 // Import the TypeScript types for configuring the approval gate.
 // ApprovalGateConfig: defines the threshold, channel hint, timeout, and cumulative window.
 // TokenAmount: a { amount, token } pair representing the approval threshold.
 // UsdSpendingLimit: a { amount } pair for USD-denominated thresholds.
-import type { ApprovalGateConfig, TokenAmount, UsdSpendingLimit } from "@kova/wallet";
+import type { ApprovalGateConfig, TokenAmount, UsdSpendingLimit } from "@kova-sdk/wallet";
 ```
 
 ## ApprovalGateConfig
@@ -198,7 +198,7 @@ import {
   ApprovalGateRule,
   CallbackApprovalChannel,
   MemoryStore,
-} from "@kova/wallet";
+} from "@kova-sdk/wallet";
 
 // Create a shared in-memory store for counter persistence.
 const store = new MemoryStore();
@@ -274,7 +274,7 @@ import {
   RateLimitRule,
   ApprovalGateRule,
   CallbackApprovalChannel,
-} from "@kova/wallet";
+} from "@kova-sdk/wallet";
 import { Keypair } from "@solana/web3.js";
 
 // Create the core infrastructure components.

@@ -23,8 +23,8 @@ Both channels implement the `ApprovalChannel` interface. Security guarantees (TO
 ### Configuration
 
 ```typescript
-import { CallbackApprovalChannel } from "@kova/wallet";
-import type { ApprovalRequest, ApprovalResult } from "@kova/wallet";
+import { CallbackApprovalChannel } from "@kova-sdk/wallet";
+import type { ApprovalRequest, ApprovalResult } from "@kova-sdk/wallet";
 
 const channel = new CallbackApprovalChannel({
   // Optional name for audit logs (defaults to "callback").
@@ -108,7 +108,7 @@ The three decision values map to policy outcomes:
 ### Configuration
 
 ```typescript
-import { WebhookApprovalChannel } from "@kova/wallet";
+import { WebhookApprovalChannel } from "@kova-sdk/wallet";
 
 const channel = new WebhookApprovalChannel({
   // URL to POST approval requests to. Must be HTTPS in production.
@@ -183,7 +183,7 @@ import {
   MemoryStore,
   SolanaAdapter,
   Policy,
-} from "@kova/wallet";
+} from "@kova-sdk/wallet";
 
 // Build a policy with an approval gate.
 const policy = Policy.create("approval-demo")
@@ -237,8 +237,8 @@ Never commit bot tokens or secrets to source control.
 ### Building the channel
 
 ```typescript
-import { CallbackApprovalChannel } from "@kova/wallet";
-import type { ApprovalRequest, ApprovalResult } from "@kova/wallet";
+import { CallbackApprovalChannel } from "@kova-sdk/wallet";
+import type { ApprovalRequest, ApprovalResult } from "@kova-sdk/wallet";
 
 const TELEGRAM_API = `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}`;
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID!;

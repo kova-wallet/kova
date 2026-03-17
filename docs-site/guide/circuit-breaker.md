@@ -135,7 +135,7 @@ import {
   MemoryStore,        // In-memory persistence (use SqliteStore in production)
   LocalSigner,        // In-memory signer for development
   SolanaAdapter,      // Solana blockchain adapter
-} from "@kova/wallet";
+} from "@kova-sdk/wallet";
 
 // Create a shared store for the SDK to persist state.
 const store = new MemoryStore({ dangerouslyAllowInProduction: true });
