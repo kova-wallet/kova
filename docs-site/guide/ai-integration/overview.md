@@ -1,4 +1,4 @@
-# AI Integration Overview
+# MCP Server
 
 ::: info What you'll learn
 - How kova exposes wallet functionality to AI agents through an MCP (Model Context Protocol) server

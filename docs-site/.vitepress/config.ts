@@ -59,8 +59,8 @@ export default defineConfig({
         {
           text: 'AI Integration',
           items: [
+            { text: 'MCP Server', link: '/guide/ai-integration/overview' },
             { text: 'Server Setup', link: '/guide/server-setup' },
-            { text: 'Overview', link: '/guide/ai-integration/overview' },
             { text: 'Claude (Anthropic)', link: '/guide/ai-integration/claude' },
             { text: 'OpenAI', link: '/guide/ai-integration/openai' },
             { text: 'LangChain', link: '/guide/ai-integration/langchain' },
