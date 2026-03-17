@@ -32,7 +32,7 @@ export const READ_RATE_LIMIT_PER_MINUTE = 120;
 
 /**
  * A-11: Timeout for tool call execution in milliseconds (120 seconds).
- * Exported so Claude/OpenAI adapters can use Promise.race with this value.
+ * Used by the MCP adapter via Promise.race to prevent indefinite hangs.
  */
 export const TOOL_CALL_TIMEOUT_MS = 120_000;
 
@@ -58,6 +58,13 @@ const READ_TOOL_NAMES: ReadonlySet<string> = new Set([
   "wallet_get_balance",
   "wallet_get_transaction_history",
   "wallet_get_policy",
+  "wallet_get_supported_tokens",
+  "wallet_get_address",
+  "wallet_estimate_fee",
+  "wallet_get_token_price",
+  "wallet_get_transaction_status",
+  "wallet_get_spending_remaining",
+  "wallet_get_all_balances",
 ]);
 
 /** All wallet tool names as a const union for type-safe dispatch */
@@ -70,6 +77,13 @@ export const WALLET_TOOL_NAMES = [
   "wallet_get_balance",
   "wallet_get_policy",
   "wallet_get_transaction_history",
+  "wallet_get_supported_tokens",
+  "wallet_get_address",
+  "wallet_estimate_fee",
+  "wallet_get_token_price",
+  "wallet_get_transaction_status",
+  "wallet_get_spending_remaining",
+  "wallet_get_all_balances",
 ] as const;
 
 export type WalletToolName = (typeof WALLET_TOOL_NAMES)[number];
@@ -79,8 +93,11 @@ export type WalletToolDefinition = ToolDefinition;
 
 /**
  * Default safe tools exposed to agents. Does NOT include dangerous tools
- * (wallet_execute_custom, wallet_get_policy) which must be opted-in explicitly.
+ * (wallet_execute_custom) which must be opted-in explicitly.
  * Use getFilteredTools() or ALL_WALLET_TOOLS if you need access to dangerous tools.
+ *
+ * wallet_get_policy is now a safe tool — agents need to know their constraints to
+ * operate effectively. The PolicySummary already redacts exact values (MED-38).
  *
  * ARCH-03 SECURITY WARNING — wallet_execute_custom:
  * When enabled, wallet_execute_custom allows AI agents to submit ARBITRARY Solana
@@ -310,6 +327,127 @@ export const WALLET_TOOLS: readonly ToolDefinition[] = [
       additionalProperties: false,
     },
   },
+  {
+    name: "wallet_get_supported_tokens",
+    description:
+      "Get the list of tokens supported by this wallet. Returns each token's symbol, network, and mint address. Use this to discover which tokens can be transferred before attempting a transaction.",
+    parameters: {
+      type: "object",
+      properties: {},
+      required: [],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "wallet_get_address",
+    description:
+      "Get this wallet's public address on the configured chain. Use this to know where to receive funds or to share the wallet address with others.",
+    parameters: {
+      type: "object",
+      properties: {},
+      required: [],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "wallet_estimate_fee",
+    description:
+      "Estimate the network fee for a transfer before executing it. Returns the estimated fee in the chain's native token (e.g., SOL). Use this to check costs before committing to a transaction.",
+    parameters: {
+      type: "object",
+      properties: {
+        to: {
+          type: "string",
+          description: "Recipient wallet address",
+          maxLength: 256,
+        },
+        amount: {
+          type: "string",
+          description: 'Amount to send as a decimal string (e.g., "1.5")',
+          maxLength: 78,
+        },
+        token: {
+          type: "string",
+          description: 'Token symbol (e.g., "SOL", "USDC") or mint address',
+          maxLength: 256,
+        },
+        chain: {
+          type: "string",
+          description: "Target blockchain",
+          enum: ["solana", "ethereum", "base"],
+        },
+      },
+      required: ["to", "amount", "token", "chain"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "wallet_get_token_price",
+    description:
+      "Get the current USD price of a token from the configured price oracle (e.g., Pyth Network). Use this to check token valuations before making transfer decisions.",
+    parameters: {
+      type: "object",
+      properties: {
+        token: {
+          type: "string",
+          description: 'Token symbol (e.g., "SOL", "USDC", "USDT")',
+          maxLength: 64,
+        },
+      },
+      required: ["token"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "wallet_get_transaction_status",
+    description:
+      "Check the status of a previously submitted transaction by its transaction ID. Returns whether the transaction is confirmed, finalized, failed, or not found.",
+    parameters: {
+      type: "object",
+      properties: {
+        txId: {
+          type: "string",
+          description: "The transaction ID (signature) to check",
+          maxLength: 128,
+        },
+      },
+      required: ["txId"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "wallet_get_policy",
+    description:
+      "Get a summary of the wallet's active policy rules. Returns which spending limits, allowlists, rate limits, time windows, and approval gates are configured. Use this to understand what actions are permitted before attempting transactions.",
+    parameters: {
+      type: "object",
+      properties: {},
+      required: [],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "wallet_get_spending_remaining",
+    description:
+      "Get the remaining spending budget for the current period. Returns how much you can still spend within each configured time window (daily, weekly, monthly) in both token and USD terms. Use this to plan transactions within your budget.",
+    parameters: {
+      type: "object",
+      properties: {},
+      required: [],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "wallet_get_all_balances",
+    description:
+      "Get the wallet's balance for all supported tokens in a single call. Returns each token's balance, decimals, and USD value (if available). More efficient than calling wallet_get_balance multiple times.",
+    parameters: {
+      type: "object",
+      properties: {},
+      required: [],
+      additionalProperties: false,
+    },
+  },
 ];
 
 /**
@@ -319,8 +457,6 @@ export const WALLET_TOOLS: readonly ToolDefinition[] = [
  *
  * - wallet_execute_custom (CRIT-08): Allows arbitrary on-chain instruction execution.
  *   Without allowPrograms policy, a prompt-injected agent could drain the wallet.
- * - wallet_get_policy (CRIT-12): Exposes policy details that enable policy reconnaissance.
- *   An attacker can learn thresholds to stay under to avoid triggering controls.
  */
 export const DANGEROUS_TOOLS: readonly ToolDefinition[] = [
   /**
@@ -374,23 +510,6 @@ export const DANGEROUS_TOOLS: readonly ToolDefinition[] = [
         },
       },
       required: ["programId", "data", "accounts", "chain"],
-      additionalProperties: false,
-    },
-  },
-  /**
-   * CRIT-12: This tool should be opt-in for security-sensitive deployments.
-   * Exposing policy details to an agent can enable policy reconnaissance — an
-   * attacker who has prompt-injected the agent can learn exactly what thresholds
-   * to stay under to avoid triggering controls.
-   */
-  {
-    name: "wallet_get_policy",
-    description:
-      "Get a summary of the current wallet configuration and active status.",
-    parameters: {
-      type: "object",
-      properties: {},
-      required: [],
       additionalProperties: false,
     },
   },

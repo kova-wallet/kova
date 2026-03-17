@@ -7,14 +7,14 @@ import { AllowlistRule } from "../../../src/policy/rules/allowlist.js";
 import { RateLimitRule } from "../../../src/policy/rules/rate-limit.js";
 import { TimeWindowRule } from "../../../src/policy/rules/time-window.js";
 import { ApprovalGateRule } from "../../../src/policy/rules/approval-gate.js";
-import { toAnthropicTools } from "../../../src/adapters/claude.js";
-import { toOpenAITools } from "../../../src/adapters/openai.js";
-import { createLangChainTools } from "../../../src/adapters/langchain.js";
 import {
   WALLET_TOOLS,
   WALLET_TOOL_NAMES,
   getToolByName,
 } from "../../../src/adapters/tools.js";
+import { createMcpServer } from "../../../src/adapters/mcp.js";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { AgentWalletConfig } from "../../../src/core/wallet.js";
 import type { PolicyRule } from "../../../src/policy/types.js";
 import type {
@@ -101,6 +101,8 @@ function createWallet(overrides?: Partial<AgentWalletConfig>) {
       "wallet_get_balance",
       "wallet_get_policy",
       "wallet_get_transaction_history",
+      "wallet_get_spending_remaining",
+      "wallet_get_all_balances",
     ]),
   };
   return new AgentWallet({ ...defaults, ...overrides });
@@ -126,10 +128,10 @@ function parseSanitizedResponse(response: string): unknown {
 // ── Canonical Tool Definitions ────────────────────────────────────
 
 describe("Canonical Tool Definitions", () => {
-  it("should define exactly 6 safe tools (dangerous tools moved to DANGEROUS_TOOLS)", () => {
-    // API-002/API-003: wallet_execute_custom and wallet_get_policy moved to DANGEROUS_TOOLS
-    expect(WALLET_TOOLS).toHaveLength(6);
-    expect(WALLET_TOOL_NAMES).toHaveLength(8);
+  it("should define exactly 14 safe tools (only wallet_execute_custom in DANGEROUS_TOOLS)", () => {
+    // wallet_get_policy moved to safe tools; wallet_get_spending_remaining and wallet_get_all_balances added
+    expect(WALLET_TOOLS).toHaveLength(14);
+    expect(WALLET_TOOL_NAMES).toHaveLength(15);
   });
 
   it("should have safe tool names be a subset of WALLET_TOOL_NAMES", () => {
@@ -188,143 +190,142 @@ describe("Canonical Tool Definitions", () => {
   });
 });
 
-// ── Anthropic Adapter ─────────────────────────────────────────────
+// ── MCP Server Adapter ────────────────────────────────────────────
 
-describe("Anthropic Adapter", () => {
-  it("should convert safe tools to Anthropic format (6 by default)", () => {
-    const tools = toAnthropicTools();
-    expect(tools).toHaveLength(6);
-  });
-
-  it("each tool should have input_schema instead of parameters", () => {
-    const tools = toAnthropicTools();
-    for (const tool of tools) {
-      expect(tool).toHaveProperty("name");
-      expect(tool).toHaveProperty("description");
-      expect(tool).toHaveProperty("input_schema");
-      expect(tool.input_schema.type).toBe("object");
-      expect((tool as Record<string, unknown>)["parameters"]).toBeUndefined();
-    }
-  });
-
-  it("tool names should be a subset of canonical definitions", () => {
-    const tools = toAnthropicTools();
-    const names = tools.map((t) => t.name);
-    for (const name of names) {
-      expect(WALLET_TOOL_NAMES).toContain(name);
-    }
-  });
-
-  it("input_schema should contain correct properties and required", () => {
-    const tools = toAnthropicTools();
-    const transfer = tools.find((t) => t.name === "wallet_transfer")!;
-    expect(transfer.input_schema.properties).toHaveProperty("to");
-    expect(transfer.input_schema.properties).toHaveProperty("amount");
-    expect(transfer.input_schema.required).toContain("to");
-  });
-});
-
-// ── OpenAI Adapter ────────────────────────────────────────────────
-
-describe("OpenAI Adapter", () => {
-  it("should convert safe tools to OpenAI format (6 by default)", () => {
-    const tools = toOpenAITools();
-    expect(tools).toHaveLength(6);
-  });
-
-  it("each tool should have type: function wrapper", () => {
-    const tools = toOpenAITools();
-    for (const tool of tools) {
-      expect(tool.type).toBe("function");
-      expect(tool.function).toBeDefined();
-      expect(tool.function.name).toBeTruthy();
-      expect(tool.function.description).toBeTruthy();
-      expect(tool.function.parameters.type).toBe("object");
-    }
-  });
-
-  it("tool names should be a subset of canonical definitions", () => {
-    const tools = toOpenAITools();
-    const names = tools.map((t) => t.function.name);
-    for (const name of names) {
-      expect(WALLET_TOOL_NAMES).toContain(name);
-    }
-  });
-
-  it("function.parameters should contain correct properties", () => {
-    const tools = toOpenAITools();
-    const swap = tools.find((t) => t.function.name === "wallet_swap")!;
-    expect(swap.function.parameters.properties).toHaveProperty("fromToken");
-    expect(swap.function.parameters.properties).toHaveProperty("toToken");
-    expect(swap.function.parameters.required).toContain("amount");
-  });
-});
-
-// ── LangChain Adapter ─────────────────────────────────────────────
-
-describe("LangChain Adapter", () => {
-  it("should create tools for all 6 safe wallet tools", () => {
+describe("MCP Server Adapter", () => {
+  async function createMcpClientServer(options?: Parameters<typeof createMcpServer>[1]) {
     const wallet = createWallet();
-    const tools = createLangChainTools(wallet);
-    expect(tools).toHaveLength(6);
+    const server = createMcpServer(wallet, options);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: "test-client", version: "1.0.0" });
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    return { client, server, wallet };
+  }
+
+  it("should list 14 safe tools by default", async () => {
+    const { client } = await createMcpClientServer();
+    const result = await client.listTools();
+    expect(result.tools).toHaveLength(14);
+    const names = result.tools.map((t) => t.name);
+    expect(names).toContain("wallet_transfer");
+    expect(names).toContain("wallet_get_balance");
+    expect(names).toContain("wallet_get_transaction_history");
+    expect(names).toContain("wallet_get_supported_tokens");
+    expect(names).toContain("wallet_get_address");
+    expect(names).toContain("wallet_estimate_fee");
+    expect(names).toContain("wallet_get_token_price");
+    expect(names).toContain("wallet_get_transaction_status");
+    expect(names).toContain("wallet_get_policy");
+    expect(names).toContain("wallet_get_spending_remaining");
+    expect(names).toContain("wallet_get_all_balances");
+    expect(names).not.toContain("wallet_execute_custom");
   });
 
-  it("each tool should have name, description, schema, and call", () => {
-    const wallet = createWallet();
-    const tools = createLangChainTools(wallet);
-    for (const tool of tools) {
+  it("should list 15 tools when includeDangerous is true", async () => {
+    const { client } = await createMcpClientServer({ includeDangerous: true });
+    const result = await client.listTools();
+    expect(result.tools).toHaveLength(15);
+    const names = result.tools.map((t) => t.name);
+    expect(names).toContain("wallet_execute_custom");
+  });
+
+  it("should exclude tools by name", async () => {
+    const { client } = await createMcpClientServer({ exclude: ["wallet_swap", "wallet_mint"] });
+    const result = await client.listTools();
+    const names = result.tools.map((t) => t.name);
+    expect(names).not.toContain("wallet_swap");
+    expect(names).not.toContain("wallet_mint");
+    expect(names).toContain("wallet_transfer");
+  });
+
+  it("each tool should have inputSchema with type, properties, and required", async () => {
+    const { client } = await createMcpClientServer();
+    const result = await client.listTools();
+    for (const tool of result.tools) {
       expect(tool.name).toBeTruthy();
       expect(tool.description).toBeTruthy();
-      expect(tool.schema.type).toBe("object");
-      expect(typeof tool.call).toBe("function");
+      expect(tool.inputSchema.type).toBe("object");
+      expect(tool.inputSchema.properties).toBeDefined();
     }
   });
 
-  it("call should delegate to wallet.handleToolCall and return sanitized string", async () => {
-    const wallet = createWallet();
-    const tools = createLangChainTools(wallet);
-    const balanceTool = tools.find((t) => t.name === "wallet_get_balance")!;
-    const result = await balanceTool.call({ token: "SOL" });
-    // CRIT-T3-01: LangChain adapter now wraps results in sanitized delimiters
-    const parsed = parseSanitizedResponse(result) as { success: boolean; data: { token: string } };
+  it("tool names should be a subset of canonical definitions", async () => {
+    const { client } = await createMcpClientServer();
+    const result = await client.listTools();
+    for (const tool of result.tools) {
+      expect(WALLET_TOOL_NAMES).toContain(tool.name);
+    }
+  });
+
+  it("should call wallet_get_balance and return result", async () => {
+    const { client } = await createMcpClientServer();
+    const result = await client.callTool({ name: "wallet_get_balance", arguments: { token: "SOL" } });
+    expect(result.content).toHaveLength(1);
+    expect(result.isError).toBeFalsy();
+    const text = (result.content[0] as { text: string }).text;
+    const parsed = parseSanitizedResponse(text) as { success: boolean; data: { token: string } };
     expect(parsed.success).toBe(true);
     expect(parsed.data.token).toBe("SOL");
   });
 
-  it("tool names should be a subset of canonical definitions", () => {
-    const wallet = createWallet();
-    const tools = createLangChainTools(wallet);
-    const names = tools.map((t) => t.name);
-    for (const name of names) {
-      expect(WALLET_TOOL_NAMES).toContain(name);
-    }
-  });
-});
-
-// ── wallet.toAnthropicTools() / toOpenAITools() ───────────────────
-
-describe("AgentWallet tool format methods", () => {
-  it("toAnthropicTools should return 6 safe tools with input_schema", () => {
-    const wallet = createWallet();
-    const tools = wallet.toAnthropicTools();
-    expect(tools).toHaveLength(6);
-    expect(tools[0]).toHaveProperty("input_schema");
+  it("should call wallet_transfer and return confirmed result", async () => {
+    const { client } = await createMcpClientServer();
+    const result = await client.callTool({
+      name: "wallet_transfer",
+      arguments: {
+        to: "GsbwXfJraMomNxBcjYLcG3mxkBUiyWXAB32fGbSQQRre",
+        amount: "1.0",
+        token: "SOL",
+        chain: "solana",
+      },
+    });
+    expect(result.isError).toBeFalsy();
+    const text = (result.content[0] as { text: string }).text;
+    const parsed = parseSanitizedResponse(text) as { success: boolean; data: { status: string } };
+    expect(parsed.success).toBe(true);
+    expect(parsed.data.status).toBe("confirmed");
   });
 
-  it("toOpenAITools should return 6 safe tools with function wrapper", () => {
-    const wallet = createWallet();
-    const tools = wallet.toOpenAITools();
-    expect(tools).toHaveLength(6);
-    expect(tools[0]!.type).toBe("function");
+  it("should return isError for unknown tool", async () => {
+    const { client } = await createMcpClientServer();
+    const result = await client.callTool({ name: "unknown_tool", arguments: {} });
+    expect(result.isError).toBe(true);
   });
 
-  it("toAnthropicTools and toOpenAITools should have same tool names", () => {
-    const wallet = createWallet();
-    const anthropicNames = wallet.toAnthropicTools().map((t) => t.name);
-    const openaiNames = wallet
-      .toOpenAITools()
-      .map((t) => t.function.name);
-    expect(anthropicNames).toEqual(openaiNames);
+  it("should return isError for policy-denied transfer", async () => {
+    const denyRule: PolicyRule = {
+      name: "deny-all",
+      evaluate: async () => ({
+        decision: "DENY" as const,
+        rule: "deny-all",
+        reason: "All denied",
+      }),
+    };
+    const store = new MemoryStore();
+    const policy = new PolicyEngine([denyRule], store);
+    const wallet = createWallet({ policy, store });
+
+    const server = createMcpServer(wallet);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: "test-client", version: "1.0.0" });
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+
+    const result = await client.callTool({
+      name: "wallet_transfer",
+      arguments: {
+        to: "GsbwXfJraMomNxBcjYLcG3mxkBUiyWXAB32fGbSQQRre",
+        amount: "1.0",
+        token: "SOL",
+        chain: "solana",
+      },
+    });
+    expect(result.isError).toBe(true);
+    const text = (result.content[0] as { text: string }).text;
+    const parsed = parseSanitizedResponse(text) as { success: boolean; data: { status: string } };
+    expect(parsed.success).toBe(false);
+    expect(parsed.data.status).toBe("denied");
   });
 });
 
@@ -547,6 +548,55 @@ describe("handleToolCall", () => {
       validator: "Sysvar1111111111111111111111111111111111111",
     });
     expect(result.success).toBe(true);
+  });
+
+  it("should dispatch wallet_get_spending_remaining with no spending limits", async () => {
+    const wallet = createWallet();
+    const result = await wallet.handleToolCall("wallet_get_spending_remaining", {});
+    expect(result.success).toBe(true);
+    expect((result.data as { message: string }).message).toContain("No spending limits configured");
+  });
+
+  it("should dispatch wallet_get_spending_remaining with daily limit configured", async () => {
+    const store = new MemoryStore();
+    const rule = new SpendingLimitRule({
+      daily: { amount: "100", token: "SOL" },
+    });
+    const policy = new PolicyEngine([rule], store);
+    const wallet = createWallet({ policy, store });
+
+    const result = await wallet.handleToolCall("wallet_get_spending_remaining", {});
+    expect(result.success).toBe(true);
+    const data = result.data as Record<string, { window: string; remaining: string; limit: string }>;
+    expect(data.daily_SOL).toBeDefined();
+    expect(data.daily_SOL.window).toBe("daily");
+    expect(data.daily_SOL.remaining).toBe("100.0000");
+    expect(data.daily_SOL.limit).toBe("100");
+  });
+
+  it("should dispatch wallet_get_spending_remaining with USD limits", async () => {
+    const store = new MemoryStore();
+    const rule = new SpendingLimitRule({
+      dailyUSD: { amount: "500" },
+    });
+    const policy = new PolicyEngine([rule], store);
+    const wallet = createWallet({ policy, store });
+
+    const result = await wallet.handleToolCall("wallet_get_spending_remaining", {});
+    expect(result.success).toBe(true);
+    const data = result.data as Record<string, { window: string; remaining: string }>;
+    expect(data.daily_USD).toBeDefined();
+    expect(data.daily_USD.remaining).toBe("$500.00");
+  });
+
+  it("should dispatch wallet_get_all_balances", async () => {
+    const wallet = createWallet();
+    const result = await wallet.handleToolCall("wallet_get_all_balances", {});
+    expect(result.success).toBe(true);
+    const data = result.data as { balances: Array<{ token: string; amount: string }> };
+    expect(Array.isArray(data.balances)).toBe(true);
+    expect(data.balances.length).toBeGreaterThanOrEqual(2); // SOL + USDC at minimum
+    expect(data.balances.some(b => b.token === "SOL")).toBe(true);
   });
 });
 
@@ -1814,78 +1864,6 @@ describe("Adapter format verification — tool schema completeness", () => {
   });
 });
 
-// ── Adapter format verification: Anthropic schema propagation ────
-
-describe("Anthropic Adapter — schema propagation", () => {
-  it("should propagate chain enum values to input_schema", () => {
-    const tools = toAnthropicTools();
-    const transfer = tools.find((t) => t.name === "wallet_transfer")!;
-    const chainProp = transfer.input_schema.properties["chain"] as { enum: string[] };
-    expect(chainProp.enum).toEqual(["solana", "ethereum", "base"]);
-  });
-
-  it("should propagate all required fields for each tool", () => {
-    const tools = toAnthropicTools();
-    for (const tool of tools) {
-      const canonical = getToolByName(tool.name)!;
-      expect(tool.input_schema.required).toEqual(canonical.parameters.required);
-    }
-  });
-
-  it("should propagate all properties for each tool", () => {
-    const tools = toAnthropicTools();
-    for (const tool of tools) {
-      const canonical = getToolByName(tool.name)!;
-      const toolPropKeys = Object.keys(tool.input_schema.properties).sort();
-      const canonicalPropKeys = Object.keys(canonical.parameters.properties).sort();
-      expect(toolPropKeys).toEqual(canonicalPropKeys);
-    }
-  });
-
-  it("each tool should have non-empty description", () => {
-    const tools = toAnthropicTools();
-    for (const tool of tools) {
-      expect(tool.description.length).toBeGreaterThan(0);
-    }
-  });
-});
-
-// ── Adapter format verification: OpenAI schema propagation ───────
-
-describe("OpenAI Adapter — schema propagation", () => {
-  it("should propagate chain enum values to function.parameters", () => {
-    const tools = toOpenAITools();
-    const transfer = tools.find((t) => t.function.name === "wallet_transfer")!;
-    const chainProp = transfer.function.parameters.properties["chain"] as { enum: string[] };
-    expect(chainProp.enum).toEqual(["solana", "ethereum", "base"]);
-  });
-
-  it("should propagate all required fields for each tool", () => {
-    const tools = toOpenAITools();
-    for (const tool of tools) {
-      const canonical = getToolByName(tool.function.name)!;
-      expect(tool.function.parameters.required).toEqual(canonical.parameters.required);
-    }
-  });
-
-  it("should propagate all properties for each tool", () => {
-    const tools = toOpenAITools();
-    for (const tool of tools) {
-      const canonical = getToolByName(tool.function.name)!;
-      const toolPropKeys = Object.keys(tool.function.parameters.properties).sort();
-      const canonicalPropKeys = Object.keys(canonical.parameters.properties).sort();
-      expect(toolPropKeys).toEqual(canonicalPropKeys);
-    }
-  });
-
-  it("each tool function should have non-empty description", () => {
-    const tools = toOpenAITools();
-    for (const tool of tools) {
-      expect(tool.function.description.length).toBeGreaterThan(0);
-    }
-  });
-});
-
 // ── Tool result format: ToolCallResult shape ─────────────────────
 
 describe("ToolCallResult shape verification", () => {
@@ -2067,168 +2045,6 @@ describe("ToolCallResult shape verification", () => {
     expect(txResult.summary).toContain("Staked");
     expect(txResult.summary).toContain("10.0");
     expect(txResult.summary).toContain("SOL");
-  });
-});
-
-// ── LangChain adapter: error handling ────────────────────────────
-
-describe("LangChain Adapter — error handling and JSON stringification", () => {
-  it("should return sanitized string with success=false when tool call fails validation", async () => {
-    const wallet = createWallet();
-    const tools = createLangChainTools(wallet);
-    const transferTool = tools.find((t) => t.name === "wallet_transfer")!;
-    const result = await transferTool.call({
-      to: "",
-      amount: "1.0",
-      token: "SOL",
-      chain: "solana",
-    });
-    // CRIT-T3-01: LangChain adapter now wraps results in sanitized delimiters
-    const parsed = parseSanitizedResponse(result) as { success: boolean; error: string };
-    expect(parsed.success).toBe(false);
-    expect(parsed.error).toBeDefined();
-  });
-
-  it("should return JSON string for unknown tool error", async () => {
-    // LangChain tools are pre-bound; let's test the error path through handleToolCall
-    const wallet = createWallet();
-    const result = await wallet.handleToolCall("bad_tool", {});
-    // This would be stringified by LangChain adapter
-    const jsonStr = JSON.stringify(result);
-    const parsed = JSON.parse(jsonStr);
-    expect(parsed.success).toBe(false);
-    // MED-09: Validation now catches unknown tools and returns "Validation failed" immediately
-    expect(parsed.error).toContain("Validation failed");
-  });
-
-  it("should properly stringify successful transfer result in sanitized format", async () => {
-    const wallet = createWallet();
-    const tools = createLangChainTools(wallet);
-    const transferTool = tools.find((t) => t.name === "wallet_transfer")!;
-    const result = await transferTool.call({
-      to: "GsbwXfJraMomNxBcjYLcG3mxkBUiyWXAB32fGbSQQRre",
-      amount: "1.0",
-      token: "SOL",
-      chain: "solana",
-    });
-    expect(typeof result).toBe("string");
-    // CRIT-T3-01: LangChain adapter now wraps results in sanitized delimiters
-    const parsed = parseSanitizedResponse(result) as { success: boolean; data: { status: string; txId: string } };
-    expect(parsed.success).toBe(true);
-    expect(parsed.data.status).toBe("confirmed");
-    expect(parsed.data.txId).toBeDefined();
-  });
-
-  it("should properly stringify policy result as valid JSON", async () => {
-    const store = new MemoryStore();
-    const rules: PolicyRule[] = [
-      new SpendingLimitRule({ perTransaction: { amount: "10", token: "SOL" } }),
-      new RateLimitRule({ maxTransactionsPerMinute: 5 }),
-    ];
-    const policy = new PolicyEngine(rules, store);
-    const wallet = createWallet({ policy, store });
-
-    // API-003: wallet_get_policy is now in DANGEROUS_TOOLS, not in default LangChain tools.
-    // Test via handleToolCall directly instead.
-    const result = await wallet.handleToolCall("wallet_get_policy", {});
-    expect(result.success).toBe(true);
-    // MED-38: Policy name is now redacted to "custom" when rules exist
-    expect(result.data.name).toBe("custom");
-    expect(result.data.spendingLimits).toBeDefined();
-    expect(result.data.rateLimits).toBeDefined();
-  });
-
-  it("should properly stringify balance result in sanitized format", async () => {
-    const wallet = createWallet();
-    const tools = createLangChainTools(wallet);
-    const balanceTool = tools.find((t) => t.name === "wallet_get_balance")!;
-    const result = await balanceTool.call({ token: "USDC" });
-    // CRIT-T3-01: LangChain adapter now wraps results in sanitized delimiters
-    const parsed = parseSanitizedResponse(result) as { success: boolean; data: { token: string; amount: string; decimals: number } };
-    expect(parsed.success).toBe(true);
-    expect(parsed.data.token).toBe("USDC");
-    expect(typeof parsed.data.amount).toBe("string");
-    expect(typeof parsed.data.decimals).toBe("number");
-  });
-
-  it("should properly stringify transaction history result in sanitized format", async () => {
-    const wallet = createWallet();
-    const tools = createLangChainTools(wallet);
-    const historyTool = tools.find((t) => t.name === "wallet_get_transaction_history")!;
-    const result = await historyTool.call({});
-    // CRIT-T3-01: LangChain adapter now wraps results in sanitized delimiters
-    const parsed = parseSanitizedResponse(result) as { success: boolean; data: unknown[] };
-    expect(parsed.success).toBe(true);
-    expect(Array.isArray(parsed.data)).toBe(true);
-  });
-
-  it("should stringify denied transaction result as valid JSON with error", async () => {
-    const denyRule: PolicyRule = {
-      name: "deny-all",
-      evaluate: async () => ({
-        decision: "DENY" as const,
-        rule: "deny-all",
-        reason: "Denied for testing",
-      }),
-    };
-    const store = new MemoryStore();
-    const policy = new PolicyEngine([denyRule], store);
-    const wallet = createWallet({ policy, store });
-
-    const tools = createLangChainTools(wallet);
-    const transferTool = tools.find((t) => t.name === "wallet_transfer")!;
-    const result = await transferTool.call({
-      to: "GsbwXfJraMomNxBcjYLcG3mxkBUiyWXAB32fGbSQQRre",
-      amount: "1.0",
-      token: "SOL",
-      chain: "solana",
-    });
-    // CRIT-T3-01: LangChain adapter now wraps results in sanitized delimiters
-    const parsed = parseSanitizedResponse(result) as { success: boolean; error: string; data: { status: string } };
-    expect(parsed.success).toBe(false);
-    expect(parsed.error).toBeDefined();
-    expect(parsed.data.status).toBe("denied");
-  });
-
-  it("LangChain tool schema should match canonical schema for each tool", () => {
-    const wallet = createWallet();
-    const tools = createLangChainTools(wallet);
-    for (const tool of tools) {
-      const canonical = getToolByName(tool.name)!;
-      expect(tool.schema.type).toBe(canonical.parameters.type);
-      expect(tool.schema.required).toEqual(canonical.parameters.required);
-      const toolPropKeys = Object.keys(tool.schema.properties).sort();
-      const canonicalPropKeys = Object.keys(canonical.parameters.properties).sort();
-      expect(toolPropKeys).toEqual(canonicalPropKeys);
-    }
-  });
-
-  it("should handle handleToolCall exception by catching and returning error", async () => {
-    // Create a wallet with a chain adapter that throws on buildTransaction
-    const throwingChain: ChainAdapter = {
-      chain: "solana",
-      getBalance: async () => { throw new Error("Chain connection lost"); },
-      getValueInUSD: async () => 0,
-      buildTransaction: async () => { throw new Error("Chain connection lost"); },
-      simulateTransaction: vi.fn().mockResolvedValue({ success: true }),
-      broadcast: async () => "mock_tx",
-      getTransactionStatus: async (txId: string) => ({
-        status: "confirmed" as const,
-        txId,
-      }),
-      isValidAddress: () => true,
-    };
-    const store = new MemoryStore();
-    const wallet = createWallet({ chain: throwingChain, store });
-
-    const tools = createLangChainTools(wallet);
-    const balanceTool = tools.find((t) => t.name === "wallet_get_balance")!;
-    const result = await balanceTool.call({ token: "SOL" });
-    // CRIT-T3-01: LangChain adapter now wraps results in sanitized delimiters
-    const parsed = parseSanitizedResponse(result) as { success: boolean; error: string };
-    expect(parsed.success).toBe(false);
-    // S5-04/S5-10 fix: error messages are now sanitized — internal details are not leaked
-    expect(parsed.error).toContain("An internal error occurred");
   });
 });
 

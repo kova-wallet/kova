@@ -146,18 +146,13 @@ export type { AuditLoggerConfig, AuditFailureCallback, IntegrityReport } from ".
 export type { AuditEntry, PolicyRuleAudit } from "./logging/types.js";
 
 // ---------------------------------------------------------------------------
-// LLM Adapters — Public API
-// Tool definitions and framework-specific adapters for AI agent integration.
+// MCP Server — Public API
+// The sole agent-facing interface. All AI agents interact with the wallet
+// through the MCP server, regardless of the AI framework used.
+// Tool definitions, validation, and sanitization are internal to the adapter.
 // ---------------------------------------------------------------------------
-export type { ToolDefinition, ToolParameter, ToolCallResult, ToolCallErrorCode } from "./adapters/types.js";
-export { WALLET_TOOLS, WALLET_TOOL_NAMES, getToolByName, safeHandleToolCall, sanitizeToolResponse } from "./adapters/tools.js";
-export type { WalletToolName } from "./adapters/tools.js";
-export { toAnthropicTools } from "./adapters/claude.js";
-export type { AnthropicTool } from "./adapters/claude.js";
-export { toOpenAITools } from "./adapters/openai.js";
-export type { OpenAITool } from "./adapters/openai.js";
-export { createLangChainTools } from "./adapters/langchain.js";
-export type { LangChainToolDefinition } from "./adapters/langchain.js";
+export { createMcpServer, createMcpStdioServer } from "./adapters/mcp.js";
+export type { McpServerOptions } from "./adapters/mcp.js";
 
 // ---------------------------------------------------------------------------
 // Oracles — Price feed providers for USD valuation

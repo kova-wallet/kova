@@ -114,31 +114,9 @@ Execute a wallet tool by name. Used in AI tool-use loops.
 
 ```typescript
 // Dispatch a tool call from an AI agent to the appropriate wallet handler.
-// This is the single entry point for all AI integrations (Claude, OpenAI, LangChain).
+// This is used internally by the MCP server.
 const result = await wallet.handleToolCall("wallet_get_balance", { token: "SOL" });
 // { success: true, data: { token: "SOL", amount: "12.5", ... } }
-```
-
-#### `toAnthropicTools(): AnthropicTool[]`
-
-Return tool definitions in Anthropic Messages API format.
-
-```typescript
-// Convert kova's wallet tools to Anthropic's format (uses input_schema).
-// Pass the result directly to anthropic.messages.create({ tools }).
-const tools = wallet.toAnthropicTools();
-// Pass directly to anthropic.messages.create({ tools })
-```
-
-#### `toOpenAITools(): OpenAITool[]`
-
-Return tool definitions in OpenAI function calling format.
-
-```typescript
-// Convert kova's wallet tools to OpenAI's format (uses { type: "function", function: {...} }).
-// Pass the result directly to openai.chat.completions.create({ tools }).
-const tools = wallet.toOpenAITools();
-// Pass directly to openai.chat.completions.create({ tools })
 ```
 
 ---
@@ -1221,240 +1199,39 @@ await approval.start();
 
 ## Adapters
 
-### Tool Definitions
+### MCP Server
 
-kova provides built-in tool definitions for AI model integrations.
+#### `createMcpServer(wallet, options?): Server`
 
-#### ToolDefinition
+Create an MCP Server instance with all wallet tools registered. The returned server is not yet connected to a transport -- call `server.connect(transport)` with a `StdioServerTransport` or any other MCP-compatible transport.
 
 ```typescript
-// The canonical tool definition format used internally by kova.
-// Provider-specific adapters convert this to the format each AI service expects.
-interface ToolDefinition {
-  name: string;                    // Tool name (e.g., "wallet_transfer")
-  description: string;             // Description sent to the LLM
-  parameters: ToolParameter[];     // Array of parameter definitions
-}
+import { createMcpServer } from "@kova/wallet";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+
+const server = createMcpServer(wallet);
+await server.connect(new StdioServerTransport());
 ```
 
-#### ToolParameter
+#### `createMcpStdioServer(wallet, options?): Promise<Server>`
+
+Convenience function that creates an MCP server and connects it to stdio transport.
 
 ```typescript
-// Schema for a single tool parameter.
-interface ToolParameter {
-  name: string;           // Parameter name (e.g., "to", "amount")
-  type: string;           // JSON Schema type (e.g., "string", "number")
-  description: string;    // Description shown to the LLM to guide usage
-  required: boolean;      // Whether this parameter is mandatory
-  enum?: string[];        // Optional: restrict to specific values (e.g., chain names)
-}
+import { createMcpStdioServer } from "@kova/wallet";
+
+const server = await createMcpStdioServer(wallet);
 ```
 
-#### WalletToolDefinition
-
-Exported type alias for `ToolDefinition`, used when referencing wallet-specific tool definitions.
+#### McpServerOptions
 
 ```typescript
-// Type alias for wallet tool definitions.
-type WalletToolDefinition = ToolDefinition;
-```
-
-#### ToolCallResult
-
-Returned by `wallet.handleToolCall()`.
-
-```typescript
-// The standardized response format for all tool calls.
-interface ToolCallResult {
-  success: boolean;    // Whether the operation succeeded
-  data?: unknown;      // Result data (varies by tool)
-  error?: string;      // Error message if success is false
-}
-```
-
----
-
-### WALLET_TOOLS
-
-Array of all built-in wallet tool definitions.
-
-```typescript
-// Import the complete array of all 8 wallet tool definitions.
-// Use these to build custom AI integrations for providers not natively supported.
-import { WALLET_TOOLS } from "@kova/wallet";
-// ToolDefinition[] (8 tools)
-```
-
-### DANGEROUS_TOOLS
-
-Array of the 2 dangerous tool definitions (`wallet_execute_custom` and `wallet_get_policy`) that must be explicitly opted into.
-
-```typescript
-// Import the dangerous tool definitions separately.
-import { DANGEROUS_TOOLS } from "@kova/wallet";
-// ToolDefinition[] (2 tools)
-```
-
-### ALL_WALLET_TOOLS
-
-Combined array of all safe and dangerous tool definitions (same as `WALLET_TOOLS`).
-
-```typescript
-// Import the combined array of all tool definitions.
-import { ALL_WALLET_TOOLS } from "@kova/wallet";
-// ToolDefinition[] (8 tools)
-```
-
-### WRITE_TOOL_NAMES
-
-Array of tool name strings for write operations only.
-
-```typescript
-// Import the array of write-only tool name strings.
-// Useful for filtering or restricting agents to read-only operations.
-import { WRITE_TOOL_NAMES } from "@kova/wallet";
-// ["wallet_transfer", "wallet_swap", "wallet_mint", "wallet_stake", "wallet_execute_custom"]
-```
-
-### WALLET_TOOL_NAMES
-
-Array of all tool name strings.
-
-```typescript
-// Import the array of all tool name strings.
-// Useful for validation or filtering.
-import { WALLET_TOOL_NAMES } from "@kova/wallet";
-// ["wallet_transfer", "wallet_swap", "wallet_mint", "wallet_stake",
-//  "wallet_execute_custom", "wallet_get_balance", "wallet_get_policy",
-//  "wallet_get_transaction_history"]
-```
-
-### WalletToolName
-
-Union type of all valid tool names.
-
-```typescript
-// Type-safe union of all valid tool names.
-// Use this type to ensure your code only references valid tool names.
-type WalletToolName =
-  | "wallet_transfer"                 // Send tokens
-  | "wallet_swap"                     // Swap tokens via DEX
-  | "wallet_mint"                     // Mint an NFT
-  | "wallet_stake"                    // Stake tokens with a validator
-  | "wallet_execute_custom"           // Execute a custom program instruction
-  | "wallet_get_balance"              // Query token balance
-  | "wallet_get_policy"               // View policy constraints
-  | "wallet_get_transaction_history"; // View recent transactions
-```
-
-### getToolByName
-
-```typescript
-// Look up a specific tool definition by its name.
-// Returns undefined if the name doesn't match any known tool.
-function getToolByName(name: WalletToolName): ToolDefinition | undefined
-```
-
-Retrieve a specific tool definition by name.
-
-```typescript
-// Import the lookup function.
-import { getToolByName } from "@kova/wallet";
-
-// Find the wallet_transfer tool definition by name.
-// Returns the full ToolDefinition with name, description, and parameters.
-const transferTool = getToolByName("wallet_transfer");
-```
-
----
-
-### Anthropic Adapter
-
-#### `toAnthropicTools(): AnthropicTool[]`
-
-Instance method on `AgentWallet`. Returns tools in Anthropic Messages API format.
-
-```typescript
-// Convert kova tools to Anthropic's format.
-// The key transformation: "parameters" becomes "input_schema".
-const tools = wallet.toAnthropicTools();
-```
-
-#### AnthropicTool
-
-```typescript
-// Anthropic's expected tool format for the Messages API.
-interface AnthropicTool {
-  name: string;              // Tool name (e.g., "wallet_transfer")
-  description: string;       // Tool description for Claude
-  input_schema: {            // JSON Schema for the tool's input (note: "input_schema", not "parameters")
-    type: "object";
-    properties: Record<string, unknown>;
-    required: string[];
-  };
-}
-```
-
----
-
-### OpenAI Adapter
-
-#### `toOpenAITools(): OpenAITool[]`
-
-Instance method on `AgentWallet`. Returns tools in OpenAI function calling format.
-
-```typescript
-// Convert kova tools to OpenAI's function calling format.
-// Each tool is wrapped in { type: "function", function: { ... } }.
-const tools = wallet.toOpenAITools();
-```
-
-#### OpenAITool
-
-```typescript
-// OpenAI's expected tool format for the Chat Completions API.
-interface OpenAITool {
-  type: "function";          // Always "function" -- tells OpenAI this is a callable function
-  function: {
-    name: string;            // Tool/function name
-    description: string;     // Tool description for GPT
-    parameters: {            // JSON Schema for the function's input parameters
-      type: "object";
-      properties: Record<string, unknown>;
-      required: string[];
-    };
-  };
-}
-```
-
----
-
-### LangChain Adapter
-
-#### `createLangChainTools(wallet: AgentWallet): LangChainToolDefinition[]`
-
-Standalone function that creates LangChain-compatible tool definitions.
-
-```typescript
-// Import the LangChain adapter function.
-// Unlike toAnthropicTools() and toOpenAITools(), this is a standalone function
-// (not an instance method) because LangChain tools need a reference to the wallet.
-import { createLangChainTools } from "@kova/wallet";
-
-// Create LangChain-compatible tools from the wallet instance.
-// Each tool includes a call() method that delegates to wallet.handleToolCall().
-const tools = createLangChainTools(wallet);
-```
-
-#### LangChainToolDefinition
-
-```typescript
-// The LangChain-compatible tool format produced by createLangChainTools().
-interface LangChainToolDefinition {
-  name: string;                                          // Tool name
-  description: string;                                   // Tool description for the LLM
-  schema: Record<string, unknown>;                       // JSON Schema for input parameters
-  call: (input: Record<string, unknown>) => Promise<string>; // The callable function (returns JSON string)
+interface McpServerOptions {
+  includeDangerous?: boolean;                    // Include wallet_execute_custom and wallet_get_policy
+  exclude?: string[];                            // Exclude specific tools by name
+  authToken?: string;                            // Static auth token for every call
+  authTokenProvider?: () => string | undefined;  // Dynamic auth token provider
+  serverInfo?: { name?: string; version?: string }; // Override server name/version
 }
 ```
 

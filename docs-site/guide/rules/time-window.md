@@ -45,12 +45,12 @@ Given a rule configured for Mon-Fri, 09:00-17:00, America/New_York:
 
 ```typescript
 // Import the TimeWindowRule class, which restricts WHEN the agent can execute transactions.
-import { TimeWindowRule } from "kova";
+import { TimeWindowRule } from "@kova/wallet";
 
 // Import the TypeScript types for configuring active hours.
 // ActiveHoursConfig: the top-level config with timezone, windows, and outside-hours policy.
 // TimeWindow: defines a specific window of days and times when transactions are allowed.
-import type { ActiveHoursConfig, TimeWindow } from "kova";
+import type { ActiveHoursConfig, TimeWindow } from "@kova/wallet";
 ```
 
 ## ActiveHoursConfig
@@ -207,8 +207,8 @@ const rule = new TimeWindowRule({
 });
 ```
 
-::: tip
-When `outsideHoursPolicy` is set to `"require_approval"`, the rule actually requests approval through the configured approval channel when one is available. If an `ApprovalChannel` is configured in the `PolicyEngine`, off-hours transactions will be routed to the human approver. If no channel is available, the transaction is denied.
+::: warning DEPRECATION NOTICE
+The `"require_approval"` value for `outsideHoursPolicy` is **deprecated**. It currently behaves identically to `"deny"` -- the only difference is the denial reason string (the message says "requires approval" instead of "outside active hours"). It does **not** route transactions to an approval channel. For real approval-gated behavior outside active hours, pair `TimeWindowRule` with [`ApprovalGateRule`](/guide/rules/approval-gate) instead.
 :::
 
 ## Code Examples

@@ -76,7 +76,7 @@ Open it and add the import:
 
 ```typescript
 // Import the Store interface that our custom class must implement.
-import type { Store } from "kova";
+import type { Store } from "@kova/wallet";
 // Import the ioredis client library for connecting to a Redis server.
 // Install it with: npm install ioredis
 import Redis from "ioredis";
@@ -200,7 +200,7 @@ Using `LPUSH` (insert at head) means the newest entry is always at the start of 
 Here is the complete `RedisStore` in one file:
 
 ```typescript
-import type { Store } from "kova";
+import type { Store } from "@kova/wallet";
 import Redis from "ioredis";
 
 export class RedisStore implements Store {
@@ -268,7 +268,7 @@ That's it -- 40 lines of actual logic. The Store interface is deliberately minim
 Replace `MemoryStore` or `SqliteStore` with your custom adapter:
 
 ```typescript
-import { AgentWallet, PolicyEngine, LocalSigner, SolanaAdapter } from "kova";
+import { AgentWallet, PolicyEngine, LocalSigner, SolanaAdapter } from "@kova/wallet";
 import { RedisStore } from "./redis-store";
 
 // Point at your Redis instance.

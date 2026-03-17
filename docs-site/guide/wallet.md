@@ -5,7 +5,7 @@
 - How to construct a wallet with all required and optional components
 - The 10-step execute pipeline that every transaction passes through
 - How to handle the four possible transaction outcomes (confirmed, denied, pending, failed)
-- How to integrate with AI frameworks (Claude, OpenAI) via built-in tool definitions
+- How to expose wallet operations to AI agents via the MCP (Model Context Protocol) server
 :::
 
 ## Overview
@@ -14,12 +14,12 @@ The `AgentWallet` is the central hub of the Kova SDK -- think of it as **a bank 
 
 You give your AI agent an `AgentWallet` instead of raw access to a blockchain. The wallet makes sure the agent can only do what you have explicitly allowed.
 
-The `AgentWallet` class is the main entry point for the SDK. It wires together the policy engine, signer, chain adapter, and store, and exposes a high-level API for executing transactions, checking balances, and integrating with AI frameworks.
+The `AgentWallet` class is the main entry point for the SDK. It wires together the policy engine, signer, chain adapter, and store, and exposes a high-level API for executing transactions and checking balances.
 
 ### When would I use this?
 
 - **You are building an AI agent** that needs to send payments, swap tokens, or interact with a blockchain on its own -- but you want guardrails so it cannot drain your funds.
-- **You want plug-and-play integration** with Claude (Anthropic) or GPT-4 (OpenAI) tool calling, so the AI model can invoke wallet operations safely.
+- **You want to expose wallet operations to AI agents** via the Model Context Protocol (MCP), so any AI model can invoke wallet operations safely.
 - **You need a full audit trail** of every transaction attempt (approved or denied) for compliance or debugging.
 
 ## Configuration
@@ -522,71 +522,6 @@ The SDK enforces hardcoded rate limits on tool calls regardless of your policy c
 
 These limits are floors -- they cannot be disabled via configuration. Your policy rules provide additional, more granular limits on top of these.
 
-### toAnthropicTools()
-
-Get tool definitions formatted for the Anthropic (Claude) API. These definitions tell Claude what wallet operations are available and how to call them.
-
-```typescript
-// Method signature: returns an array of tool definitions in the format expected
-// by the Anthropic Messages API. These define the wallet operations the AI can invoke.
-toAnthropicTools(): AnthropicTool[]
-```
-
-```typescript
-// Import the Anthropic SDK for interacting with the Claude API.
-import Anthropic from "@anthropic-ai/sdk";
-
-// Create an Anthropic client (uses the ANTHROPIC_API_KEY environment variable by default).
-const client = new Anthropic();
-
-// Get wallet tool definitions formatted for the Anthropic API.
-// These tell Claude what wallet operations are available (transfer, swap, get_balance, etc.),
-// including parameter schemas so Claude knows how to structure its tool calls.
-const tools = wallet.toAnthropicTools();
-
-// Send a message to Claude with the wallet tools attached.
-// Claude can now decide to call wallet tools (e.g., wallet_transfer) based on the user's request.
-// When Claude returns a tool_use block, you pass it to wallet.handleToolCall() to execute.
-const response = await client.messages.create({
-  model: "claude-sonnet-4-6-20250827",  // The Claude model to use
-  max_tokens: 1024,                   // Maximum response length
-  tools,                              // Attach the wallet tool definitions
-  messages: [{ role: "user", content: "Send 0.1 SOL to Alice" }],
-});
-```
-
-### toOpenAITools()
-
-Get tool definitions formatted for the OpenAI API. Same concept as `toAnthropicTools()`, but formatted for OpenAI's function calling interface.
-
-```typescript
-// Method signature: returns an array of tool definitions in the format expected
-// by the OpenAI Chat Completions API (function calling).
-toOpenAITools(): OpenAITool[]
-```
-
-```typescript
-// Import the OpenAI SDK for interacting with the OpenAI API.
-import OpenAI from "openai";
-
-// Create an OpenAI client (uses the OPENAI_API_KEY environment variable by default).
-const client = new OpenAI();
-
-// Get wallet tool definitions formatted for the OpenAI API.
-// The format differs from Anthropic's but contains the same information:
-// available operations, parameter schemas, and descriptions.
-const tools = wallet.toOpenAITools();
-
-// Send a chat completion request with the wallet tools attached.
-// GPT-4 can now decide to call wallet functions based on the user's message.
-// When GPT-4 returns a function_call, you pass the name and arguments to wallet.handleToolCall().
-const response = await client.chat.completions.create({
-  model: "gpt-4",   // The OpenAI model to use
-  tools,             // Attach the wallet tool definitions
-  messages: [{ role: "user", content: "Send 0.1 SOL to Alice" }],
-});
-```
-
 ## TransactionResult
 
 Every `execute()` call returns a `TransactionResult`. This object tells you exactly what happened -- whether the transaction succeeded, was blocked by policy, is waiting for approval, or failed for a technical reason.
@@ -692,5 +627,3 @@ If multiple agents share the same `AgentWallet` instance and store, their spendi
 | `getPolicy()` | `Promise<PolicySummary>` | Get a read-only summary of all policy constraints (limits, allowlists, rate limits) |
 | `getTransactionHistory(limit?)` | `Promise<TransactionResult[]>` | Fetch recent transactions from the audit log (default: 10, max: 1000) |
 | `handleToolCall(name, input, authToken?)` | `Promise<ToolCallResult>` | Dispatch an AI model's tool call to the appropriate wallet method |
-| `toAnthropicTools()` | `AnthropicTool[]` | Get tool definitions formatted for the Claude (Anthropic) API |
-| `toOpenAITools()` | `OpenAITool[]` | Get tool definitions formatted for the OpenAI API |

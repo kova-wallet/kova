@@ -22,6 +22,7 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import * as crypto from "node:crypto";
 import * as os from "node:os";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -44,6 +45,7 @@ import type { TransactionIntent } from "../../src/core/intent.js";
  */
 let sqliteAvailable = false;
 let tmpDir: string;
+const testHmacKey = crypto.randomBytes(32).toString("hex");
 
 beforeAll(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kova-sqlite-test-"));
@@ -63,6 +65,7 @@ beforeAll(async () => {
   const probeFile = path.join(tmpDir, "probe.db");
   const probe = new SqliteStore({
     path: probeFile,
+    hmacKey: testHmacKey,
     requireEncryption: false,
     allowedDirectories: [tmpDir],
   });
@@ -94,6 +97,7 @@ function dbPath(name: string): string {
 function openStore(filePath: string): SqliteStore {
   return new SqliteStore({
     path: filePath,
+    hmacKey: testHmacKey,
     requireEncryption: false,
     allowedDirectories: [tmpDir],
   });
@@ -241,22 +245,30 @@ describe("SpendingLimitRule — counter survives store restart", () => {
     const file = dbPath("spending-daily");
     const store1 = openStore(file);
 
-    const rule = new SpendingLimitRule({
+    const rule1 = new SpendingLimitRule({
       daily: { amount: "100", token: "SOL" },
     });
 
     const now = Date.now();
-    const r1 = await rule.evaluate(makeTransfer("10"), makeContext(store1, now));
+    const r1 = await rule1.evaluate(makeTransfer("10"), makeContext(store1, now));
     expect(r1.decision).toBe("ALLOW");
-    const r2 = await rule.evaluate(makeTransfer("15"), makeContext(store1, now));
+    const r2 = await rule1.evaluate(makeTransfer("15"), makeContext(store1, now));
     expect(r2.decision).toBe("ALLOW");
     store1.close();
 
+    // Verify counter survived restart by checking that the rule denies
+    // a transfer that would exceed the daily limit (25 already spent + 80 = 105 > 100).
     const store2 = openStore(file);
     try {
-      const counterRaw = await store2.get("spending:daily:SOL");
-      expect(counterRaw).not.toBeNull();
-      expect(parseFloat(counterRaw!)).toBeCloseTo(25, 5);
+      const rule2 = new SpendingLimitRule({
+        daily: { amount: "100", token: "SOL" },
+      });
+      const deny = await rule2.evaluate(makeTransfer("80"), makeContext(store2, now));
+      expect(deny.decision).toBe("DENY");
+
+      // But a smaller transfer that stays under the limit should succeed (25 + 50 = 75 < 100).
+      const allow = await rule2.evaluate(makeTransfer("50"), makeContext(store2, now));
+      expect(allow.decision).toBe("ALLOW");
     } finally {
       store2.close();
     }

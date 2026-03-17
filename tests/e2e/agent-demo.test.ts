@@ -723,47 +723,6 @@ describe("Agent Demo — E2E Workflow", () => {
       expect(summary.rateLimits).toBeDefined();
     });
 
-    it("toAnthropicTools() returns array with expected tool names", () => {
-      const wallet = createToolWallet();
-      const tools = wallet.toAnthropicTools();
-
-      expect(Array.isArray(tools)).toBe(true);
-      // API-002/API-003: Default safe tools are 6 (dangerous tools opt-in only)
-      expect(tools.length).toBeGreaterThanOrEqual(6);
-
-      const names = tools.map((t) => t.name);
-      expect(names).toContain("wallet_transfer");
-      expect(names).toContain("wallet_get_balance");
-      expect(names).toContain("wallet_get_transaction_history");
-
-      // Anthropic format uses input_schema
-      for (const tool of tools) {
-        expect(tool.input_schema).toBeDefined();
-        expect(tool.input_schema.type).toBe("object");
-      }
-    });
-
-    it("toOpenAITools() returns array with expected structure", () => {
-      const wallet = createToolWallet();
-      const tools = wallet.toOpenAITools();
-
-      expect(Array.isArray(tools)).toBe(true);
-      // API-002/API-003: Default safe tools are 6 (dangerous tools opt-in only)
-      expect(tools.length).toBeGreaterThanOrEqual(6);
-
-      for (const tool of tools) {
-        expect(tool.type).toBe("function");
-        expect(tool.function).toBeDefined();
-        expect(tool.function.name).toBeDefined();
-        expect(tool.function.parameters).toBeDefined();
-        expect(tool.function.parameters.type).toBe("object");
-      }
-
-      const names = tools.map((t) => t.function.name);
-      expect(names).toContain("wallet_transfer");
-      expect(names).toContain("wallet_swap");
-      expect(names).toContain("wallet_get_balance");
-    });
   });
 
   // ────────────────────────────────────────────────────────────────

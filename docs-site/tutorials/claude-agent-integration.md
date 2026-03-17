@@ -7,12 +7,12 @@
 In this tutorial, you'll connect a kova wallet to Claude so that an AI agent can check balances, enforce spending policies, and execute blockchain transactions -- all through natural language. You will build a complete server-side integration in about 20 minutes.
 
 By the end, you will have a working system where:
-- Claude can call wallet tools (check balance, send SOL, view policy) via the Anthropic Messages API
+- Claude can call wallet tools (check balance, send SOL, view policy) via MCP (Model Context Protocol)
 - Your private key never leaves your server -- Claude only sees tool schemas and results
 - A policy engine enforces spending limits, allowlists, and rate limits on every transaction
 - You understand the full security model and can extend it for production use
 
-No prior experience with Claude's tool-use API or blockchain development is required.
+No prior experience with MCP or blockchain development is required.
 
 ---
 
@@ -24,7 +24,7 @@ Before you start, make sure you have the following:
 |------------|---------|-----------------|
 | **Node.js** | 18.0 or later | `node --version` / [nodejs.org](https://nodejs.org/en/download) |
 | **npm** | 9.0 or later | `npm --version` / Included with Node.js |
-| **Anthropic API key** | Starts with `sk-ant-...` | [console.anthropic.com/settings/keys](https://console.anthropic.com/settings/keys) |
+| **Claude Desktop** | For connecting to the MCP server | [claude.ai/download](https://claude.ai/download) |
 | **kova basics** | Completed the first wallet tutorial | [Your First Agent Wallet](/tutorials/first-wallet) (recommended but not required) |
 
 You do **not** need the Solana CLI or any blockchain tools installed locally.
@@ -41,8 +41,8 @@ Your Server (Node.js backend)
   ├── Policy rules live here (PolicyEngine)
   ├── Wallet orchestrates everything (AgentWallet)
   │
-  │   Exposes only tool schemas ──────►  Claude API
-  │   (JSON descriptions, no secrets)    (LLM decides which tools to call)
+  │   MCP Server exposes tools ──────►  Claude (via MCP)
+  │   (JSON descriptions, no secrets)    (LLM discovers and calls tools)
   │                                          │
   │   ◄────── Tool call results ────────────┘
   │   wallet.handleToolCall()
@@ -50,46 +50,20 @@ Your Server (Node.js backend)
   │     → return success/failure
 ```
 
-Claude never sees the private key. It only sees tool **schemas** (names + parameter types) and tool **results** (success/failure). Your backend handles everything in between.
+Claude never sees the private key. It only sees tool **schemas** (names + parameter types) and tool **results** (success/failure). Your MCP server handles everything in between.
 
 ::: details What just happened?
-This is the core security model of kova. Think of it like a bank teller (your server) and a customer (Claude). The customer can ask "What is my balance?" or "Send $50 to this person," but the teller is the one who actually accesses the vault, checks the rules, and moves the money. The customer never touches the vault. In kova terms: Claude calls tool schemas, your server runs `handleToolCall()`, and the private key, policy engine, and blockchain connection all stay safely on your server.
+This is the core security model of kova. Think of it like a bank teller (your server) and a customer (Claude). The customer can ask "What is my balance?" or "Send $50 to this person," but the teller is the one who actually accesses the vault, checks the rules, and moves the money. The customer never touches the vault. In kova terms: Claude connects to your MCP server, discovers tool schemas, calls them, and your server runs `handleToolCall()` internally. The private key, policy engine, and blockchain connection all stay safely on your server.
 :::
 
-## Step 0: Set Your API Key
+## Step 0: Prerequisites Check
 
-Before we begin coding, export your Anthropic API key as an environment variable. This is how the Anthropic SDK authenticates your requests.
-
-```bash
-export ANTHROPIC_API_KEY=sk-ant-...
-```
-
-**Expected output:** (none -- environment variables are set silently)
-
-To verify it worked:
-
-```bash
-echo $ANTHROPIC_API_KEY
-```
-
-**Expected output:**
-
-```
-sk-ant-...   (your key, partially shown)
-```
-
-::: details Troubleshooting: API key issues
-**If you see `Error: Missing API key`** later when running the code -- Your environment variable is not set. Make sure you ran the `export` command in the same terminal session where you run the script. Environment variables do not persist across terminal sessions unless you add them to your shell profile (`.bashrc`, `.zshrc`, etc.).
-
-**If you see `Error: 401 Unauthorized`** -- Your API key is invalid or expired. Generate a new one at [console.anthropic.com/settings/keys](https://console.anthropic.com/settings/keys).
-
-**If you are on Windows** -- Use `set ANTHROPIC_API_KEY=sk-ant-...` in Command Prompt, or `$env:ANTHROPIC_API_KEY = "sk-ant-..."` in PowerShell.
-:::
+Before we begin coding, make sure Node.js and npm are installed (see Prerequisites table above). No API key is needed on the server side -- the MCP server exposes wallet tools over a transport (stdio), and Claude connects to it as an MCP client.
 
 ## Step 1: Install Dependencies
 
 ```bash
-npm install @kova/wallet @solana/web3.js @anthropic-ai/sdk
+npm install @kova/wallet @solana/web3.js @modelcontextprotocol/sdk
 ```
 
 **Expected output:**
@@ -101,7 +75,7 @@ added 15 packages in 4s
 ::: details Troubleshooting: Installation issues
 **If you see `Cannot find module '@kova/wallet'`** -- Run `npm install @kova/wallet` again. Make sure you are in the correct project directory.
 
-**If you see `Cannot find module '@anthropic-ai/sdk'`** -- Run `npm install @anthropic-ai/sdk`. This is the official Anthropic SDK for Node.js.
+**If you see `Cannot find module '@modelcontextprotocol/sdk'`** -- Run `npm install @modelcontextprotocol/sdk`. This is the official MCP SDK for Node.js.
 :::
 
 ## Step 2: Create the Wallet on Your Server
@@ -112,7 +86,6 @@ An **allowlist** is a list of approved wallet addresses. When an allowlist is ac
 
 ```typescript
 import { Keypair } from "@solana/web3.js";
-import Anthropic from "@anthropic-ai/sdk";
 import {
   AgentWallet,
   Policy,
@@ -161,30 +134,31 @@ None of this is exposed to Claude. The agent will only interact through tool sch
 
 ::: details Checkpoint -- Step 2
 Before moving on, verify that:
-1. You have `kova`, `@solana/web3.js`, and `@anthropic-ai/sdk` installed (`ls node_modules/@kova/wallet`)
-2. Your `ANTHROPIC_API_KEY` environment variable is set (`echo $ANTHROPIC_API_KEY`)
-3. The code above compiles without errors (no red squiggly lines in your editor)
+1. You have `@kova/wallet`, `@solana/web3.js`, and `@modelcontextprotocol/sdk` installed (`ls node_modules/@kova/wallet`)
+2. The code above compiles without errors (no red squiggly lines in your editor)
 
 If you see `Cannot find name 'AllowlistRule'`, make sure you have the latest version of kova installed: `npm install @kova/wallet@latest`.
 :::
 
-## Step 3: Export Tool Schemas for Claude
+## Step 3: Create the MCP Server
 
-Call `wallet.toAnthropicTools()` to get an array of JSON tool definitions. These are just descriptions -- parameter names, types, and what each tool does. No keys, no addresses, no internal state.
+Call `createMcpServer(wallet)` to create an MCP server with all wallet tools registered. The MCP server exposes tool schemas -- parameter names, types, and what each tool does. No keys, no addresses, no internal state.
 
-**Tool schemas** are JSON objects that describe what operations are available, what parameters they accept, and what they return. Claude reads these descriptions and decides which tool to call based on the user's request. This is the same pattern used by OpenAI function calling, LangChain tools, and other agent frameworks.
+**MCP (Model Context Protocol)** is an open standard for connecting AI agents to tools. Claude has first-class MCP support -- when Claude connects to your MCP server, it automatically discovers available tools and their schemas. This is the same protocol used across AI frameworks (Claude Desktop, OpenAI, LangChain, and custom agents).
 
 ```typescript
-const tools = wallet.toAnthropicTools();
+import { createMcpServer } from "@kova/wallet";
+
+const server = createMcpServer(wallet);
 ```
 
-Here's what one tool schema looks like:
+When Claude discovers the tools, here is what one tool schema looks like:
 
 ```json
 {
   "name": "wallet_transfer",
   "description": "Transfer tokens to a recipient address. Sends a specified amount of a token (e.g., SOL, USDC) to the given address on the configured chain.",
-  "input_schema": {
+  "inputSchema": {
     "type": "object",
     "properties": {
       "to":     { "type": "string", "description": "Recipient wallet address" },
@@ -198,142 +172,80 @@ Here's what one tool schema looks like:
 }
 ```
 
-By default, only 2 read-only tools are enabled (`wallet_get_balance` and `wallet_get_transaction_history`). To enable write tools like `wallet_transfer`, you must explicitly opt in via `enabledTools`:
+The MCP server exposes the following wallet tools:
 
-| Tool | What it does | Default |
-|------|-------------|---------|
-| `wallet_get_balance` | Check token balance | Enabled |
-| `wallet_get_transaction_history` | View recent transactions | Enabled |
-| `wallet_transfer` | Send tokens to an address | Opt-in |
-| `wallet_swap` | Swap one token for another (e.g., SOL to USDC) | Opt-in |
-| `wallet_get_policy` | View policy constraints | Opt-in |
+| Tool | What it does |
+|------|-------------|
+| `wallet_get_balance` | Check token balance |
+| `wallet_get_transaction_history` | View recent transactions |
+| `wallet_transfer` | Send tokens to an address |
+| `wallet_swap` | Swap one token for another (e.g., SOL to USDC) |
+| `wallet_get_policy` | View policy constraints |
 
-To enable write tools, pass `enabledTools` when generating tool schemas:
+To exclude specific tools, pass options when creating the server:
 
 ```typescript
-const tools = wallet.toAnthropicTools({
-  enabledTools: [
-    "wallet_get_balance",
-    "wallet_get_transaction_history",
-    "wallet_get_policy",
-    "wallet_transfer",
-  ],
+const server = createMcpServer(wallet, {
+  exclude: ["wallet_swap"],  // exclude tools you don't want the agent to use
 });
 ```
 
 ::: details What just happened?
-The `toAnthropicTools()` method generated a set of JSON descriptions that tell Claude: "Here are the things you can do, and here are the parameters each action needs." Claude uses these descriptions to understand what tools are available and how to call them correctly. Critically, these schemas contain zero sensitive information -- no private keys, no RPC URLs, no internal state. They are safe to send to the Claude API.
+The `createMcpServer()` function created an MCP server with all wallet tools registered. When Claude connects, it discovers these tools automatically -- "Here are the things you can do, and here are the parameters each action needs." Claude uses these descriptions to understand what tools are available and how to call them correctly. Critically, these schemas contain zero sensitive information -- no private keys, no RPC URLs, no internal state. They are safe to expose via MCP.
 :::
 
-## Step 4: Pass the Schemas to Claude
+## Step 4: Connect the MCP Server to a Transport
 
-Send the tool schemas along with your user message to the Claude API. Claude sees the tool descriptions and decides when to use them.
-
-The **system prompt** is a special message that sets Claude's behavior for the entire conversation. It is not visible to the end user but strongly influences how Claude responds. In this case, we tell Claude to always check the policy and balance before making transactions.
+Connect the MCP server to a transport so Claude can communicate with it. The most common transport is **stdio** -- Claude Desktop and the Claude CLI both support it natively.
 
 ```typescript
-const anthropic = new Anthropic();
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 
-const messages: Anthropic.MessageParam[] = [
-  { role: "user", content: "Check my balance and send 0.5 SOL to 9aE4Uy6gzM..." },
-];
-
-let response = await anthropic.messages.create({
-  model: "claude-sonnet-4-6-20250827",
-  max_tokens: 1024,
-  system: `You are a payment assistant with access to a crypto wallet.
-Always check wallet_get_policy before your first transaction.
-Always check wallet_get_balance before sending funds.
-If a transaction is denied, explain why and do not retry.`,
-  tools,     // <-- the schemas from Step 2
-  messages,
-});
+// Connect the MCP server to stdio transport
+const transport = new StdioServerTransport();
+await server.connect(transport);
+// The server is now running -- Claude can discover and call wallet tools
 ```
 
-**Expected output:** (this is the raw API response -- you will see a JSON object)
+Or use the convenience function that does both steps in one call:
+
+```typescript
+import { createMcpStdioServer } from "@kova/wallet";
+
+const server = await createMcpStdioServer(wallet);
+// Server is running on stdio, ready for Claude to connect
+```
+
+To use this with Claude Desktop, add the server to your `claude_desktop_config.json`:
 
 ```json
 {
-  "stop_reason": "tool_use",
-  "content": [
-    {
-      "type": "tool_use",
-      "id": "toolu_01ABC...",
-      "name": "wallet_get_balance",
-      "input": { "token": "SOL" }
-    }
-  ]
-}
-```
-
-Claude chose to check the balance first -- exactly what we asked it to do in the system prompt.
-
-## Step 5: Claude Decides to Call a Tool
-
-Claude analyzes the user's request and decides which tools to call. The response comes back with `stop_reason: "tool_use"` and one or more `tool_use` blocks:
-
-```json
-{
-  "stop_reason": "tool_use",
-  "content": [
-    {
-      "type": "tool_use",
-      "id": "toolu_01ABC...",
-      "name": "wallet_get_balance",
-      "input": { "token": "SOL" }
-    }
-  ]
-}
-```
-
-Claude chose to check the balance first. Notice it only sends the tool name and input parameters -- it has no access to your private key, RPC connection, or policy internals.
-
-::: details What just happened?
-When Claude receives tool schemas, it does not blindly call them all. It reads the user's message ("Check my balance and send 0.5 SOL...") and reasons about the best sequence of actions. Because the system prompt says "Always check balance before sending," Claude first calls `wallet_get_balance`. The key insight: Claude only returns a tool *name* and *input parameters*. Your server decides how to execute it.
-:::
-
-## Step 6: Route the Tool Call Through Your Wallet
-
-Your backend receives Claude's tool call and routes it through `wallet.handleToolCall()`. This is where the magic happens -- the wallet evaluates the policy, builds the transaction, signs it, and broadcasts it.
-
-The **tool-use loop** is the core pattern for Claude tool calling. It works like a conversation: Claude says "I want to call this tool," your server executes it and returns the result, Claude decides what to do next. This loop repeats until Claude has all the information it needs and responds with text instead of a tool call.
-
-```typescript
-while (response.stop_reason === "tool_use") {
-  const toolResults: Anthropic.ToolResultBlockParam[] = [];
-
-  for (const block of response.content) {
-    if (block.type === "tool_use") {
-      // This is where policy check → sign → broadcast happens
-      const result = await wallet.handleToolCall(
-        block.name,
-        block.input as Record<string, unknown>,
-      );
-
-      toolResults.push({
-        type: "tool_result",
-        tool_use_id: block.id,
-        content: JSON.stringify(result),
-      });
+  "mcpServers": {
+    "kova-wallet": {
+      "command": "node",
+      "args": ["path/to/your/mcp-server.js"]
     }
   }
-
-  // Feed the results back to Claude for the next turn
-  messages.push({ role: "assistant", content: response.content });
-  messages.push({ role: "user", content: toolResults });
-
-  response = await anthropic.messages.create({
-    model: "claude-sonnet-4-6-20250827",
-    max_tokens: 1024,
-    system: `You are a payment assistant with access to a crypto wallet.
-Always check wallet_get_policy before your first transaction.
-Always check wallet_get_balance before sending funds.
-If a transaction is denied, explain why and do not retry.`,
-    tools,
-    messages,
-  });
 }
 ```
+
+Once connected, Claude automatically discovers the wallet tools and can call them based on user requests. When a user says "Check my balance and send 0.5 SOL to 9aE4Uy6gzM...", Claude will call `wallet_get_balance` first, then `wallet_transfer` -- all routed through the MCP server to your wallet's `handleToolCall()` method.
+
+## Step 5: Claude Discovers and Calls Tools
+
+When Claude connects to your MCP server, it discovers the available wallet tools automatically. Claude analyzes the user's request and decides which tools to call. For example, if the user says "Check my balance and send 0.5 SOL," Claude will call `wallet_get_balance` first.
+
+Claude only sends the tool name and input parameters via MCP -- it has no access to your private key, RPC connection, or policy internals.
+
+::: details What just happened?
+When Claude discovers tools via MCP, it does not blindly call them all. It reads the user's message ("Check my balance and send 0.5 SOL...") and reasons about the best sequence of actions. Claude first calls `wallet_get_balance`, then proceeds to `wallet_transfer`. The key insight: Claude only sends a tool *name* and *input parameters* over MCP. Your server decides how to execute it.
+:::
+
+## Step 6: How the MCP Server Routes Tool Calls
+
+When Claude calls a tool via MCP, the MCP server automatically routes it through `wallet.handleToolCall()`. This is where the magic happens -- the wallet evaluates the policy, builds the transaction, signs it, and broadcasts it. You do not need to write any tool-routing code yourself; the MCP server handles the entire loop.
+
+The **MCP tool-call flow** works like a conversation: Claude says "I want to call this tool," the MCP server executes it via the wallet and returns the result, Claude decides what to do next. This loop repeats until Claude has all the information it needs and responds with text instead of a tool call.
 
 What happens inside `handleToolCall()` for a transfer:
 
@@ -357,20 +269,20 @@ If the policy denies the transaction, the result looks like:
 
 Claude receives this result and can explain the denial to the user.
 
-::: details Troubleshooting: Tool-use loop issues
-**If the loop never exits** -- Make sure you are checking `response.stop_reason === "tool_use"` (not `response.stop_reason !== "end_turn"`). Claude may return other stop reasons like `"max_tokens"`.
+::: details Troubleshooting: Tool call issues
+**If you see `Error: Unknown tool name`** -- The tool name from Claude does not match any registered tool. Make sure you have not excluded required tools via the `exclude` option in `createMcpServer()`.
 
-**If you see `Error: Unknown tool name`** -- The tool name from Claude does not match any tool in your wallet. Make sure you are passing the exact `tools` array from `wallet.toAnthropicTools()` and not modifying the tool names.
+**If `handleToolCall()` throws an error** -- The MCP server returns a generic error response to Claude. Check your server logs for details.
 
-**If `handleToolCall()` throws an error** -- Check that `block.input` is a valid object. You may need to add error handling around the `handleToolCall()` call.
+**If Claude is not discovering tools** -- Verify the MCP server is running and connected. In Claude Desktop, check that your `claude_desktop_config.json` points to the correct script path.
 :::
 
 ::: details Checkpoint -- Steps 3 through 6
 At this point, you have the complete integration pattern:
-1. `wallet.toAnthropicTools()` generates tool schemas (Step 3)
-2. You pass schemas to `anthropic.messages.create()` (Step 4)
-3. Claude returns `tool_use` blocks (Step 5)
-4. You route them through `wallet.handleToolCall()` (Step 6)
+1. `createMcpServer(wallet)` creates an MCP server with wallet tools (Step 3)
+2. You connect the server to a transport (Step 4)
+3. Claude discovers and calls tools via MCP (Step 5)
+4. The MCP server routes calls through `wallet.handleToolCall()` (Step 6)
 5. Results go back to Claude, and the loop repeats
 
 This is the fundamental pattern. Every kova + Claude integration follows these exact steps, regardless of how complex the policy or conversation gets.
@@ -378,17 +290,9 @@ This is the fundamental pattern. Every kova + Claude integration follows these e
 
 ## Step 7: Claude Returns the Final Response
 
-Once Claude is done calling tools, `stop_reason` changes to `"end_turn"` and the response contains a text block with Claude's summary:
+Once Claude is done calling tools, it produces a natural language summary for the user. With MCP, this happens automatically -- Claude Desktop displays the response directly to the user.
 
-```typescript
-const textBlocks = response.content.filter(
-  (block): block is Anthropic.TextBlock => block.type === "text",
-);
-const reply = textBlocks.map((b) => b.text).join("\n");
-console.log(reply);
-```
-
-**Expected output:**
+**Example response from Claude:**
 
 > I checked your balance (4.2 SOL) and sent 0.5 SOL to 9aE4Uy6gzM... The transaction was confirmed with ID `5Uj7...abc`. Your remaining balance is approximately 3.7 SOL.
 
@@ -428,13 +332,13 @@ Notice how Claude made *three* tool calls before responding to the user. It chec
 
 ```typescript
 import { Keypair } from "@solana/web3.js";
-import Anthropic from "@anthropic-ai/sdk";
 import {
   AgentWallet,
   Policy,
   LocalSigner,
   SolanaAdapter,
   MemoryStore,
+  createMcpStdioServer,
 } from "@kova/wallet";
 
 const TREASURY = "9aE4Uy6gzM..."; // your recipient address
@@ -463,77 +367,14 @@ function createWallet(): AgentWallet {
   });
 }
 
-// ── 2. Run the agent loop ──
-
-async function runAgent(wallet: AgentWallet, userMessage: string): Promise<string> {
-  const anthropic = new Anthropic();
-  const tools = wallet.toAnthropicTools();
-
-  const systemPrompt = `You are a payment assistant with access to a crypto wallet.
-Always check wallet_get_policy before your first transaction.
-Always check wallet_get_balance before sending funds.
-If a transaction is denied, explain why and do not retry.
-Include a "reason" in every transfer for the audit trail.`;
-
-  const messages: Anthropic.MessageParam[] = [
-    { role: "user", content: userMessage },
-  ];
-
-  let response = await anthropic.messages.create({
-    model: "claude-sonnet-4-6-20250827",
-    max_tokens: 1024,
-    system: systemPrompt,
-    tools,
-    messages,
-  });
-
-  // Tool-use loop
-  while (response.stop_reason === "tool_use") {
-    const toolResults: Anthropic.ToolResultBlockParam[] = [];
-
-    for (const block of response.content) {
-      if (block.type === "tool_use") {
-        const result = await wallet.handleToolCall(
-          block.name,
-          block.input as Record<string, unknown>,
-        );
-        toolResults.push({
-          type: "tool_result",
-          tool_use_id: block.id,
-          content: JSON.stringify(result),
-        });
-      }
-    }
-
-    messages.push({ role: "assistant", content: response.content });
-    messages.push({ role: "user", content: toolResults });
-
-    response = await anthropic.messages.create({
-      model: "claude-sonnet-4-6-20250827",
-      max_tokens: 1024,
-      system: systemPrompt,
-      tools,
-      messages,
-    });
-  }
-
-  const textBlocks = response.content.filter(
-    (block): block is Anthropic.TextBlock => block.type === "text",
-  );
-  return textBlocks.map((b) => b.text).join("\n");
-}
-
-// ── 3. Run it ──
+// ── 2. Start the MCP server ──
 
 async function main() {
   const wallet = createWallet();
 
-  const reply = await runAgent(
-    wallet,
-    `Check my policy and balance, then send 0.5 SOL to ${TREASURY}.`,
-  );
-
-  console.log(reply);
+  // Start the MCP server on stdio -- Claude connects and discovers wallet tools
+  const server = await createMcpStdioServer(wallet);
+  console.log("kova MCP server running on stdio. Connect Claude to use wallet tools.");
 }
 
 main().catch(console.error);
@@ -545,23 +386,23 @@ To run the full example:
 npx ts-node claude-wallet.ts
 ```
 
-**Expected output:**
+Then configure Claude Desktop to connect to this server by adding it to your `claude_desktop_config.json`:
 
+```json
+{
+  "mcpServers": {
+    "kova-wallet": {
+      "command": "npx",
+      "args": ["ts-node", "claude-wallet.ts"]
+    }
+  }
+}
 ```
-I checked your policy and balance. Here's a summary:
 
-- **Policy**: Max 1 SOL per transaction, max 5 SOL per day, transfers only to approved addresses.
-- **Balance**: 0 SOL
-
-Unfortunately, I cannot send 0.5 SOL because your wallet balance is 0 SOL. You'll need to fund the wallet first.
-```
-
-(If the wallet is funded, Claude will report a successful transfer with a transaction ID instead.)
+Once connected, Claude can check balances, review the policy, and send transactions -- all through natural language. If the wallet has no funds, Claude will report the balance and explain it cannot send.
 
 ::: details Troubleshooting: Full example issues
-**If you see `Error: Missing API key`** -- Set your `ANTHROPIC_API_KEY` environment variable (see Step 0).
-
-**If you see `Error: 429 Too Many Requests`** -- You have hit the Anthropic API rate limit. Wait a few seconds and try again, or check your plan's rate limits at [console.anthropic.com](https://console.anthropic.com).
+**If Claude cannot find the wallet tools** -- Make sure the MCP server script is running. Check the path in `claude_desktop_config.json`.
 
 **If the transaction is denied with `ADDRESS_NOT_ALLOWED`** -- The recipient address is not in the allowlist. Update the `TREASURY` variable and the `.allowAddresses([...])` array to match.
 
@@ -593,7 +434,7 @@ You now have a working Claude + kova integration. Here are three challenges to g
 
 2. **Add a multi-step conversation.** Instead of a single `runAgent()` call, build a loop that reads user input from `process.stdin` and passes each message to `chat()`. This creates an interactive terminal agent that remembers context across turns.
 
-3. **Swap the LLM.** Replace the Anthropic client with the OpenAI SDK (see the [OpenAI Integration guide](/guide/ai-integration/openai)). Since kova tool schemas follow the standard function-calling format, the wallet code stays exactly the same -- only the LLM client changes.
+3. **Connect a different AI client.** Since kova uses MCP as its sole agent interface, any MCP-compatible AI client can connect to the same server -- Claude Desktop, OpenAI, LangChain, or custom agents. See the [OpenAI Integration guide](/guide/ai-integration/openai) for details.
 
 ## Next Steps
 
