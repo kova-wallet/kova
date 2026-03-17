@@ -373,5 +373,5 @@ See the [Production Deployment](/tutorials/production) tutorial for a complete g
 
 ## Next Steps
 
-- [MCP Integration](/guide/ai-integration/mcp) — Deep dive into the MCP server and tool registration
+- [MCP Integration](/guide/ai-integration/overview) — Deep dive into the MCP server and tool registration
 - [Security Model](/guide/security) — Threat model and design decisions
