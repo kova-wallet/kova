@@ -116,6 +116,9 @@ import { MemoryStore } from "@kova-sdk/wallet";
 // Create an in-memory store instance. All data lives in JavaScript objects/maps
 // within the current Node.js process. Fast and simple, but nothing survives a restart.
 const store = new MemoryStore(); // Dev-only; throws in production unless KOVA_ALLOW_MEMORY_STORE=1
+
+// Or explicitly opt in for non-test environments:
+const store = new MemoryStore({ dangerouslyAllowInProduction: true });
 ```
 
 ::: warning Production Safety
@@ -294,6 +297,9 @@ const store = new RedisStore();
 | `url` | `string` | No | Redis connection URL (e.g., `"redis://localhost:6379"`, `"rediss://user:pass@host:6380/0"`). Ignored if `client` is provided. Defaults to `localhost:6379`. |
 | `keyPrefix` | `string` | No | Prefix applied to all Redis keys for application-level namespacing (e.g., `"kova:"`). Separate from `PrefixedStore`'s per-wallet prefix -- you can use both. |
 | `listPrefix` | `string` | No | Internal prefix for list keys to avoid collisions with KV keys. Default: `"list:"`. |
+| `encryptionKey` | `Buffer` | No | AES-256-GCM key (exactly 32 bytes) for application-level encryption of all stored values. Counter values used with `INCRBYFLOAT` cannot be encrypted (Redis needs the raw value for arithmetic). |
+| `hmacKey` | `string` | No | Hex-encoded HMAC-SHA256 key (at least 64 hex characters / 32 bytes) for counter integrity protection. Detects tampering by anyone with direct Redis access. Required by default -- set `requireHmacKey: false` to override. |
+| `requireTls` | `boolean` | No | When `true`, require TLS for the Redis connection. Throws if the URL does not use `rediss://`. Recommended `true` for production. Default: `false`. |
 
 ```typescript
 import { RedisStore } from "@kova-sdk/wallet";
@@ -403,10 +409,11 @@ const engine = new PolicyEngine(rules, store);
 // spending limits, audit logs, and idempotency caches all read from and
 // write to the same Redis database -- keeping all safety state consistent.
 const wallet = new AgentWallet({
-  signer,   // The key-signing backend (e.g., LocalSigner, VaultSigner)
+  signer,   // The key-signing backend (e.g., LocalSigner, MpcSigner)
   chain,    // The chain adapter (e.g., SolanaAdapter) for submitting transactions
   policy: engine, // The policy engine that enforces spending/rate limits
   store,    // The persistence backend shared with the policy engine
+  dangerouslyDisableAuth: true, // Opt out of authToken requirement (provide authToken in production)
 });
 ```
 

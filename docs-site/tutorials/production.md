@@ -77,6 +77,7 @@ const wallet = new AgentWallet({
   policy: engine,
   store,
   logger,
+  authToken: process.env.WALLET_AUTH_TOKEN!,  // Required in production; use dangerouslyDisableAuth in dev
   circuitBreaker: {
     threshold: 5,       // After 5 consecutive policy denials, the circuit "opens."
                         // While open, ALL transactions are immediately rejected with
@@ -410,7 +411,7 @@ const store = new SqliteStore({
 const keypair = Keypair.fromSecretKey(
   Uint8Array.from(JSON.parse(required("SOLANA_SECRET_KEY")))
 );
-const signer = new LocalSigner(keypair, { network: "mainnet-beta" });  // Dev-only; throws in production unless KOVA_ALLOW_LOCAL_SIGNER=1
+const signer = new LocalSigner(keypair, { dangerouslyAllowInProduction: true });  // LocalSigner requires this flag in production; prefer MpcSigner for real deployments
 
 // --- Chain ---
 // Use a private RPC endpoint in production (Helius, QuickNode, etc.)

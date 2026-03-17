@@ -10,7 +10,7 @@
 
 `SpendingLimitRule` caps how much your AI agent can spend -- like setting a daily budget on a corporate credit card.
 
-The `SpendingLimitRule` enforces per-transaction, daily, weekly, and monthly spending caps. It uses store counters with TTL-based expiration for time-window tracking.
+The `SpendingLimitRule` enforces per-transaction, daily, weekly, and monthly spending caps. It uses sliding window logs with timestamp-based tracking for time-window enforcement.
 
 ## When to Use This
 
@@ -41,7 +41,7 @@ Each limit is scoped to a specific token (e.g., SOL or USDC). If the intent's to
 | Send 3 SOL | 2 SOL | 0 SOL | 10 SOL | **DENY** -- exceeds per-transaction limit |
 | Send 1 SOL | 2 SOL | 9.5 SOL | 10 SOL | **DENY** -- 9.5 + 1 = 10.5, exceeds daily limit |
 | Send 100 USDC | 2 SOL | 5 SOL | 10 SOL | **DENY** -- mismatched token, rule denies by default |
-| Send 2 SOL | 2 SOL | 0 SOL | 10 SOL | **ALLOW** -- exactly at per-transaction limit (not exceeded) |
+| Send 2 SOL | 2 SOL | 0 SOL | 10 SOL | **DENY** -- exactly at per-transaction limit (uses >= comparison) |
 
 ## Import
 
@@ -128,16 +128,17 @@ The constructor takes only a `SpendingLimitConfig` object. No additional argumen
 
 ## How Rolling Windows Work
 
-Time-window limits (daily, weekly, monthly) use a **sliding window** with rolling TTL-based expiration via the store:
+Time-window limits (daily, weekly, monthly) use **sliding window logs** -- each transaction is recorded as a `"timestamp:amount"` entry in a store list, and the total is computed by summing entries within the trailing window:
 
-1. On the first transaction, a counter key is created in the store with a TTL matching the window duration:
-   - Daily: 86,400 seconds (24 hours)
-   - Weekly: 604,800 seconds (7 days)
-   - Monthly: 2,592,000 seconds (30 days)
-2. Each allowed transaction increments the counter by the transaction amount.
-3. When the TTL expires, the store automatically removes the key. The next transaction starts a fresh counter.
+1. Each allowed transaction appends a `"timestamp:amount"` entry to a per-window store list.
+2. On evaluation, recent entries are retrieved and only those with timestamps within the sliding window are summed:
+   - Daily: last 86,400 seconds (24 hours)
+   - Weekly: last 604,800 seconds (7 days)
+   - Monthly: last 2,592,000 seconds (30 days)
+3. If the projected total (current window sum + new transaction amount) would meet or exceed the limit, the transaction is denied.
+4. Expired entries are garbage-collected periodically to prevent unbounded list growth.
 
-This means the windows are **sliding** -- they measure spending over the last N seconds using rolling TTL-based expiration, not calendar days/weeks/months. All amounts are tracked with BigInt precision (PRECISION_DECIMALS=9) to avoid floating-point rounding errors.
+This means the windows are truly **sliding** -- they measure spending over the last N seconds relative to the current time, not calendar days/weeks/months. This eliminates the boundary double-spend vulnerability present in fixed-window TTL-based counters. All amounts are tracked with BigInt precision (PRECISION_DECIMALS=9) to avoid floating-point rounding errors.
 
 ::: tip WHAT DOES "ROLLING WINDOW" MEAN?
 A rolling window is like a sliding 24-hour clock, not a calendar day. If your first transaction happens at 3 PM on Tuesday, the "daily" window runs until 3 PM on Wednesday -- not until midnight. This is different from calendar-based limits where spending resets at midnight every night.
@@ -146,12 +147,12 @@ A rolling window is like a sliding 24-hour clock, not a calendar day. If your fi
 ```
 Time ──────────────────────────────────────────────►
      │                                              │
-     ├── Daily window (24h TTL) ───────────────────►│
-     │  Tx: 2 SOL                                   │
-     │       Tx: 3 SOL                              │
-     │            Tx: 1 SOL                         │
-     │  Counter: 6 SOL                              │
-     │                                    Key expires, counter resets
+     ├── Daily window (sliding 24h) ───────────────►│
+     │  Log: "ts1:2"                                │
+     │       Log: "ts2:3"                           │
+     │            Log: "ts3:1"                      │
+     │  Window total: 6 SOL (sum of entries in last 24h)
+     │                          Oldest entries fall out of window naturally
 ```
 
 ## Token Matching
@@ -226,12 +227,13 @@ import { PolicyEngine, SpendingLimitRule, MemoryStore } from "@kova-sdk/wallet";
 const store = new MemoryStore();
 
 // Create a PolicyEngine with two SpendingLimitRule instances — one for each token.
-// Each rule only tracks spending for its configured token; other tokens pass through.
+// Each rule checks its configured token; transactions in unrecognized tokens are DENIED
+// (not passed through) to prevent untracked spending via cross-token bypass.
 const engine = new PolicyEngine(
   [
     // Rule 1: SOL spending limits.
     // Caps SOL transactions at 5 SOL per tx and 50 SOL per day.
-    // USDC transactions pass through this rule unaffected.
+    // USDC transactions are DENIED by this rule (token mismatch with no USD limits).
     new SpendingLimitRule({
       perTransaction: { amount: "5", token: "SOL" },
       daily: { amount: "50", token: "SOL" },
@@ -239,7 +241,7 @@ const engine = new PolicyEngine(
 
     // Rule 2: USDC spending limits.
     // Caps USDC transactions at 100 USDC per tx and 500 USDC per day.
-    // SOL transactions pass through this rule unaffected.
+    // SOL transactions are DENIED by this rule (token mismatch with no USD limits).
     new SpendingLimitRule({
       perTransaction: { amount: "100", token: "USDC" },
       daily: { amount: "500", token: "USDC" },
@@ -255,17 +257,17 @@ When a transaction would exceed any configured limit, the rule returns `DENY` wi
 
 **Per-transaction limit exceeded:**
 ```
-DENY: Per-transaction spending limit exceeded: tried to send 3 SOL, limit is 2 SOL
+Per-transaction spending limit exceeded: tried to send 3 SOL, limit is 2 SOL
 ```
 
 **Daily limit exceeded:**
 ```
-DENY: Daily spending limit exceeded: tried to send 3 SOL, daily limit is 10 SOL (already spent ~8.0000 SOL in this daily window)
+Daily spending limit exceeded: tried to send 3 SOL, daily limit is 10 SOL (already spent ~8.0000 SOL in this daily window)
 ```
 
 **Weekly limit exceeded:**
 ```
-DENY: Weekly spending limit exceeded: tried to send 10 SOL, weekly limit is 50 SOL (already spent ~45.0000 SOL in this weekly window)
+Weekly spending limit exceeded: tried to send 10 SOL, weekly limit is 50 SOL (already spent ~45.0000 SOL in this weekly window)
 ```
 
 The reason includes the attempted amount, the configured limit, and for time-window limits, the current accumulated spend within the window. This information is included in the `TransactionResult.error.message` field and in the audit log.

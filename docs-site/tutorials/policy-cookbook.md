@@ -218,7 +218,7 @@ const businessHoursPolicy = Policy.create("business-hours-agent")
         end: "17:00",    // 5:00 PM ET -- latest the agent can transact
       },
       // You can add multiple windows, e.g., for Saturday half-days:
-      // { days: ["Sat"], start: "10:00", end: "14:00" }
+      // { days: ["sat"], start: "10:00", end: "14:00" }
     ],
   })
   .build();

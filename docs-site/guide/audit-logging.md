@@ -145,6 +145,21 @@ interface AuditEntry {
   // Links this entry to the preceding one, forming the tamper-evident chain.
   // Empty string for the very first entry in the log.
   previousHash?: string;
+  /** List of field paths that were redacted before storage (for GDPR compliance) */
+  // When fields are redacted before storage, list them here so downstream
+  // consumers know which fields were stripped.
+  // Example: ["intent.params.to", "intent.metadata.agentId"]
+  redactedFields?: string[];
+  /** Distributed trace ID for correlating audit entries across services */
+  // Use this to correlate audit entries with external tracing systems
+  // (e.g., OpenTelemetry, Datadog, Jaeger).
+  traceId?: string;
+  /** Session ID for correlating audit entries within a single user session */
+  // Groups related audit entries from the same logical session.
+  sessionId?: string;
+  /** Schema version for forward compatibility */
+  // Allows consumers to handle different versions of the audit entry format.
+  schemaVersion?: number;
 }
 ```
 

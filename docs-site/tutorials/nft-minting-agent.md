@@ -354,7 +354,7 @@ const dropPolicy = Policy.create("1-of-1-drops")
   })
   .rateLimit({ maxTransactionsPerHour: 1 })
   .requireApproval({
-    above: { amount: "0", token: "SOL" }, // every transaction requires approval
+    above: { amount: "0.000001", token: "SOL" }, // every transaction requires approval
     timeout: 300_000,
   })
   .build();

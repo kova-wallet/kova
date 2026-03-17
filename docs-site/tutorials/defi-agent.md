@@ -40,6 +40,7 @@ Create a policy that permits swaps, has moderate spending limits, and allows int
 import { Keypair } from "@solana/web3.js";
 import {
   AgentWallet,        // Top-level wallet for the DeFi agent
+  AuditLogger,        // Tamper-evident audit logger for verifying integrity
   LocalSigner,        // Signs transactions using an in-memory Solana Keypair
   MemoryStore,        // In-memory state store (use SqliteStore in production)
   SolanaAdapter,      // Chain adapter for Solana (Jupiter swap routing requires custom implementation)
@@ -353,13 +354,14 @@ Retrieve and display all transactions the agent has executed.
 
 ## Step 8: Verify Audit Log Integrity
 
-The audit logger maintains a tamper-evident chain of entries. Verify that no entries have been modified or deleted.
+The audit logger maintains a tamper-evident chain of entries. To verify that no entries have been modified or deleted, use the `AuditLogger.verifyIntegrity()` method directly (this method is on the `AuditLogger` class, not on `AgentWallet`).
 
 ```typescript
   // Verify the tamper-evident SHA-256 hash chain of the audit log.
-  // The wallet manages the AuditLogger internally — use wallet.verifyAuditIntegrity()
-  // to check that no entries have been modified, deleted, or inserted.
-  const integrity = await wallet.verifyAuditIntegrity(20);
+  // AuditLogger.verifyIntegrity() checks that no entries have been
+  // modified, deleted, or inserted.
+  const logger = new AuditLogger(store);
+  const integrity = await logger.verifyIntegrity(20);
   console.log("\n=== Audit Integrity Report ===");
   console.log("Valid:", integrity.valid);              // true if entire chain is intact
   console.log("Entries checked:", integrity.entriesChecked);
@@ -390,6 +392,7 @@ main().catch(console.error);
 import { Keypair } from "@solana/web3.js";
 import {
   AgentWallet,
+  AuditLogger,
   LocalSigner,
   MemoryStore,
   SolanaAdapter,
@@ -483,7 +486,9 @@ async function main() {
   }
 
   // --- Verify audit log integrity ---
-  const integrity = await wallet.verifyAuditIntegrity(20);
+  // Use AuditLogger.verifyIntegrity() directly (not available on AgentWallet).
+  const logger = new AuditLogger(store);
+  const integrity = await logger.verifyIntegrity(20);
   console.log(`\nAudit integrity: ${integrity.valid ? "VALID" : "BROKEN"}`);
   console.log(`Entries checked: ${integrity.entriesChecked}`);
   if (!integrity.valid) {

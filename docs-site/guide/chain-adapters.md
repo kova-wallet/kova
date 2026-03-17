@@ -2,7 +2,7 @@
 
 ::: info What you'll learn
 - How chain adapters abstract blockchain-specific complexity behind a common interface
-- The 7-method ChainAdapter interface for building, signing, and broadcasting transactions
+- The 10-method ChainAdapter interface for building, signing, and broadcasting transactions
 - How to configure the `SolanaAdapter` for devnet and mainnet
 - Which intent types are supported and which require a custom adapter
 - URL validation and SSRF protection for secure RPC connections

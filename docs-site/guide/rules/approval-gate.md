@@ -29,7 +29,7 @@ Think of `ApprovalGateRule` as an expense approval workflow. When your agent tri
 5. If the human approves, the transaction proceeds. If they reject (or do not respond within the timeout), the transaction is denied.
 
 ::: tip
-The `ApprovalGateRule` only applies to transactions in the same token as the threshold. A threshold of 10 SOL will not trigger approval for USDC transactions. USDC transactions pass through this rule untouched.
+When only a token-specific threshold is configured (e.g., 10 SOL), transactions in a different token (e.g., USDC) are **denied** by this rule. To handle multiple tokens, configure `aboveUSD` for a USD-denominated threshold that applies across all tokens.
 :::
 
 ## Decision Table
@@ -42,7 +42,7 @@ Given a threshold of 10 SOL with a 5-minute timeout:
 | Send 15 SOL | Yes (SOL) | Approved within 5 min | **ALLOW** -- human approved |
 | Send 15 SOL | Yes (SOL) | Rejected | **DENY** -- human rejected |
 | Send 15 SOL | Yes (SOL) | No response in 5 min | **DENY** -- timed out |
-| Send 1000 USDC | No (USDC vs SOL) | N/A | **ALLOW** -- different token, rule does not apply |
+| Send 1000 USDC | No (USDC vs SOL) | N/A | **DENY** -- token mismatch with no `aboveUSD` configured |
 | Send 15 SOL | Yes (SOL) | No approval channel configured | **DENY** -- cannot request approval |
 
 ## Import
@@ -112,17 +112,17 @@ The constructor takes only an `ApprovalGateConfig` object.
 The rule compares the transaction amount against the threshold:
 
 1. **Extract amount**: Get the `amount` field from the intent params (works for transfer, swap, mint, and stake intents).
-2. **Token match**: Compare the intent's token with the threshold's token (case-insensitive). If the tokens do not match, the rule returns `ALLOW` -- it does not apply to other token types.
+2. **Token match**: Compare the intent's token with the threshold's token (case-insensitive). If the tokens do not match and no `aboveUSD` threshold is configured, the rule returns `DENY`.
 3. **Threshold check**: If `amount <= threshold`, return `ALLOW`. If `amount > threshold`, request approval.
 
 ```
 Intent: transfer 5 SOL    │ Threshold: 10 SOL    │ Result: ALLOW (below threshold)
 Intent: transfer 15 SOL   │ Threshold: 10 SOL    │ Result: request approval
-Intent: transfer 100 USDC │ Threshold: 10 SOL    │ Result: ALLOW (different token)
+Intent: transfer 100 USDC │ Threshold: 10 SOL    │ Result: DENY (token mismatch, no aboveUSD)
 ```
 
 ::: warning
-Custom intents no longer pass through the approval gate. They are denied by default. If you need custom intents to bypass the approval gate, implement a custom `PolicyRule` that handles them explicitly.
+Custom and mint intents trigger the approval flow with an "unknown amount" message if an approval channel is configured. If no approval channel is configured, they are denied. This ensures human oversight for operations where the SDK cannot determine the transaction value.
 :::
 
 ## The Approval Flow
@@ -324,6 +324,7 @@ const wallet = new AgentWallet({
   policy: engine,
   store,
   approval, // Also pass to wallet for policy introspection
+  dangerouslyDisableAuth: true,
 });
 
 // Example 1: Small transfer (5 SOL < 10 SOL threshold).

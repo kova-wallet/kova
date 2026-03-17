@@ -259,7 +259,7 @@ import {
 } from "@kova-sdk/wallet";
 import { RecipientReputationRule } from "./recipient-reputation-rule";
 
-const store = new MemoryStore(); // Dev-only; throws in production unless KOVA_ALLOW_MEMORY_STORE=1
+const store = new MemoryStore({ dangerouslyAllowInProduction: true }); // Dev-only; throws in production unless KOVA_ALLOW_MEMORY_STORE=1
 
 // Create the rules array. Rules are evaluated in order --
 // put cheap checks first, expensive checks last.
@@ -330,7 +330,7 @@ import { RecipientReputationRule } from "./recipient-reputation-rule";
 // Helper to create a PolicyContext with a fresh store.
 function createContext(): PolicyContext {
   return {
-    store: new MemoryStore(), // Dev-only; throws in production unless KOVA_ALLOW_MEMORY_STORE=1
+    store: new MemoryStore({ dangerouslyAllowInProduction: true }), // Dev-only; throws in production unless KOVA_ALLOW_MEMORY_STORE=1
     now: Date.now(),
   };
 }

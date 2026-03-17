@@ -257,6 +257,8 @@ type PolicyDecision = PolicyAllow | PolicyDeny | PolicyPending;
 // All rules passed — the transaction is approved to proceed.
 interface PolicyAllow {
   decision: "ALLOW";
+  /** Optional metadata for provisional allows (e.g., pendingApproval in dry-run) */
+  metadata?: Record<string, unknown>;
 }
 
 // A rule denied the transaction — it will NOT be executed.
@@ -569,7 +571,7 @@ If you include an `ApprovalGateRule` in your rules but do not pass an `ApprovalC
 |------|-------------|------------|
 | `RateLimitRule` | Limits how many transactions can execute per minute/hour | `maxTransactionsPerMinute`, `maxTransactionsPerHour` |
 | `TimeWindowRule` | Restricts transactions to specific days and times | `timezone`, `windows` (day + start/end time) |
-| `AllowlistRule` | Only allows transactions to pre-approved addresses | `allowAddresses`, `denyAddresses`, `allowPrograms` |
+| `AllowlistRule` | Only allows transactions to pre-approved addresses | `allowAddresses`, `denyAddresses`, `allowPrograms`, `denyPrograms` |
 | `SpendingLimitRule` | Caps spending per-transaction, daily, weekly, or monthly | `perTransaction`, `daily`, `weekly`, `monthly` |
 | `ApprovalGateRule` | Requires human approval above a threshold | `above` (amount + token), `timeout` |
 
@@ -590,6 +592,9 @@ If you include an `ApprovalGateRule` in your rules but do not pass an `ApprovalC
 | `Policy.extend(base, name)` | `PolicyBuilder` | Create a new policy inheriting settings from a base policy |
 | `.spendingLimit(config)` | `PolicyBuilder` | Set spending caps (per-tx, daily, weekly, monthly) |
 | `.allowAddresses(addresses)` | `PolicyBuilder` | Restrict transfers to specific recipient addresses |
+| `.denyAddresses(addresses)` | `PolicyBuilder` | Block transfers to specific recipient addresses |
+| `.allowPrograms(programs)` | `PolicyBuilder` | Restrict interactions to specific program/contract IDs |
+| `.denyPrograms(programs)` | `PolicyBuilder` | Block interactions with specific program/contract IDs |
 | `.rateLimit(config)` | `PolicyBuilder` | Set transaction frequency limits |
 | `.activeHours(config)` | `PolicyBuilder` | Restrict transactions to specific days/times |
 | `.requireApproval(config)` | `PolicyBuilder` | Require human approval above a threshold |

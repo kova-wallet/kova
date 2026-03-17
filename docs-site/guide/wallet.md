@@ -51,7 +51,7 @@ import type { AgentWalletConfig } from "@kova-sdk/wallet";
 | `idempotencyHmacKey` | `string \| Buffer` | No | HMAC-SHA256 key for verifying authenticity of cached idempotency entries. Prevents an attacker with store write access from forging cached "confirmed" results. Generate with `crypto.randomBytes(32).toString('hex')` and store securely -- not in the database |
 | `storePrefix` | `string` | No | Key prefix for multi-wallet store isolation. When multiple AgentWallet instances share a Store backend, each must use a unique prefix to prevent cross-wallet interference in spending limits, rate counters, and audit logs |
 | `mutexTimeoutMs` | `number` | No | Timeout in milliseconds for acquiring the execute mutex. If the mutex cannot be acquired within this period, the call fails instead of blocking indefinitely. Default: `30000` (30 seconds) |
-| `enabledTools` | `ReadonlySet<string>` | No | Set of tool names enabled for `handleToolCall()`. Defaults to read-only tools only (`wallet_get_balance`, `wallet_get_transaction_history`). Write tools require explicit opt-in. See [Tool Access Control](#tool-access-control) |
+| `enabledTools` | `ReadonlySet<string>` | No | Set of tool names enabled for `handleToolCall()`. Defaults to all 10 read-only tools (`wallet_get_balance`, `wallet_get_transaction_history`, `wallet_get_supported_tokens`, `wallet_get_address`, `wallet_estimate_fee`, `wallet_get_token_price`, `wallet_get_transaction_status`, `wallet_get_policy`, `wallet_get_spending_remaining`, `wallet_get_all_balances`). Write tools require explicit opt-in. See [Tool Access Control](#tool-access-control) |
 | `dangerouslyAllowAutoHmacKey` | `boolean` | No | When `true`, allows auto-generation of the idempotency HMAC key. Auto-generated keys do not survive process restarts, risking duplicate transactions. For production, provide a persistent `idempotencyHmacKey` instead |
 | `authToken` | `string` | No | Capability token for caller authentication. When set, `execute()` and `handleToolCall()` require this token; calls without it are rejected with `AUTH_FAILED` |
 | `agentId` | `string` | No | Wallet-level agent identifier. Used for circuit breaker isolation and per-agent rate limiting instead of the self-reported `agentId` in intent metadata, which is untrusted |
@@ -119,6 +119,7 @@ const wallet = new AgentWallet({
   chain,
   policy,
   store,
+  dangerouslyDisableAuth: true,
 });
 ```
 
@@ -214,6 +215,7 @@ const wallet = new AgentWallet({
   policy: engine,
   store,
   approval, // Also pass approval to the wallet for policy introspection
+  dangerouslyDisableAuth: true,
 
   // Circuit breaker: after 3 consecutive policy denials, block ALL transactions for 10 minutes.
   // This protects against runaway agents that keep retrying denied transactions in a tight loop.
@@ -381,7 +383,8 @@ const summary = await wallet.getPolicy();
 // Display each aspect of the policy configuration.
 console.log("Policy name:", summary.name);                       // The human-readable policy name
 console.log("Spending limits:", summary.spendingLimits);         // Per-tx, daily, weekly, monthly caps
-console.log("Allowlisted addresses:", summary.allowlistedAddresses); // Addresses the agent can send to
+console.log("Allowlisted addresses:", summary.allowlistedAddresses); // Count of allowlisted addresses (number)
+console.log("Allowlisted programs:", summary.allowlistedPrograms); // Count of allowlisted programs (number)
 console.log("Rate limits:", summary.rateLimits);                 // Max transactions per minute/hour
 console.log("Active hours:", summary.activeHours);               // Time windows when transactions are allowed
 console.log("Approval required:", summary.approvalRequired);     // Threshold above which human approval is needed
@@ -393,9 +396,9 @@ console.log("Circuit breaker:", summary.circuitBreaker);         // Circuit brea
 Get recent transaction history from the audit log. Useful for dashboards, debugging, or letting your agent review what it has already done.
 
 ```typescript
-// Method signature: takes an optional limit (default 10, max 1000) and returns
-// a Promise resolving to an array of past TransactionResult objects from the audit log.
-async getTransactionHistory(limit?: number): Promise<TransactionResult[]>
+// Method signature: takes an optional limit (default 10, max 1000) and optional options,
+// and returns a Promise resolving to an array of past TransactionResult objects from the audit log.
+async getTransactionHistory(limit?: number, options?: { redactAddresses?: boolean }): Promise<TransactionResult[]>
 ```
 
 The `limit` parameter defaults to 10 and is clamped to the range `[1, 1000]`.
@@ -438,8 +441,15 @@ Supported tool names:
 | `wallet_stake` | `execute({ type: "stake", ... })` |
 | `wallet_execute_custom` | `execute({ type: "custom", ... })` |
 | `wallet_get_balance` | `getBalance(token)` |
+| `wallet_get_all_balances` | `getBalance()` for all tokens |
 | `wallet_get_policy` | `getPolicy()` |
 | `wallet_get_transaction_history` | `getTransactionHistory(limit)` |
+| `wallet_get_supported_tokens` | List supported tokens |
+| `wallet_get_address` | `getAddress()` |
+| `wallet_estimate_fee` | Estimate transaction fees |
+| `wallet_get_token_price` | Get token price |
+| `wallet_get_transaction_status` | Check transaction status |
+| `wallet_get_spending_remaining` | Get remaining spending budget |
 
 ```typescript
 // Handle a tool call from an AI agent that wants to transfer SOL.
@@ -472,6 +482,14 @@ By default, only read-only tools are enabled for `handleToolCall()`. This preven
 |-----------|-------------|
 | `wallet_get_balance` | Query the wallet's token balance |
 | `wallet_get_transaction_history` | Retrieve recent audit log entries |
+| `wallet_get_supported_tokens` | List supported tokens |
+| `wallet_get_address` | Get the wallet's public address |
+| `wallet_estimate_fee` | Estimate transaction fees |
+| `wallet_get_token_price` | Get token price information |
+| `wallet_get_transaction_status` | Check a transaction's status |
+| `wallet_get_policy` | View policy summary |
+| `wallet_get_spending_remaining` | Get remaining spending budget |
+| `wallet_get_all_balances` | Get balances for all tokens |
 
 ### Opt-in Write Tools
 
@@ -486,11 +504,22 @@ const wallet = new AgentWallet({
   chain,
   policy: engine,
   store,
+  dangerouslyDisableAuth: true,
   // Explicitly enable transfer and swap tools alongside the defaults.
+  // All 10 read-only tools are included by default; only write tools need opt-in.
   enabledTools: new Set([
+    // Default read-only tools
     "wallet_get_balance",
     "wallet_get_transaction_history",
+    "wallet_get_supported_tokens",
+    "wallet_get_address",
+    "wallet_estimate_fee",
+    "wallet_get_token_price",
+    "wallet_get_transaction_status",
     "wallet_get_policy",
+    "wallet_get_spending_remaining",
+    "wallet_get_all_balances",
+    // Opt-in write tools
     "wallet_transfer",
     "wallet_swap",
   ]),
@@ -504,7 +533,6 @@ const wallet = new AgentWallet({
 | `wallet_mint` | Write | Mint an NFT |
 | `wallet_stake` | Write | Stake tokens to a validator |
 | `wallet_execute_custom` | Write (dangerous) | Execute an arbitrary custom transaction |
-| `wallet_get_policy` | Read | View policy summary (opt-in to prevent policy reconnaissance) |
 
 ::: warning
 `wallet_execute_custom` is the most dangerous tool because it allows arbitrary program interactions. Only enable it when your policy rules are strict enough to prevent abuse.
@@ -536,7 +564,7 @@ interface ConfirmedResult {
   summary: string;
   intentId: string;
   timestamp: number;
-  chainData?: unknown;
+  chainData?: Record<string, unknown>;
   warnings?: string[];
 }
 
@@ -547,7 +575,7 @@ interface DeniedOrFailedResult {
   summary: string;
   intentId: string;
   timestamp: number;
-  chainData?: unknown;
+  chainData?: Record<string, unknown>;
   warnings?: string[];
 }
 
@@ -557,7 +585,7 @@ interface PendingResult {
   summary: string;
   intentId: string;
   timestamp: number;
-  chainData?: unknown;
+  chainData?: Record<string, unknown>;
   warnings?: string[];
 }
 
@@ -625,5 +653,5 @@ If multiple agents share the same `AgentWallet` instance and store, their spendi
 | `getBalance(token)` | `Promise<TokenBalance>` | Check the wallet's balance for a specific token (e.g., "SOL", "USDC") |
 | `getAddress()` | `Promise<string>` | Get the wallet's public address (the address others send funds to) |
 | `getPolicy()` | `Promise<PolicySummary>` | Get a read-only summary of all policy constraints (limits, allowlists, rate limits) |
-| `getTransactionHistory(limit?)` | `Promise<TransactionResult[]>` | Fetch recent transactions from the audit log (default: 10, max: 1000) |
+| `getTransactionHistory(limit?, options?)` | `Promise<TransactionResult[]>` | Fetch recent transactions from the audit log (default: 10, max: 1000) |
 | `handleToolCall(name, input, authToken?)` | `Promise<ToolCallResult>` | Dispatch an AI model's tool call to the appropriate wallet method |

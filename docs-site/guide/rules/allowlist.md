@@ -111,7 +111,10 @@ The rule evaluates in a strict order. **Deny lists are always checked first.**
 3. Is the programId in denyPrograms?            → YES → DENY
 4. Is allowPrograms configured?
    └─ Is the programId in allowPrograms?        → NO  → DENY
-5. All checks passed                            → ALLOW
+5. Is the token in denyTokens?                  → YES → DENY
+6. Is allowTokens configured?
+   └─ Is the token in allowTokens?              → NO  → DENY
+7. All checks passed                            → ALLOW
 ```
 
 Key behaviors:
@@ -260,9 +263,12 @@ The `Policy` builder validates that no address or program appears in both the al
 When an address or program is denied, the rule returns **generic** denial messages that do not reveal the specific address or program. This prevents policy reconnaissance by untrusted agents:
 
 ```
-DENY: Address is not permitted by policy
-DENY: Program is not permitted by policy
-DENY: Token is not permitted by policy
+Address is not permitted
+Address not in allowlist
+Program is not permitted
+Program not in allowlist
+Token is not permitted for swaps
+Token not in swap allowlist
 ```
 
 ## Introspection

@@ -10,7 +10,7 @@ If you just need a Redis-backed store, you don't need to build a custom adapter 
 
 In this tutorial, you'll build a custom `Store` adapter backed by Redis as a learning exercise. By the end, you will understand exactly how the SDK's persistence layer works and be able to wire any database (Postgres, DynamoDB, Turso, Upstash, etc.) into kova.
 
-The `Store` interface has 7 methods (one optional). If you can implement those methods, your adapter works with every SDK feature -- spending limits, rate limits, audit logs, circuit breakers, and idempotency caches.
+The `Store` interface has 7 methods. If you can implement those methods, your adapter works with every SDK feature -- spending limits, rate limits, audit logs, circuit breakers, and idempotency caches.
 
 ---
 
@@ -40,7 +40,7 @@ interface Store {
   increment(key: string, amount: number): Promise<number>;
   append(key: string, value: string): Promise<void>;
   getRecent(key: string, count: number): Promise<string[]>;
-  clearList?(key: string): Promise<void>; // optional
+  clearList(key: string): Promise<void>;
 }
 ```
 
@@ -54,7 +54,7 @@ Here is what each method does and which SDK feature uses it:
 | `increment(key, amount)` | Atomically add `amount` to a numeric key. Return the new total. Create the key if it does not exist. | Spending limit counters, rate limit counters |
 | `append(key, value)` | Add an entry to the end of a list. | Audit log entries |
 | `getRecent(key, count)` | Return the most recent `count` entries from a list, newest first. | Audit log retrieval, transaction history |
-| `clearList?(key)` | *(Optional)* Remove all entries from a list. | Test cleanup, log rotation |
+| `clearList(key)` | Remove all entries from a list. | Test cleanup, log rotation, audit log clearing |
 
 All methods return `Promise` so they work with both local and remote backends.
 
@@ -247,7 +247,7 @@ export class RedisStore implements Store {
     return this.client.lrange(this.listPrefix + key, 0, count - 1);
   }
 
-  /** Optional: remove all entries from a list. */
+  /** Remove all entries from a list. */
   async clearList(key: string): Promise<void> {
     await this.client.del(this.listPrefix + key);
   }
@@ -286,6 +286,7 @@ const wallet = new AgentWallet({
   chain,
   policy: engine,
   store,
+  dangerouslyDisableAuth: true,  // Dev-only; use authToken in production
 });
 
 // Gracefully close on shutdown.
@@ -397,7 +398,7 @@ If all of these pass, your adapter is compatible with the SDK.
 
 ## Adapting to Other Databases
 
-The same methods map cleanly to any backend. Here is a quick reference for the core 6 required methods:
+The same methods map cleanly to any backend. Here is a quick reference for the core methods:
 
 | Store Method | Redis | PostgreSQL | DynamoDB |
 |---|---|---|---|

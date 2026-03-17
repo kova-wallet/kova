@@ -165,7 +165,7 @@ const chain = new SolanaAdapter({
 });
 
 const keypair = Keypair.generate();
-const signer = new LocalSigner(keypair); // Dev-only; throws in production unless KOVA_ALLOW_LOCAL_SIGNER=1
+const signer = new LocalSigner(keypair, { network: "devnet" }); // Dev-only; throws in production unless KOVA_ALLOW_LOCAL_SIGNER=1
 
 // Rules in evaluation order: cheapest checks first.
 const rules: PolicyRule[] = [
@@ -221,6 +221,7 @@ const wallet = new AgentWallet({
   policy: engine,
   store,
   logger,
+  dangerouslyDisableAuth: true,  // Dev-only; use authToken in production
 });
 ```
 

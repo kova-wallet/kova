@@ -22,14 +22,14 @@ You can check your current versions by running `node -v` and `npm -v` in your te
 
 ## Install
 
-Install `kova` from npm:
+Install `@kova-sdk/wallet` from npm:
 
 ```bash
 # Install the kova SDK from the npm registry.
 # This single package provides everything you need: AgentWallet, PolicyEngine,
-# signers, chain adapters, AI framework adapters, and all built-in policy rules.
+# signers, chain adapters, MCP server, and all built-in policy rules.
 # No additional peer dependencies are required for basic usage.
-npm install kova
+npm install @kova-sdk/wallet
 ```
 
 This is the only required package. It includes everything you need to create wallets, define policies, and interact with the Solana blockchain.
@@ -39,8 +39,8 @@ This is the only required package. It includes everything you need to create wal
 Create a simple test file to verify the SDK is installed correctly:
 
 ```typescript
-// verify.ts -- A quick smoke test to confirm kova is installed and all
-// core exports are accessible. Run this after `npm install kova` to
+// verify.ts -- A quick smoke test to confirm @kova-sdk/wallet is installed and all
+// core exports are accessible. Run this after `npm install @kova-sdk/wallet` to
 // verify that your environment is set up correctly.
 
 import {
@@ -91,11 +91,21 @@ SpendingLimitRule: function
 `tsx` is a tool that runs TypeScript files directly without a separate compile step. `npx` downloads and runs it on-the-fly, so you don't need to install it globally. If you prefer, you can also compile with `tsc` and run with `node` instead.
 :::
 
-If you see all `function` outputs, kova is installed correctly and every component is accessible. If any import fails, double-check that you ran `npm install kova` in the correct project directory.
+If you see all `function` outputs, kova is installed correctly and every component is accessible. If any import fails, double-check that you ran `npm install @kova-sdk/wallet` in the correct project directory.
 
 ## Peer Dependencies
 
-The `@solana/web3.js` library is bundled with `kova` -- you do not need to install it separately. The SDK re-exports everything you need for Solana interaction.
+The `@solana/web3.js` library is bundled with `@kova-sdk/wallet` -- you do not need to install it separately. The SDK re-exports everything you need for Solana interaction.
+
+### Turnkey MPC Signer (Optional)
+
+If you plan to use `TurnkeyProvider` with `MpcSigner` for production key management, install the Turnkey SDK:
+
+```bash
+# Install @turnkey/sdk-server, required only if you use TurnkeyProvider
+# for hardware-backed MPC signing. This is an optional peer dependency.
+npm install @turnkey/sdk-server
+```
 
 ### Persistent Storage (Recommended for Production)
 
@@ -116,6 +126,13 @@ npm install better-sqlite3
 ```
 
 This lets you use `SqliteStore`, which persists the SDK's internal safety state to a local file. See the [Stores guide](/guide/stores) for details.
+
+::: tip Development shortcut
+`SqliteStore` defaults to `requireEncryption: true`, which requires SQLCipher encryption pragmas. For local development without encryption, pass `requireEncryption: false`:
+```typescript
+const store = new SqliteStore({ path: "./dev.db", requireEncryption: false });
+```
+:::
 
 ::: warning
 `better-sqlite3` is a native Node.js addon. It requires a C++ compiler (e.g., `gcc`, `clang`, or MSVC) to build during installation. On macOS, ensure Xcode Command Line Tools are installed (`xcode-select --install`). On Linux, install `build-essential` (`sudo apt-get install build-essential`). On Windows, install the Visual Studio C++ build tools.
