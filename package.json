@@ -1,6 +1,6 @@
 {
   "name": "@kova-sdk/wallet",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "A policy-constrained crypto wallet SDK for autonomous AI agents",
   "type": "module",
   "main": "dist/index.js",
