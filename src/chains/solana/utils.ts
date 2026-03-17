@@ -80,9 +80,12 @@ export function normalizeTokenSymbol(token: string): string {
   return token.toUpperCase();
 }
 
-/** Check if a token symbol refers to native SOL */
+/** Native SOL wrapped mint address (same on mainnet and devnet) */
+const NATIVE_SOL_MINT = "So11111111111111111111111111111111111111112";
+
+/** Check if a token symbol or mint address refers to native SOL */
 export function isNativeSOL(token: string): boolean {
-  return normalizeTokenSymbol(token) === "SOL";
+  return normalizeTokenSymbol(token) === "SOL" || token === NATIVE_SOL_MINT;
 }
 
 /**
