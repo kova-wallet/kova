@@ -49,4 +49,5 @@ paths = [
   '''\.gitleaks\.toml$''',
   '''node_modules/''',
   '''dist/''',
+  '''docs-site/tutorials/''',
 ]

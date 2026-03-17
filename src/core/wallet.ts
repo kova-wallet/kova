@@ -3386,7 +3386,7 @@ export class AgentWallet {
           chain: this.chain.chain,
         },
       };
-    } catch (err) {
+    } catch {
       return {
         success: false,
         error: "Failed to retrieve wallet address.",
@@ -3421,7 +3421,7 @@ export class AgentWallet {
           error: simulation.success ? undefined : simulation.error,
         },
       };
-    } catch (err) {
+    } catch {
       return {
         success: false,
         error: "Failed to estimate fee. The transaction may be invalid or the network may be unavailable.",

@@ -104,9 +104,22 @@ jobs:
               const data = require('/tmp/audit-prod.json');
               const allowlist = new Set(process.argv.slice(1));
               const vulns = Object.values(data.vulnerabilities || {});
+              // Build a set of package names whose root advisory is allowlisted
+              const allowedPkgs = new Set();
+              for (const v of vulns) {
+                const hasAllowedAdvisory = v.via.some(a =>
+                  typeof a === 'object' && allowlist.has(a.url?.split('/').pop())
+                );
+                if (hasAllowedAdvisory) allowedPkgs.add(v.name);
+              }
+              // A vuln is allowed if it has a direct allowlisted advisory OR
+              // all its via entries trace back to allowlisted packages
               const blocked = vulns.filter(v =>
                 (v.severity === 'high' || v.severity === 'critical') &&
-                !v.via.some(a => typeof a === 'object' && allowlist.has(a.url?.split('/').pop()))
+                !v.via.some(a =>
+                  (typeof a === 'object' && allowlist.has(a.url?.split('/').pop())) ||
+                  (typeof a === 'string' && allowedPkgs.has(a))
+                )
               );
               console.log(blocked.length);
             " $ALLOWLIST)
@@ -135,9 +148,19 @@ jobs:
               const data = require('/tmp/audit-all.json');
               const allowlist = new Set(process.argv.slice(1));
               const vulns = Object.values(data.vulnerabilities || {});
+              const allowedPkgs = new Set();
+              for (const v of vulns) {
+                const hasAllowedAdvisory = v.via.some(a =>
+                  typeof a === 'object' && allowlist.has(a.url?.split('/').pop())
+                );
+                if (hasAllowedAdvisory) allowedPkgs.add(v.name);
+              }
               const blocked = vulns.filter(v =>
                 (v.severity === 'high' || v.severity === 'critical') &&
-                !v.via.some(a => typeof a === 'object' && allowlist.has(a.url?.split('/').pop()))
+                !v.via.some(a =>
+                  (typeof a === 'object' && allowlist.has(a.url?.split('/').pop())) ||
+                  (typeof a === 'string' && allowedPkgs.has(a))
+                )
               );
               console.log(blocked.length);
             " $ALLOWLIST)
