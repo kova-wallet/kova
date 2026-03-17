@@ -2,8 +2,8 @@
 
 ::: info What you'll learn
 - Why you need a server between your AI agent and the blockchain
-- How to build a minimal Express server that exposes kova as an HTTP API
-- The complete Claude tool-use loop from message to blockchain confirmation
+- How to build a minimal Express server with an MCP-based wallet interface
+- How MCP (Model Context Protocol) exposes wallet tools to any compatible AI agent
 - How to test your server with curl and interpret the responses
 - How to adapt the pattern for Next.js, Fastify, Hono, or any HTTP framework
 :::
@@ -35,25 +35,24 @@ Without a server, there is nowhere to run the SDK. The agent only receives JSON 
 ## Prerequisites
 
 - **Node.js 18 or later** ([download here](https://nodejs.org/))
-- **An Anthropic API key** -- get one at [console.anthropic.com](https://console.anthropic.com/)
 - **A Solana keypair** -- generate one with `solana-keygen new --outfile wallet-keypair.json` (install the [Solana CLI](https://docs.solanalabs.com/cli/install) first)
 - **Basic familiarity with Express** (or any HTTP framework) -- if you have built a REST API before, you are ready
 - **About 15 minutes** to get the server running
 
 ## Minimal Express Server
 
-Here is a complete, working server that exposes kova as an HTTP API. It handles Claude tool calls and returns results.
+Here is a complete, working server that exposes kova as an HTTP API. It uses MCP (Model Context Protocol) to expose wallet tools to any compatible AI agent.
 
 ### Install Dependencies
 
 ```bash
 # Create a new project and install all dependencies.
-# express         - HTTP server framework
-# @anthropic-ai/sdk - Claude API client for tool-use conversations
-# kova            - The wallet SDK
-# @solana/web3.js - Solana client library for Keypair loading
+# express                      - HTTP server framework
+# @kova/wallet                 - The wallet SDK
+# @solana/web3.js              - Solana client library for Keypair loading
+# @modelcontextprotocol/sdk    - MCP server support
 npm init -y
-npm install express @anthropic-ai/sdk kova @solana/web3.js
+npm install express @kova/wallet @solana/web3.js @modelcontextprotocol/sdk
 npm install -D typescript ts-node @types/express @types/node
 ```
 
@@ -62,8 +61,6 @@ npm install -D typescript ts-node @types/express @types/node
 ```bash
 # .env (do NOT commit this file)
 #
-# Your Anthropic API key — get one at https://console.anthropic.com/
-ANTHROPIC_API_KEY=sk-ant-...
 # Path to the Solana keypair JSON file (array of 64 bytes).
 # Generate one with: solana-keygen new --outfile wallet-keypair.json
 WALLET_KEYPAIR_PATH=./wallet-keypair.json
@@ -79,8 +76,6 @@ Create `server.ts`:
 // Import the HTTP framework. Express handles routing, JSON parsing, and
 // request/response management so you can focus on the wallet logic.
 import express from "express";
-// Import the Anthropic SDK for communicating with Claude.
-import Anthropic from "@anthropic-ai/sdk";
 // Import Solana's Keypair class for loading the wallet's private key.
 import { Keypair } from "@solana/web3.js";
 // Import the kova SDK components needed to build the wallet.
@@ -93,7 +88,9 @@ import {
   PolicyEngine,       // Evaluates rules against each transaction intent
   SpendingLimitRule,  // Caps per-transaction and daily spending
   RateLimitRule,      // Limits transactions per time window
-} from "kova";
+} from "@kova/wallet";
+// Import the MCP server factory to expose wallet tools via Model Context Protocol.
+import { createMcpServer } from "@kova/wallet";
 // Import Node.js fs for reading the keypair file from disk.
 import { readFileSync } from "fs";
 
@@ -139,98 +136,24 @@ const wallet = new AgentWallet({
   store,
 });
 
-// --- 3. Set up the Anthropic client ---
-// The SDK reads ANTHROPIC_API_KEY from the environment automatically.
-const anthropic = new Anthropic();
-// Convert kova's wallet tools (6 safe by default) into Anthropic's expected format.
-// These schemas tell Claude what tools are available and how to call them.
-const tools = wallet.toAnthropicTools();
-
-// System prompt that guides Claude's behavior.
-// This is NOT a security boundary — the policy engine is.
-// But it helps Claude behave responsibly within those limits.
-const SYSTEM_PROMPT = `You are a helpful payment assistant with access to a crypto wallet.
-
-RULES:
-- Always call wallet_get_policy before your first transaction to understand your constraints.
-- Always call wallet_get_balance before sending funds to verify sufficient balance.
-- If a transaction is denied, explain the reason to the user. Do NOT retry the same request.
-- Include a "reason" field in all transfers explaining why the payment is being made.
-- Never reveal internal wallet addresses, private keys, or RPC endpoints.`;
+// --- 3. Create the MCP server ---
+// The MCP server exposes all wallet tools to any MCP-compatible AI agent.
+// Policy enforcement happens automatically on every tool call.
+const mcpServer = createMcpServer(wallet);
 
 // --- 4. Create the Express server ---
 const app = express();
-// Parse incoming JSON request bodies (Claude tool calls come as JSON).
+// Parse incoming JSON request bodies (MCP requests come as JSON).
 app.use(express.json());
 
-// POST /chat — The main endpoint. Accepts a user message, runs the Claude
-// tool-use loop, and returns Claude's final text response.
-app.post("/chat", async (req, res) => {
+// POST /mcp — MCP transport endpoint.
+// Any MCP-compatible AI agent (Claude, GPT-4, etc.) connects here.
+// The MCP server handles tool discovery, tool calls, policy enforcement,
+// signing, and broadcasting automatically — no manual tool-use loop needed.
+app.post("/mcp", async (req, res) => {
   try {
-    const { message } = req.body;
-    if (!message || typeof message !== "string") {
-      return res.status(400).json({ error: "Missing 'message' field in request body" });
-    }
-
-    // Initialize the conversation with the user's message.
-    const messages: Anthropic.MessageParam[] = [
-      { role: "user", content: message },
-    ];
-
-    // Send the first request to Claude with the wallet tools.
-    let response = await anthropic.messages.create({
-      model: "claude-sonnet-4-6-20250827",
-      max_tokens: 1024,
-      system: SYSTEM_PROMPT,
-      tools,
-      messages,
-    });
-
-    // Tool-use loop: keep going until Claude produces a final text response.
-    // Each iteration processes Claude's tool calls and feeds results back.
-    while (response.stop_reason === "tool_use") {
-      const assistantContent = response.content;
-      messages.push({ role: "assistant", content: assistantContent });
-
-      // Execute each tool call through the kova wallet.
-      const toolResults: Anthropic.ToolResultBlockParam[] = [];
-      for (const block of assistantContent) {
-        if (block.type === "tool_use") {
-          console.log(`[Tool] ${block.name}`, block.input);
-
-          // This is the key line: the wallet handles the tool call,
-          // runs it through the policy engine, signs if approved,
-          // and returns a standardized result.
-          const result = await wallet.handleToolCall(
-            block.name,
-            block.input as Record<string, unknown>,
-          );
-
-          console.log(`[Result] success=${result.success}`);
-          toolResults.push({
-            type: "tool_result",
-            tool_use_id: block.id,
-            content: JSON.stringify(result),
-          });
-        }
-      }
-
-      // Send tool results back to Claude.
-      messages.push({ role: "user", content: toolResults });
-      response = await anthropic.messages.create({
-        model: "claude-sonnet-4-6-20250827",
-        max_tokens: 1024,
-        system: SYSTEM_PROMPT,
-        tools,
-        messages,
-      });
-    }
-
-    // Extract Claude's final text response.
-    const textBlock = response.content.find((b) => b.type === "text");
-    const reply = textBlock?.text ?? "No response generated.";
-
-    res.json({ reply });
+    const result = await mcpServer.handleRequest(req.body);
+    res.json(result);
   } catch (error) {
     console.error("Error:", error);
     res.status(500).json({ error: "Internal server error" });
@@ -252,6 +175,7 @@ app.get("/health", async (_req, res) => {
 const PORT = process.env.PORT ?? 3000;
 app.listen(PORT, () => {
   console.log(`kova server running on http://localhost:${PORT}`);
+  console.log(`MCP endpoint: http://localhost:${PORT}/mcp`);
   console.log(`Wallet: ${keypair.publicKey.toBase58()}`);
   console.log(`Policy: ${policy.getName()}`);
 });
@@ -267,19 +191,17 @@ npx ts-node server.ts
 ### Test It
 
 ```bash
-# Send a chat message to the server.
-# Claude will use the wallet tools to check balance and execute the request.
-curl -X POST http://localhost:3000/chat \
-  -H "Content-Type: application/json" \
-  -d '{"message": "What is my SOL balance?"}'
-
 # Check server health and wallet info.
 curl http://localhost:3000/health
+
+# The MCP endpoint at /mcp is designed for MCP-compatible AI agents.
+# Point your MCP client (e.g., Claude Desktop, an MCP SDK client) at:
+#   http://localhost:3000/mcp
 ```
 
 ## Testing with curl
 
-Here are the exact curl commands you can use to test your server, along with the expected responses. Run these from a second terminal window while the server is running.
+Here are the curl commands you can use to test your server. Run these from a second terminal window while the server is running.
 
 ### Health check
 
@@ -299,152 +221,95 @@ curl http://localhost:3000/health
 
 If you see this, the server is running, the wallet keypair loaded correctly, and the policy engine is initialized.
 
-### Check balance
+### Call a tool directly via MCP
+
+You can invoke individual wallet tools through the MCP endpoint. This is what an MCP-compatible AI agent does automatically behind the scenes.
 
 ```bash
-curl -X POST http://localhost:3000/chat \
+# List available tools
+curl -X POST http://localhost:3000/mcp \
   -H "Content-Type: application/json" \
-  -d '{"message": "What is my SOL balance?"}'
+  -d '{"method": "tools/list"}'
+
+# Call wallet_get_balance
+curl -X POST http://localhost:3000/mcp \
+  -H "Content-Type: application/json" \
+  -d '{"method": "tools/call", "params": {"name": "wallet_get_balance", "arguments": {"token": "SOL"}}}'
+```
+
+**Expected response (tools/call):**
+
+```json
+{
+  "result": {
+    "content": [{ "type": "text", "text": "{\"success\":true,\"data\":{\"amount\":\"2.5\",\"token\":\"SOL\"}}" }]
+  }
+}
+```
+
+Your exact balance will differ. The MCP server automatically routes the tool call through the policy engine, signs the transaction if needed, and returns a standardized result.
+
+### Test a policy denial via MCP
+
+```bash
+curl -X POST http://localhost:3000/mcp \
+  -H "Content-Type: application/json" \
+  -d '{"method": "tools/call", "params": {"name": "wallet_transfer", "arguments": {"to": "9aE476sH92Vz7DMPyq5WLPkrKWivxeuTKEFKd2sZZcde", "amount": "5", "token": "SOL"}}}'
 ```
 
 **Expected response:**
 
 ```json
 {
-  "reply": "Your current SOL balance is 2.5 SOL."
+  "result": {
+    "content": [{ "type": "text", "text": "{\"success\":false,\"error\":\"Transfer exceeds per-transaction limit of 1 SOL\"}" }]
+  }
 }
 ```
 
-Behind the scenes, Claude called the `wallet_get_balance` tool, received the balance data, and formatted a human-readable response. Your exact balance will differ.
-
-### Check policy
-
-```bash
-curl -X POST http://localhost:3000/chat \
-  -H "Content-Type: application/json" \
-  -d '{"message": "What are my spending limits?"}'
-```
-
-**Expected response:**
-
-```json
-{
-  "reply": "Your wallet policy has the following constraints:\n- Per-transaction limit: 1 SOL\n- Daily limit: 10 SOL\n- Rate limit: 5 transactions per minute, 30 per hour"
-}
-```
-
-### Send a transfer
-
-```bash
-curl -X POST http://localhost:3000/chat \
-  -H "Content-Type: application/json" \
-  -d '{"message": "Send 0.1 SOL to 9aE476sH92Vz7DMPyq5WLPkrKWivxeuTKEFKd2sZZcde"}'
-```
-
-**Expected response (if approved by policy):**
-
-```json
-{
-  "reply": "I've sent 0.1 SOL to 9aE476sH92Vz7DMPyq5WLPkrKWivxeuTKEFKd2sZZcde. Transaction ID: 5Uj7kE..."
-}
-```
-
-**Expected response (if denied by policy):**
-
-```json
-{
-  "reply": "I'm sorry, but the transfer was denied by the wallet policy. The reason was: Transfer exceeds per-transaction limit of 1 SOL."
-}
-```
-
-### Trigger a policy denial
-
-```bash
-curl -X POST http://localhost:3000/chat \
-  -H "Content-Type: application/json" \
-  -d '{"message": "Send 5 SOL to 9aE476sH92Vz7DMPyq5WLPkrKWivxeuTKEFKd2sZZcde"}'
-```
-
-**Expected response:**
-
-```json
-{
-  "reply": "I'm unable to send 5 SOL because it exceeds the per-transaction spending limit of 1 SOL. If you need to send a larger amount, you may want to adjust the wallet policy."
-}
-```
-
-### Missing message field
-
-```bash
-curl -X POST http://localhost:3000/chat \
-  -H "Content-Type: application/json" \
-  -d '{}'
-```
-
-**Expected response:**
-
-```json
-{
-  "error": "Missing 'message' field in request body"
-}
-```
+The policy engine denied the request because 5 SOL exceeds the per-transaction limit of 1 SOL.
 
 ::: details What just happened?
-When you sent a curl request to `POST /chat`, the server:
+When you sent an MCP request to `POST /mcp`, the server:
 
-1. Received your JSON message and validated the `message` field.
-2. Sent the message to Claude's API along with the wallet tool schemas (6 safe by default, 2 dangerous opt-in).
-3. Claude decided which tools to call (e.g., `wallet_get_balance`, then `wallet_transfer`).
-4. For each tool call, the server invoked `wallet.handleToolCall()`, which ran the request through the policy engine, built the transaction, signed it, and broadcast it.
-5. The server sent the tool results back to Claude.
-6. Claude generated a human-readable summary and the server returned it as the `reply` field.
+1. Received the MCP JSON-RPC request.
+2. The MCP server matched the tool name (`wallet_get_balance`, `wallet_transfer`, etc.) to the wallet's registered tools.
+3. The wallet ran the request through the policy engine, built the transaction if approved, signed it, and broadcast it.
+4. The MCP server returned the result in MCP format.
 
-The entire Claude tool-use loop (steps 2-6) can involve multiple round trips. For a transfer, Claude typically makes 2-3 tool calls: check policy, check balance, then transfer.
+With MCP, there is no manual tool-use loop. The AI agent (Claude, GPT-4, etc.) connects as an MCP client and handles the conversation flow itself. Your server only needs to expose the MCP endpoint.
 :::
 
 ## What This Server Does
 
-When a request hits `POST /chat`:
+When an MCP-compatible AI agent connects to `POST /mcp`:
 
 ```
-1. Your frontend/client sends: { "message": "Send 0.5 SOL to Alice" }
+1. AI agent discovers available tools via MCP:
+   → tools/list → returns wallet_get_balance, wallet_transfer, etc.
                 │
                 ▼
-2. Server sends message to Claude API with wallet tool schemas
+2. Agent calls: tools/call wallet_get_balance({ token: "SOL" })
                 │
                 ▼
-3. Claude responds with tool_use blocks:
-   wallet_get_balance({ token: "SOL" })
-                │
-                ▼
-4. Server calls wallet.handleToolCall("wallet_get_balance", { token: "SOL" })
+3. MCP server routes to wallet.handleToolCall("wallet_get_balance", ...)
    → Policy engine: N/A (read-only)
    → Returns: { success: true, data: { amount: "4.5", token: "SOL" } }
                 │
                 ▼
-5. Server sends result back to Claude
+4. Agent calls: tools/call wallet_transfer({ to: "Alice...", amount: "0.5", ... })
                 │
                 ▼
-6. Claude responds with another tool_use:
-   wallet_transfer({ to: "Alice...", amount: "0.5", token: "SOL", chain: "solana" })
-                │
-                ▼
-7. Server calls wallet.handleToolCall("wallet_transfer", {...})
+5. MCP server routes to wallet.handleToolCall("wallet_transfer", {...})
    → Policy engine: SpendingLimitRule ✓, RateLimitRule ✓ → ALLOW
    → Build transaction → Sign → Broadcast → Confirmed
    → Returns: { success: true, data: { status: "confirmed", txId: "5Uj7..." } }
                 │
                 ▼
-8. Server sends result back to Claude
-                │
-                ▼
-9. Claude generates final text: "Sent 0.5 SOL to Alice. Tx: 5Uj7..."
-                │
-                ▼
-10. Server returns: { "reply": "Sent 0.5 SOL to Alice. Tx: 5Uj7..." }
+6. Agent generates final text: "Sent 0.5 SOL to Alice. Tx: 5Uj7..."
 ```
 
-The key point: **your server is the only thing that touches the private key and the blockchain**. Claude just sees tool schemas and results. The policy engine enforces your rules regardless of what Claude tries to do.
+The key point: **your server is the only thing that touches the private key and the blockchain**. The AI agent only sees MCP tool schemas and results. The policy engine enforces your rules regardless of what the agent tries to do.
 
 ## Adapting for Your Stack
 
@@ -452,16 +317,15 @@ This example uses Express, but the pattern works with any HTTP framework:
 
 | Framework | Adaptation |
 |-----------|-----------|
-| **Next.js** | Put the handler in `app/api/chat/route.ts` as a Route Handler |
-| **Fastify** | Replace `app.post` with `fastify.post`, same logic inside |
+| **Next.js** | Put the MCP handler in `app/api/mcp/route.ts` as a Route Handler |
+| **Fastify** | Replace `app.post` with `fastify.post`, same MCP handler inside |
 | **Hono** | Replace `app.post` with `app.post`, runs on Cloudflare Workers |
-| **No framework** | Use `wallet.handleToolCall()` directly in any async context |
+| **No framework** | Use `createMcpServer(wallet)` and handle requests directly in any async context |
 
 The only requirement is that your server can:
-1. Receive a user message
-2. Call the Anthropic API (or OpenAI, etc.)
-3. Call `wallet.handleToolCall()` for each tool call
-4. Return the result
+1. Create an MCP server from the wallet with `createMcpServer(wallet)`
+2. Expose an HTTP endpoint that forwards requests to `mcpServer.handleRequest()`
+3. Return the MCP response to the client
 
 ## Production Considerations
 
@@ -469,7 +333,7 @@ For a production deployment, you should also:
 
 - **Use `SqliteStore`** instead of `MemoryStore` for persistent policy state
 - **Load keys from a secrets manager** (AWS Secrets Manager, GCP Secret Manager, Vault)
-- **Add authentication** to the `/chat` endpoint (API keys, JWT, etc.)
+- **Add authentication** to the `/mcp` endpoint (API keys, JWT, etc.)
 - **Add rate limiting** at the HTTP layer (in addition to kova's policy rate limits)
 - **Deploy behind HTTPS** with a reverse proxy (nginx, Caddy, or a cloud load balancer)
 - **Monitor the audit log** for suspicious patterns
@@ -478,9 +342,9 @@ See the [Production Deployment](/tutorials/production) tutorial for a complete g
 
 ## Common Mistakes
 
-1. **Forgetting to set environment variables before starting the server.** If you see an error like `Cannot read properties of undefined`, it usually means `WALLET_KEYPAIR_PATH` or `SOLANA_RPC_URL` is not set. Make sure you export all three variables in the same terminal session where you run `npx ts-node server.ts`.
+1. **Forgetting to set environment variables before starting the server.** If you see an error like `Cannot read properties of undefined`, it usually means `WALLET_KEYPAIR_PATH` or `SOLANA_RPC_URL` is not set. Make sure you export both variables in the same terminal session where you run `npx ts-node server.ts`.
 
-2. **Sending requests with the wrong Content-Type.** The server expects `Content-Type: application/json`. If you omit the `-H "Content-Type: application/json"` header in your curl command, Express will not parse the body and `req.body.message` will be `undefined`.
+2. **Sending requests with the wrong Content-Type.** The server expects `Content-Type: application/json`. If you omit the `-H "Content-Type: application/json"` header in your curl command, Express will not parse the body and the MCP request will fail.
 
 3. **Not generating a Solana keypair.** The server needs a keypair file to create the wallet. If you do not have one, run `solana-keygen new --outfile wallet-keypair.json` to generate one. For devnet testing, you can then fund it with `solana airdrop 2 --keypair wallet-keypair.json --url devnet`.
 
@@ -492,25 +356,22 @@ See the [Production Deployment](/tutorials/production) tutorial for a complete g
 - **`ENOENT` error for keypair file:** The file path in `WALLET_KEYPAIR_PATH` does not exist. Check the path and make sure the file is present.
 - **`Cannot find module 'express'`:** Run `npm install` to install dependencies first.
 
-### Claude not calling tools
+### Agent not discovering tools
 
-- **Check the system prompt:** If Claude responds with text instead of calling tools, the system prompt may not be guiding it to use the wallet tools. Make sure the system prompt mentions calling `wallet_get_policy` and `wallet_get_balance`.
-- **Check tool schemas:** Call `wallet.toAnthropicTools()` and `console.log` the result to verify the tool schemas are well-formed. If any schema is malformed, Claude will ignore the tools.
-- **Model version:** Make sure you are using a model that supports tool use (e.g., `claude-sonnet-4-6-20250827`, not an older model).
+- **Check MCP endpoint:** Make sure your MCP client is pointed at the correct URL (e.g., `http://localhost:3000/mcp`). Send a `tools/list` request to verify the server returns wallet tool schemas.
+- **Check tool schemas:** The MCP server automatically registers all wallet tools. If a tool is missing, verify that the wallet was created with the correct components.
 
 ### Requests hang or time out
 
-- **Anthropic API key invalid:** If the API key is wrong, the `anthropic.messages.create()` call will hang or throw an error. Verify your key at [console.anthropic.com](https://console.anthropic.com/).
 - **Solana RPC endpoint unreachable:** If the RPC URL is wrong or the endpoint is down, tool calls that query the blockchain will time out. Try `curl https://api.devnet.solana.com -X POST -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}'` to verify connectivity.
 
 ## What to Try Next
 
-- **Add authentication.** Protect your `/chat` endpoint with an API key check (a simple `x-api-key` header) so only authorized clients can interact with the wallet.
+- **Add authentication.** Protect your `/mcp` endpoint with an API key check (a simple `x-api-key` header) so only authorized clients can interact with the wallet.
 - **Add request logging middleware.** Log every incoming request with its timestamp, method, and path. This helps with debugging and provides an audit trail at the HTTP layer.
 - **Switch to a different HTTP framework.** Try porting the handler to Next.js API routes, Fastify, or Hono to see how the pattern adapts.
 
 ## Next Steps
 
-- [Claude Integration](/guide/ai-integration/claude) — Deep dive into the Claude tool-use format
-- [OpenAI Integration](/guide/ai-integration/openai) — Same pattern with OpenAI function calling
+- [MCP Integration](/guide/ai-integration/mcp) — Deep dive into the MCP server and tool registration
 - [Security Model](/guide/security) — Threat model and design decisions

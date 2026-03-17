@@ -43,8 +43,6 @@ import type { AuditFailureCallback } from "../logging/audit.js";
 import type { AuditEntry } from "../logging/types.js";
 import type { PolicyRuleAudit } from "../policy/types.js";
 import type { ToolCallResult } from "../adapters/types.js";
-import { toAnthropicTools as convertToAnthropicTools, type AnthropicTool } from "../adapters/claude.js";
-import { toOpenAITools as convertToOpenAITools, type OpenAITool } from "../adapters/openai.js";
 // M-55 fix: WALLET_TOOL_NAMES no longer enumerated in error messages (but still
 // imported for MED-T3-08 constructor validation of enabledTools).
 import { WALLET_TOOL_NAMES, WRITE_TOOL_NAMES, WRITE_RATE_LIMIT_PER_MINUTE, validateToolInput, type WalletToolName } from "../adapters/tools.js";
@@ -396,12 +394,9 @@ export interface AgentWalletConfig {
   /**
    * H-06 fix: Set of tool names that are enabled for dispatch via handleToolCall().
    * If not provided, defaults to safe read-only tools only (wallet_get_balance,
-   * wallet_get_transaction_history). Dangerous tools (wallet_execute_custom,
-   * wallet_get_policy) and write tools (wallet_transfer, wallet_swap, wallet_mint,
-   * wallet_stake) must be explicitly enabled.
-   *
-   * M-59 fix: wallet_get_policy is included in this check — it is not invocable
-   * unless explicitly listed in enabledTools.
+   * wallet_get_transaction_history, wallet_get_policy, etc.). Dangerous tools
+   * (wallet_execute_custom) and write tools (wallet_transfer, wallet_swap,
+   * wallet_mint, wallet_stake) must be explicitly enabled.
    */
   enabledTools?: ReadonlySet<string>;
   /**
@@ -478,6 +473,14 @@ export interface AgentWalletConfig {
 const DEFAULT_ENABLED_TOOLS: ReadonlySet<string> = new Set([
   "wallet_get_balance",
   "wallet_get_transaction_history",
+  "wallet_get_supported_tokens",
+  "wallet_get_address",
+  "wallet_estimate_fee",
+  "wallet_get_token_price",
+  "wallet_get_transaction_status",
+  "wallet_get_policy",
+  "wallet_get_spending_remaining",
+  "wallet_get_all_balances",
 ]);
 
 export class AgentWallet {
@@ -2059,9 +2062,8 @@ export class AgentWallet {
       }
 
       // H-06 fix: Check tool enablement before dispatch. Only tools in the configured
-      // enabledTools set are dispatched. This prevents dangerous tools (wallet_execute_custom,
-      // wallet_get_policy) from being invoked even if the agent knows the tool name.
-      // M-59 fix: wallet_get_policy is included in this check.
+      // enabledTools set are dispatched. This prevents dangerous tools (wallet_execute_custom)
+      // from being invoked even if the agent knows the tool name.
       if (!this.enabledTools.has(name)) {
         // M-11 fix: Sanitize tool name to prevent injection. Strip control chars
         // and truncate to a reasonable length before including in the error.
@@ -2098,6 +2100,20 @@ export class AgentWallet {
           return await this.handleGetPolicy();
         case "wallet_get_transaction_history":
           return await this.handleGetHistory(validatedInput);
+        case "wallet_get_supported_tokens":
+          return this.handleGetSupportedTokens();
+        case "wallet_get_address":
+          return await this.handleGetAddress();
+        case "wallet_estimate_fee":
+          return await this.handleEstimateFee(validatedInput);
+        case "wallet_get_token_price":
+          return await this.handleGetTokenPrice(validatedInput);
+        case "wallet_get_transaction_status":
+          return await this.handleGetTransactionStatus(validatedInput);
+        case "wallet_get_spending_remaining":
+          return await this.handleGetSpendingRemaining();
+        case "wallet_get_all_balances":
+          return await this.handleGetAllBalances();
         default: {
           // M-11 fix: Sanitize tool name before reflecting in error response.
           // M-55 fix: Do NOT list available tools — prevents reconnaissance.
@@ -2151,20 +2167,6 @@ export class AgentWallet {
         error: "An internal error occurred while processing the tool call.",
       };
     }
-  }
-
-  /**
-   * Get tool definitions in Anthropic (Claude) format.
-   */
-  toAnthropicTools(): AnthropicTool[] {
-    return convertToAnthropicTools().filter(t => this.enabledTools.has(t.name));
-  }
-
-  /**
-   * Get tool definitions in OpenAI format.
-   */
-  toOpenAITools(): OpenAITool[] {
-    return convertToOpenAITools().filter(t => this.enabledTools.has(t.function.name));
   }
 
   // ── Private helpers ──────────────────────────────────────────────────
@@ -3321,6 +3323,327 @@ export class AgentWallet {
   /**
    * MED-03 fix: Rate limit history queries to prevent enumeration without audit logging.
    */
+  private handleGetSupportedTokens(): ToolCallResult {
+    // Import the token registries to return supported tokens with their mint addresses.
+    // The chain adapter's isDevnet state determines which registry to use, but since
+    // isDevnet is private, we check the chain adapter's config via duck-typing.
+    const chainAdapter = this.chain as { config?: { network?: string }; isDevnet?: boolean };
+    const isDevnet = chainAdapter.isDevnet ??
+      (chainAdapter.config?.network === "devnet");
+
+    const tokens: Array<{ symbol: string; network: string; mintAddress: string; decimals: number }> = [];
+
+    // SOL is available on all networks with the same mint
+    tokens.push({
+      symbol: "SOL",
+      network: isDevnet ? "devnet" : "mainnet-beta",
+      mintAddress: "So11111111111111111111111111111111111111112",
+      decimals: 9,
+    });
+
+    // USDC has different mint addresses per network
+    if (isDevnet) {
+      tokens.push({
+        symbol: "USDC",
+        network: "devnet",
+        mintAddress: "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU",
+        decimals: 6,
+      });
+    } else {
+      tokens.push({
+        symbol: "USDC",
+        network: "mainnet-beta",
+        mintAddress: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        decimals: 6,
+      });
+      // USDT is only available on mainnet
+      tokens.push({
+        symbol: "USDT",
+        network: "mainnet-beta",
+        mintAddress: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+        decimals: 6,
+      });
+    }
+
+    return {
+      success: true,
+      data: {
+        tokens,
+        note: "You can also pass a raw SPL token mint address as the token parameter for tokens not listed here.",
+      },
+    };
+  }
+
+  private async handleGetAddress(): Promise<ToolCallResult> {
+    const rateLimited = await this.checkReadRateLimit();
+    if (rateLimited) return rateLimited;
+    try {
+      const address = await this.signer.getAddress();
+      return {
+        success: true,
+        data: {
+          address,
+          chain: this.chain.chain,
+        },
+      };
+    } catch (err) {
+      return {
+        success: false,
+        error: "Failed to retrieve wallet address.",
+      };
+    }
+  }
+
+  private async handleEstimateFee(
+    input: Record<string, unknown>,
+  ): Promise<ToolCallResult> {
+    const rateLimited = await this.checkReadRateLimit();
+    if (rateLimited) return rateLimited;
+    try {
+      const signerAddress = await this.signer.getAddress();
+      const intent: TransactionIntent = {
+        type: "transfer",
+        chain: input.chain as ChainId,
+        params: {
+          to: input.to as string,
+          amount: input.amount as string,
+          token: input.token as string,
+        },
+      };
+      const unsignedTx = await this.chain.buildTransaction(intent, signerAddress);
+      const simulation = await this.chain.simulateTransaction(unsignedTx.data);
+      return {
+        success: true,
+        data: {
+          estimatedFee: simulation.estimatedFee ?? null,
+          feeToken: "SOL",
+          simulationSuccess: simulation.success,
+          error: simulation.success ? undefined : simulation.error,
+        },
+      };
+    } catch (err) {
+      return {
+        success: false,
+        error: "Failed to estimate fee. The transaction may be invalid or the network may be unavailable.",
+      };
+    }
+  }
+
+  private async handleGetTokenPrice(
+    input: Record<string, unknown>,
+  ): Promise<ToolCallResult> {
+    const rateLimited = await this.checkReadRateLimit();
+    if (rateLimited) return rateLimited;
+    const token = input.token as string;
+    try {
+      const usdValue = await this.chain.getValueInUSD(token, "1");
+      return {
+        success: true,
+        data: {
+          token: token.toUpperCase(),
+          priceUSD: usdValue,
+          currency: "USD",
+        },
+      };
+    } catch {
+      return {
+        success: false,
+        error: `Price unavailable for token "${token}". No price oracle configured or the token is not supported.`,
+      };
+    }
+  }
+
+  private async handleGetTransactionStatus(
+    input: Record<string, unknown>,
+  ): Promise<ToolCallResult> {
+    const rateLimited = await this.checkReadRateLimit();
+    if (rateLimited) return rateLimited;
+    const txId = input.txId as string;
+    try {
+      const status = await this.chain.getTransactionStatus(txId);
+      return {
+        success: true,
+        data: {
+          txId: status.txId,
+          status: status.status,
+          blockTime: status.blockTime ?? null,
+          fee: status.fee ?? null,
+          error: status.error ?? null,
+        },
+      };
+    } catch {
+      return {
+        success: false,
+        error: "Failed to retrieve transaction status. The network may be unavailable.",
+      };
+    }
+  }
+
+  private async handleGetSpendingRemaining(): Promise<ToolCallResult> {
+    const rateLimited = await this.checkReadRateLimit();
+    if (rateLimited) return rateLimited;
+
+    const rules = this.policy.getRules();
+    const remaining: Record<string, unknown> = {};
+
+    for (const rule of rules) {
+      if (!(rule instanceof SpendingLimitRule)) continue;
+      const config = rule.getConfig();
+      const keyPrefix = config.keyPrefix ?? "spending:";
+
+      const WINDOW_SECONDS = {
+        daily: 86_400,
+        weekly: 604_800,
+        monthly: 2_592_000,
+      } as const;
+
+      // Token-denominated windows
+      for (const window of ["daily", "weekly", "monthly"] as const) {
+        const limitConfig = config[window];
+        if (!limitConfig) continue;
+
+        const normalizedToken = normalizeTokenId(limitConfig.token);
+        const logKey = `${keyPrefix}log:${window}:${normalizedToken}`;
+        const now = Date.now();
+        const windowStartMs = now - WINDOW_SECONDS[window] * 1000;
+
+        const recentEntries = await this.store.getRecent(logKey, 10_000);
+        let spentTotal = 0;
+        for (const entry of recentEntries) {
+          const colonIdx = entry.indexOf(":");
+          if (colonIdx === -1) continue;
+          const ts = parseInt(entry.slice(0, colonIdx), 10);
+          const amt = parseFloat(entry.slice(colonIdx + 1));
+          if (ts >= windowStartMs && Number.isFinite(amt) && amt >= 0) {
+            spentTotal += amt;
+          }
+        }
+
+        const limit = parseFloat(limitConfig.amount);
+        const remainingAmount = Math.max(0, limit - spentTotal);
+
+        remaining[`${window}_${displayTokenId(limitConfig.token)}`] = {
+          window,
+          token: displayTokenId(limitConfig.token),
+          limit: limitConfig.amount,
+          spent: spentTotal.toFixed(4),
+          remaining: remainingAmount.toFixed(4),
+          unit: displayTokenId(limitConfig.token),
+        };
+      }
+
+      // USD-denominated windows
+      for (const window of ["daily", "weekly", "monthly"] as const) {
+        const usdKey = `${window}USD` as const;
+        const limitConfig = config[usdKey];
+        if (!limitConfig) continue;
+
+        const logKey = `${keyPrefix}log:${window}:USD`;
+        const now = Date.now();
+        const windowStartMs = now - WINDOW_SECONDS[window] * 1000;
+
+        const recentEntries = await this.store.getRecent(logKey, 10_000);
+        let spentTotal = 0;
+        for (const entry of recentEntries) {
+          const colonIdx = entry.indexOf(":");
+          if (colonIdx === -1) continue;
+          const ts = parseInt(entry.slice(0, colonIdx), 10);
+          const amt = parseFloat(entry.slice(colonIdx + 1));
+          if (ts >= windowStartMs && Number.isFinite(amt) && amt >= 0) {
+            spentTotal += amt;
+          }
+        }
+
+        const limit = parseFloat(limitConfig.amount);
+        const remainingAmount = Math.max(0, limit - spentTotal);
+
+        remaining[`${window}_USD`] = {
+          window,
+          token: "USD",
+          limit: `$${limitConfig.amount}`,
+          spent: `$${spentTotal.toFixed(2)}`,
+          remaining: `$${remainingAmount.toFixed(2)}`,
+          unit: "USD",
+        };
+      }
+
+      // Per-transaction limits (stateless, just report the cap)
+      if (config.perTransaction) {
+        remaining.perTransaction = {
+          limit: config.perTransaction.amount,
+          token: displayTokenId(config.perTransaction.token),
+        };
+      }
+      if (config.perTransactionUSD) {
+        remaining.perTransactionUSD = {
+          limit: `$${config.perTransactionUSD.amount}`,
+          unit: "USD",
+        };
+      }
+    }
+
+    if (Object.keys(remaining).length === 0) {
+      return {
+        success: true,
+        data: {
+          message: "No spending limits configured. All transactions are subject to other policy rules only.",
+        },
+      };
+    }
+
+    return { success: true, data: remaining };
+  }
+
+  private async handleGetAllBalances(): Promise<ToolCallResult> {
+    const rateLimited = await this.checkReadRateLimit();
+    if (rateLimited) return rateLimited;
+
+    try {
+      const address = await this.signer.getAddress();
+
+      // Get the supported tokens list from the chain adapter
+      const chainAdapter = this.chain as { config?: { network?: string }; isDevnet?: boolean };
+      const isDevnet = chainAdapter.isDevnet ??
+        (chainAdapter.config?.network === "devnet");
+
+      const tokenSymbols = ["SOL", "USDC"];
+      if (!isDevnet) tokenSymbols.push("USDT");
+
+      const balances: Array<{
+        token: string;
+        amount: string;
+        decimals: number;
+        usdValue?: number;
+      }> = [];
+
+      for (const token of tokenSymbols) {
+        try {
+          const balance = await this.chain.getBalance(address, token);
+          balances.push({
+            token: balance.token,
+            amount: balance.amount,
+            decimals: balance.decimals,
+            usdValue: balance.usdValue,
+          });
+        } catch {
+          // Skip tokens that fail (e.g., no account for that token yet)
+          balances.push({
+            token,
+            amount: "0",
+            decimals: token === "SOL" ? 9 : 6,
+          });
+        }
+      }
+
+      return { success: true, data: { balances } };
+    } catch {
+      return {
+        success: false,
+        error: "Failed to retrieve balances. The network may be unavailable.",
+      };
+    }
+  }
+
   private async handleGetHistory(
     input: Record<string, unknown>,
   ): Promise<ToolCallResult> {

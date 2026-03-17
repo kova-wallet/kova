@@ -48,7 +48,8 @@ An RPC (Remote Procedure Call) endpoint is a URL that lets your application comm
 // - ChainAdapter: the interface all blockchain integrations must implement
 // - TransactionStatusResult: describes the on-chain status of a submitted transaction
 // - ChainTransactionStatus: a union type of possible transaction states
-import type { ChainAdapter, TransactionStatusResult, ChainTransactionStatus } from "@kova/wallet";
+// - SimulationResult: describes the result of simulating a transaction before signing
+import type { ChainAdapter, TransactionStatusResult, ChainTransactionStatus, SimulationResult } from "@kova/wallet";
 ```
 
 ```typescript
@@ -104,24 +105,21 @@ interface ChainAdapter {
   // Used by the SDK to catch invalid recipient addresses before building transactions.
   isValidAddress(address: string): boolean;
 
-  /** Verify that a built transaction matches the original intent */
-  // Required method. After building a transaction, the SDK calls this to verify
-  // that the transaction instructions match the intent (e.g., correct recipient,
-  // amount, and program). Prevents transaction substitution attacks.
-  verifyTransactionIntegrity(
-    intent: TransactionIntent,
-    transaction: UnsignedTransaction,
-    signerAddress: string,
-  ): Promise<void>;
+  /** Verify that signed transaction data matches the unsigned original */
+  // Required method. After signing, the SDK calls this to verify that the
+  // signed transaction's message bytes match the original unsigned transaction.
+  // Detects if a compromised signer modified the transaction instructions,
+  // accounts, or other data during signing. Throws if integrity check fails.
+  verifyTransactionIntegrity(unsignedTxData: Uint8Array, signedTxData: Uint8Array): void;
 
   /** Refresh the blockhash on a transaction (optional) */
   // If a transaction's blockhash expires before broadcast, this method
   // fetches a fresh blockhash and updates the transaction.
-  refreshBlockhash?(transaction: UnsignedTransaction): Promise<UnsignedTransaction>;
+  refreshBlockhash?(unsignedTx: UnsignedTransaction): Promise<UnsignedTransaction>;
 
   /** Clean up resources (optional) */
   // Called during wallet shutdown to release RPC connections, timers, etc.
-  destroy?(): Promise<void>;
+  destroy?(): void;
 }
 ```
 

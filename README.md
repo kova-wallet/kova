@@ -45,7 +45,7 @@ Agent → Intent → Policy Engine → Build Tx → Sign → Broadcast → Audit
 | **Rate Limiting** | Max transactions per minute/hour with store-backed counters |
 | **Time Windows** | Restrict to business hours (timezone-aware, multiple windows) |
 | **Approval Gates** | Human-in-the-loop via webhook or custom callback for high-value transactions |
-| **AI Adapters** | First-class tool definitions for Claude, OpenAI, and LangChain |
+| **MCP Server** | Agents interact via Model Context Protocol — framework-agnostic (Claude, OpenAI, LangChain, any MCP client) |
 | **Signers** | LocalSigner (dev), MpcSigner with Turnkey provider (production) |
 | **Stores** | MemoryStore (dev), SqliteStore (single server), RedisStore (multi-server) |
 | **Solana** | SOL transfers, SPL tokens with ATA creation, transaction simulation |
@@ -125,9 +125,9 @@ console.log(result.status);  // "confirmed" | "denied" | "pending" | "failed"
 │  └──────────┘  └──────────────┘  └─────────┘  └────────────┘  │
 │                                                                 │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐  │
-│  │  Audit Log   │  │   Circuit    │  │    AI Adapters       │  │
-│  │  (hash-chain)│  │   Breaker    │  │  Claude · OpenAI ·   │  │
-│  │              │  │              │  │  LangChain           │  │
+│  │  Audit Log   │  │   Circuit    │  │    MCP Server        │  │
+│  │  (hash-chain)│  │   Breaker    │  │  (Model Context      │  │
+│  │              │  │              │  │   Protocol)           │  │
 │  └──────────────┘  └──────────────┘  └──────────────────────┘  │
 │                                                                 │
 │  ┌──────────────────────────────────────────────────────────┐  │
@@ -187,65 +187,53 @@ const stricter = Policy.extend(policy, "strict").spendingLimit({ ... }).build();
 
 ## AI Integration
 
-kova exposes wallet operations as tool definitions that AI agents call directly. Policy enforcement happens automatically on every tool call.
-
-### Claude (Anthropic)
+Agents interact with the wallet exclusively through an [MCP](https://modelcontextprotocol.io/) (Model Context Protocol) server. Any AI framework that supports MCP — Claude, OpenAI, LangChain, or custom agents — can connect. Policy enforcement happens automatically on every tool call.
 
 ```typescript
-const response = await anthropic.messages.create({
-  model: "claude-sonnet-4-6-20250827",
-  tools: wallet.toAnthropicTools(),
-  messages: [{ role: "user", content: "Send 0.1 SOL to GsbwXf...QRre" }],
-});
+import { Keypair } from "@solana/web3.js";
+import {
+  AgentWallet, Policy, LocalSigner, MemoryStore, SolanaAdapter,
+  createMcpServer,
+} from "@kova/wallet";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 
-for (const block of response.content) {
-  if (block.type === "tool_use") {
-    const result = await wallet.handleToolCall(block.name, block.input);
-  }
-}
+const wallet = new AgentWallet({ signer, chain, policy, store });
+
+// Start the MCP server — agents connect via stdio (or any MCP transport)
+const server = createMcpServer(wallet);
+await server.connect(new StdioServerTransport());
 ```
 
-### OpenAI
+Or use the convenience helper:
 
 ```typescript
-const response = await openai.chat.completions.create({
-  model: "gpt-4o",
-  tools: wallet.toOpenAITools(),
-  messages: [{ role: "user", content: "Check my SOL balance" }],
-});
+import { createMcpStdioServer } from "@kova/wallet";
 
-const toolCall = response.choices[0]?.message.tool_calls?.[0];
-if (toolCall) {
-  const result = await wallet.handleToolCall(
-    toolCall.function.name,
-    JSON.parse(toolCall.function.arguments),
-  );
-}
-```
-
-### LangChain
-
-```typescript
-import { createLangChainTools } from "@kova/wallet";
-
-const tools = createLangChainTools(wallet);
-// Pass to any LangChain agent — policy enforcement is automatic
+const server = await createMcpStdioServer(wallet);
+// Server is now running and accepting tool calls via stdio
 ```
 
 ### Available tools
 
 | Tool | Description |
 |------|-------------|
-| `wallet_transfer` | Transfer SOL or SPL tokens |
-| `wallet_get_balance` | Query wallet balance |
+| `wallet_transfer` | Transfer SOL, USDC, or USDT |
+| `wallet_swap` | Swap tokens (requires pre-built swap transaction) |
+| `wallet_mint` | Mint NFTs from a collection |
+| `wallet_stake` | Stake tokens with a validator |
+| `wallet_get_balance` | Query wallet balance for a token |
+| `wallet_get_all_balances` | Query all token balances in one call |
+| `wallet_get_policy` | View current policy rules and constraints |
+| `wallet_get_spending_remaining` | Check remaining budget per spending window |
+| `wallet_get_supported_tokens` | List supported tokens with mint addresses |
+| `wallet_get_address` | Get the wallet's public address |
+| `wallet_get_token_price` | Get current USD price from oracle |
+| `wallet_estimate_fee` | Estimate network fee before sending |
 | `wallet_get_transaction_history` | Query past transactions |
-| `wallet_get_policy` | View current policy rules (opt-in, dangerous) |
-| `wallet_swap` | Swap tokens (requires custom chain adapter implementation) |
-| `wallet_mint` | Mint NFTs (requires custom chain adapter implementation) |
-| `wallet_stake` | Stake tokens (requires custom chain adapter implementation) |
-| `wallet_execute_custom` | Raw instructions (opt-in, dangerous) |
+| `wallet_get_transaction_status` | Check transaction confirmation status |
+| `wallet_execute_custom` | Raw on-chain instructions (opt-in, dangerous) |
 
-> **Default tools**: Only `wallet_get_balance` and `wallet_get_transaction_history` are enabled by default. Write operations (`wallet_transfer`, etc.) must be explicitly enabled. `wallet_get_policy` and `wallet_execute_custom` require dangerous opt-in flags.
+> **Default tools**: All read tools are enabled by default. Write operations (`wallet_transfer`, etc.) must be explicitly enabled via `enabledTools`. Only `wallet_execute_custom` requires the `includeDangerous` flag.
 
 ## Signers
 
@@ -316,7 +304,7 @@ kova/
 │   ├── stores/         # MemoryStore, SqliteStore, RedisStore, PrefixedStore
 │   ├── chains/solana/  # SolanaAdapter, SOL + SPL token transfers
 │   ├── approval/       # WebhookApprovalChannel, CallbackApprovalChannel
-│   ├── adapters/       # Claude, OpenAI, LangChain tool adapters
+│   ├── adapters/       # MCP server adapter (sole agent interface)
 │   ├── oracles/        # Pyth price feeds, consensus provider
 │   └── logging/        # Hash-chained audit logger
 ├── tests/              # 1,281 unit and integration tests

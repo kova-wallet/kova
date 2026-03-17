@@ -16,7 +16,7 @@ The `AuditLogger` accepts either a bare `Store` (for backward compatibility) or 
 
 ```typescript
 // Import AuditLogger and a store implementation from kova.
-import { AuditLogger, MemoryStore } from "kova";
+import { AuditLogger, MemoryStore } from "@kova/wallet";
 
 // Create a store instance to persist audit entries.
 const store = new MemoryStore();
@@ -222,7 +222,7 @@ The `verifyIntegrity(count)` method walks the hash chain from oldest to newest a
 
 ```typescript
 // Import AuditLogger and a store for integrity verification.
-import { AuditLogger, MemoryStore } from "kova";
+import { AuditLogger, MemoryStore } from "@kova/wallet";
 
 // Create the store and logger (in a real app, these would be the same
 // instances used by the AgentWallet during transaction execution).
@@ -349,7 +349,7 @@ The `onAuditFailure` callback is invoked each time an audit write fails, giving 
 
 ```typescript
 // Import AuditLogger and a store.
-import { AuditLogger, MemoryStore } from "kova";
+import { AuditLogger, MemoryStore } from "@kova/wallet";
 
 const store = new MemoryStore();
 
@@ -392,7 +392,7 @@ import {
   MemoryStore,       // In-memory persistence (use SqliteStore in production)
   LocalSigner,       // In-memory key signer (use a remote signer in production)
   SolanaAdapter,     // Solana blockchain adapter for building/submitting transactions
-} from "kova";
+} from "@kova/wallet";
 
 // Create a shared store for all SDK components.
 const store = new MemoryStore({ dangerouslyAllowInProduction: true });

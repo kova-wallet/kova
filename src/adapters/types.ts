@@ -1,6 +1,6 @@
 /**
  * Types for AI agent tool definitions.
- * Compatible with Anthropic, OpenAI, and LangChain tool formats.
+ * Framework-agnostic tool definitions used by the MCP server adapter.
  */
 
 /** Describes a single parameter in a wallet tool definition. */

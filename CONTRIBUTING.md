@@ -48,14 +48,13 @@ src/
   signers/        # Signer interface + implementations
   stores/         # Store interface + MemoryStore, SqliteStore
   chains/         # Chain adapter interface + Solana implementation
-  approval/       # Approval channel interface + Telegram bot
-  adapters/       # LLM tool definitions (Claude, OpenAI, LangChain)
+  approval/       # Approval channel interface + webhook/callback
+  adapters/       # MCP server adapter (sole agent interface)
   logging/        # Audit logger with hash-chain integrity
 tests/
   unit/           # Unit tests (mirrors src/ structure)
   e2e/            # End-to-end workflow tests
   integration/    # Integration tests (SQLite, circuit breaker)
-dashboard/        # Next.js admin UI
 docs-site/        # VitePress documentation
 ```
 

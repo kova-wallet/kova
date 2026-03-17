@@ -30,7 +30,7 @@ Transaction intents are high-level, declarative descriptions of what an agent wa
 // IntentType: the union type of supported operations ("transfer", "swap", "mint", "stake", "custom").
 // ChainId: the union type of supported blockchains ("solana", "ethereum", "base").
 // IntentMetadata: optional context attached to intents for auditing and approval flows.
-import type { TransactionIntent, IntentType, ChainId, IntentMetadata } from "kova";
+import type { TransactionIntent, IntentType, ChainId, IntentMetadata } from "@kova/wallet";
 ```
 
 ```typescript
@@ -85,8 +85,9 @@ type IntentType = "transfer" | "swap" | "mint" | "stake" | "custom";
 // Defines the supported blockchain identifiers.
 // "solana": fully implemented with the SolanaAdapter chain adapter.
 // "ethereum" and "base": reserved for future chain adapter implementations.
+// "system": used internally for system-level intents.
 // Using an unsupported chain ID will cause validation to fail at execution time.
-type ChainId = "solana" | "ethereum" | "base";
+type ChainId = "solana" | "ethereum" | "base" | "system";
 ```
 
 ::: tip
@@ -427,7 +428,7 @@ import {
   isMintIntent,
   isStakeIntent,
   isCustomIntent,
-} from "kova";
+} from "@kova/wallet";
 
 // A helper function that produces a human-readable description of any intent.
 // Each type guard narrows the `params` type, giving full type safety inside the branch.

@@ -50,7 +50,7 @@ An **address** is like a bank account number -- it identifies where to send fund
 ```typescript
 // Import the AllowlistRule class, which controls which addresses and programs
 // the agent is permitted to interact with.
-import { AllowlistRule } from "kova";
+import { AllowlistRule } from "@kova/wallet";
 ```
 
 ## AllowlistConfig

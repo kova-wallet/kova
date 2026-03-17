@@ -194,14 +194,8 @@ describe("CircuitBreaker — failOnMultiInstance: false", () => {
     await breaker1.initialize();
     await breaker2.initialize();
 
-    const intent = {
-      type: "transfer" as const,
-      chain: "solana",
-      params: { to: "recipient", amount: "1", token: "SOL" },
-    };
-
-    expect(typeof await breaker1.isOpen(intent)).toBe("boolean");
-    expect(typeof await breaker2.isOpen(intent)).toBe("boolean");
+    expect(typeof await breaker1.isOpen()).toBe("boolean");
+    expect(typeof await breaker2.isOpen()).toBe("boolean");
 
     breaker1.destroy();
     breaker2.destroy();
@@ -298,13 +292,7 @@ describe("CircuitBreaker — functional check/recordOutcome", () => {
     const breaker = makeBreaker(store, { threshold: 3, cooldownMs: 100 });
     await breaker.initialize();
 
-    const intent = {
-      type: "transfer" as const,
-      chain: "solana",
-      params: { to: "r", amount: "1", token: "SOL" },
-    };
-
-    expect(await breaker.isOpen(intent)).toBe(false);
+    expect(await breaker.isOpen()).toBe(false);
 
     breaker.destroy();
     store.stopGc();
@@ -315,17 +303,11 @@ describe("CircuitBreaker — functional check/recordOutcome", () => {
     const breaker = makeBreaker(store, { threshold: 3, cooldownMs: 100_000 });
     await breaker.initialize();
 
-    const intent = {
-      type: "transfer" as const,
-      chain: "solana",
-      params: { to: "r", amount: "1", token: "SOL" },
-    };
-
     await breaker.recordOutcome("DENY");
     await breaker.recordOutcome("DENY");
     await breaker.recordOutcome("DENY");
 
-    expect(await breaker.isOpen(intent)).toBe(true);
+    expect(await breaker.isOpen()).toBe(true);
 
     breaker.destroy();
     store.stopGc();
@@ -339,14 +321,8 @@ describe("CircuitBreaker — functional check/recordOutcome", () => {
     await breaker1.initialize();
     await breaker2.initialize();
 
-    const intent = {
-      type: "transfer" as const,
-      chain: "solana",
-      params: { to: "r", amount: "1", token: "SOL" },
-    };
-
-    expect(typeof await breaker1.isOpen(intent)).toBe("boolean");
-    expect(typeof await breaker2.isOpen(intent)).toBe("boolean");
+    expect(typeof await breaker1.isOpen()).toBe("boolean");
+    expect(typeof await breaker2.isOpen()).toBe("boolean");
 
     breaker1.destroy();
     breaker2.destroy();

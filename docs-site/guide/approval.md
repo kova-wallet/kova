@@ -18,7 +18,7 @@ The human approval system provides a human-in-the-loop mechanism for high-value 
 // - ApprovalRequest: the data object describing what the agent wants to do
 // - ApprovalResult: the human's decision (approved, rejected, or timed out)
 // - ApprovalDecision: the union type of possible decisions
-import type { ApprovalChannel, ApprovalRequest, ApprovalResult, ApprovalDecision } from "kova";
+import type { ApprovalChannel, ApprovalRequest, ApprovalResult, ApprovalDecision } from "@kova/wallet";
 ```
 
 ```typescript
@@ -159,8 +159,8 @@ The SDK ships two generic approval channels that cover the most common integrati
 The most flexible option -- you provide two callbacks: one to notify a human, and one to wait for their decision. Works with any notification mechanism (Slack, Discord, Telegram, email, SMS, in-app UI, push notifications).
 
 ```typescript
-import { CallbackApprovalChannel } from "kova";
-import type { CallbackApprovalChannelConfig } from "kova";
+import { CallbackApprovalChannel } from "@kova/wallet";
+import type { CallbackApprovalChannelConfig } from "@kova/wallet";
 
 const approval = new CallbackApprovalChannel({
   // Optional channel name for audit logs. Defaults to "callback".
@@ -201,7 +201,7 @@ HTTP webhook-based approval for systems that communicate via HTTP callbacks (e.g
 3. Your system POSTs the decision back to the channel's callback server with an `X-Kova-Signature` header
 
 ```typescript
-import { WebhookApprovalChannel } from "kova";
+import { WebhookApprovalChannel } from "@kova/wallet";
 
 const approval = new WebhookApprovalChannel({
   // URL to POST approval requests to. Must be HTTPS (HTTP allowed for localhost).
@@ -252,7 +252,7 @@ import type {
   ApprovalChannel,
   ApprovalRequest,
   ApprovalResult,
-} from "kova";
+} from "@kova/wallet";
 
 // Example: A custom approval channel that sends approval requests to Slack
 // using Slack's Block Kit for rich interactive messages.
@@ -358,7 +358,7 @@ export class SlackApprovalChannel implements ApprovalChannel {
 
 ```typescript
 // Import the policy engine components and the custom Slack approval channel.
-import { PolicyEngine, ApprovalGateRule, MemoryStore } from "kova";
+import { PolicyEngine, ApprovalGateRule, MemoryStore } from "@kova/wallet";
 import { SlackApprovalChannel } from "./slack-approval";
 
 // Create a Slack approval channel with your Slack webhook URL and channel ID.

@@ -135,7 +135,7 @@ import {
   MemoryStore,        // In-memory persistence (use SqliteStore in production)
   LocalSigner,        // In-memory signer for development
   SolanaAdapter,      // Solana blockchain adapter
-} from "kova";
+} from "@kova/wallet";
 
 // Create a shared store for the SDK to persist state.
 const store = new MemoryStore({ dangerouslyAllowInProduction: true });
@@ -175,10 +175,10 @@ If you omit the `circuitBreaker` option, the default configuration is used (`thr
 
 ## Disabling the Circuit Breaker
 
-You can disable the circuit breaker by passing `false`:
+You can disable the circuit breaker by passing `{ dangerouslyDisable: true }`:
 
 ```typescript
-// Disable the circuit breaker entirely by passing false.
+// Disable the circuit breaker entirely by passing { dangerouslyDisable: true }.
 // Without a circuit breaker, the agent can attempt unlimited denied
 // transactions without being blocked. Only do this if you have
 // alternative safeguards in place (e.g., external rate limiting).
@@ -187,7 +187,7 @@ const wallet = new AgentWallet({
   chain,
   policy: engine,
   store,
-  circuitBreaker: false, // No circuit breaker -- agent is never auto-blocked
+  circuitBreaker: { dangerouslyDisable: true }, // No circuit breaker -- agent is never auto-blocked
 });
 ```
 
@@ -196,7 +196,7 @@ Disabling the circuit breaker removes the safety net against runaway agents. Wit
 :::
 
 ::: warning Setting cooldownMs to 0
-Setting `cooldownMs` to `0` makes the circuit breaker trip and immediately reset, effectively making it a no-op. This is generally a configuration error. Either use a meaningful cooldown or disable the circuit breaker with `circuitBreaker: false`.
+Setting `cooldownMs` to `0` makes the circuit breaker trip and immediately reset, effectively making it a no-op. This is generally a configuration error. Either use a meaningful cooldown or disable the circuit breaker with `circuitBreaker: { dangerouslyDisable: true }`.
 :::
 
 ## Internal Management
@@ -301,7 +301,7 @@ kova has **two** circuit breakers that serve different purposes:
 | **Cooldown** | Configurable (`cooldownMs`) | None -- stays open until `resetFailureCount()` |
 | **Auto-reset** | Yes, after cooldown expires | No -- requires manual reset |
 | **Error code** | `CIRCUIT_BREAKER_OPEN` | `STORE_ERROR` |
-| **Can disable** | Yes (`circuitBreaker: false`) | No (always active) |
+| **Can disable** | Yes (`circuitBreaker: { dangerouslyDisable: true }`) | No (always active) |
 | **Checked** | After audit check, before policy | Before circuit breaker, before policy |
 
 ::: warning

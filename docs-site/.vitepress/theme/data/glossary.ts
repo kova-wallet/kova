@@ -250,7 +250,7 @@ export const glossary: Record<string, GlossaryEntry> = {
   "tool-definitions": {
     term: "tool definitions",
     definition:
-      "JSON schemas describing what tools an AI model can call, including parameter types and descriptions. kova generates these via toAnthropicTools() or toOpenAITools().",
+      "JSON schemas describing what tools an AI model can call, including parameter types and descriptions. kova exposes these via the MCP server created by createMcpServer().",
     category: "ai",
   },
 };
