@@ -123,7 +123,7 @@
     }
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "1.27.1",
+    "@modelcontextprotocol/sdk": "1.29.0",
     "@noble/curves": "1.9.7",
     "@noble/hashes": "1.8.0",
     "@solana/spl-token": "0.4.14",
